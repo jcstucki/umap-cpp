@@ -17,7 +17,7 @@ Reference source: `reference/umap/` (shallow clone of lmcinnes/umap, gitignored)
 - [x] `compute_membership_strengths` + `fuzzy_simplicial_set` (incl. set_op_mix_ratio union/intersection mix, -1 knn masking, return_dists; CSR sparse matrix in `include/umap/sparse_matrix.hpp`)
 - [x] `find_ab_params` (Levenberg-Marquardt fit of 1/(1+a x^{2b}))
 - [ ] Spectral initialization (normalized Laplacian eigenvectors; Eigen + Spectra), random init fallback
-- [ ] `simplicial_set_embedding` / `optimize_layout_euclidean` SGD (negative sampling, epochs_per_sample)
+- [x] `simplicial_set_embedding` / `optimize_layout_euclidean` SGD (negative sampling, epochs_per_sample) — clip/rdist/make_epochs_per_sample + full euclidean SGD (per-head-vertex rng states, move_other, alpha decay) in `include/umap/layouts.hpp` + `src/layouts.cpp`, bit-exact vs the sequential numba path; non-init glue as `simplicial_set_embedding_from_init` (n_epochs default 500/200 @ n>10000, weight filtering + eliminate_zeros, [0,10] rescale, move_other=true); spectral init remains an input seam; densmap path TODO; optional std::thread hogwild `parallel` mode
 - [ ] `UMAP` class: fit / fit_transform / transform (transform = kNN of new points vs training, init by weighted mean, constrained SGD)
 - [ ] Sparse input support (CSR)
 
@@ -52,3 +52,4 @@ Reference source: `reference/umap/` (shallow clone of lmcinnes/umap, gitignored)
 ## Log
 - 2026-08-24: repo initialized, reference cloned, roadmap written. Phase 1 kickoff.
 - 2026-08-24: Phase 1 foundations landed: CMake build (static lib + doctest tests), 13 distance metrics + registry, tau_prng (bit-exact vs numba), CSR sparse matrix, smooth_knn_dist / compute_membership_strengths / fuzzy_simplicial_set (float32-faithful), find_ab_params (LM). Goldens generated from the real reference impl via scripts/gen_golden.py (venv with numba/pynndescent). 34 test cases / 998 assertions, all green.
+- 2026-08-24 (branch layout-sgd): layout SGD landed: optimize_layout_euclidean bit-exact vs the sequential numba reference over 50- and 500-epoch goldens (per-head-vertex rng_state_per_sample seeding incl. int64 bitcast of embedding[:,0], Python-modulo negative sampling, exact f4/f8 promotion order), make_epochs_per_sample bit-exact (float32 n_samples, float64 result), simplicial_set_embedding non-init glue (threshold filter, [0,10] float32 rescale, move_other=true), std::thread hogwild parallel mode mirroring numba prange, qualitative two-cluster separation tests. Goldens via scripts/gen_golden_layout.py. 42 test cases / 1955 assertions, all green. densmap objective and spectral init still TODO (init is a seam of simplicial_set_embedding_from_init).

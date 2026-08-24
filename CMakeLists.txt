@@ -18,6 +18,12 @@ add_library(umapcpp STATIC
 target_include_directories(umapcpp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(umapcpp PRIVATE -O2 -Wall -Wextra -Wpedantic)
 
+# --- layout-sgd additions (branch layout-sgd) -------------------------------
+target_sources(umapcpp PRIVATE src/layouts.cpp)
+find_package(Threads REQUIRED)  # hogwild parallel mode (std::thread)
+target_link_libraries(umapcpp PUBLIC Threads::Threads)
+# ----------------------------------------------------------------------------
+
 enable_testing()
 
 add_executable(umap_tests
@@ -31,5 +37,9 @@ add_executable(umap_tests
 target_link_libraries(umap_tests PRIVATE umapcpp)
 target_include_directories(umap_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_compile_options(umap_tests PRIVATE -O2 -Wall -Wextra)
+
+# --- layout-sgd additions (branch layout-sgd) -------------------------------
+target_sources(umap_tests PRIVATE tests/test_layout.cpp)
+# ----------------------------------------------------------------------------
 
 add_test(NAME umap_tests COMMAND umap_tests)
