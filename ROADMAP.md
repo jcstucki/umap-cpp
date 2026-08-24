@@ -9,13 +9,13 @@ Reference source: `reference/umap/` (shallow clone of lmcinnes/umap, gitignored)
 - [ ] not started  [~] in progress  [x] done (implemented + tested)
 
 ## Phase 1 — Core CPU library (faithful port)
-- [ ] CMake scaffold: `libumapcpp` static lib, `umap` CLI, `umap_tests` (Catch2 or doctest)
-- [ ] Distance metrics (euclidean, sqeuclidean, manhattan, chebyshev, minkowski, cosine, correlation, hamming, jaccard, hellinger) — port of `umap/distances.py`
-- [ ] RNG: port of tau_prng (xorshift used in `umap/utils.py`)
+- [~] CMake scaffold: `libumapcpp` static lib, `umap` CLI, `umap_tests` (doctest, vendored header) — lib + tests done; CLI deferred to Phase 4
+- [x] Distance metrics (euclidean, sqeuclidean, manhattan, chebyshev, minkowski, cosine, correlation, hamming, jaccard, dice, hellinger, canberra, braycurtis + named_distances registry) — port of `umap/distances.py`; `_grad` variants deferred until output-metric layouts need them
+- [x] RNG: port of tau_prng (xorshift used in `umap/utils.py`), bit-exact incl. negative seeds
 - [ ] RP-tree forest init + NN-descent kNN (port of pynndescent core path used by UMAP)
-- [ ] `smooth_knn_dist` (sigma/rho binary search, SMOOTH_K_TOLERANCE, MIN_K_DIST_SCALE)
-- [ ] `compute_membership_strengths` + `fuzzy_simplicial_set` (incl. set_op_mix_ratio union)
-- [ ] `find_ab_params` (Levenberg-Marquardt fit of 1/(1+a x^{2b}))
+- [x] `smooth_knn_dist` (sigma/rho binary search, SMOOTH_K_TOLERANCE, MIN_K_DIST_SCALE, bandwidth, local_connectivity interpolation, mean-distance fallbacks)
+- [x] `compute_membership_strengths` + `fuzzy_simplicial_set` (incl. set_op_mix_ratio union/intersection mix, -1 knn masking, return_dists; CSR sparse matrix in `include/umap/sparse_matrix.hpp`)
+- [x] `find_ab_params` (Levenberg-Marquardt fit of 1/(1+a x^{2b}))
 - [ ] Spectral initialization (normalized Laplacian eigenvectors; Eigen + Spectra), random init fallback
 - [ ] `simplicial_set_embedding` / `optimize_layout_euclidean` SGD (negative sampling, epochs_per_sample)
 - [ ] `UMAP` class: fit / fit_transform / transform (transform = kNN of new points vs training, init by weighted mean, constrained SGD)
@@ -51,3 +51,4 @@ Reference source: `reference/umap/` (shallow clone of lmcinnes/umap, gitignored)
 
 ## Log
 - 2026-08-24: repo initialized, reference cloned, roadmap written. Phase 1 kickoff.
+- 2026-08-24: Phase 1 foundations landed: CMake build (static lib + doctest tests), 13 distance metrics + registry, tau_prng (bit-exact vs numba), CSR sparse matrix, smooth_knn_dist / compute_membership_strengths / fuzzy_simplicial_set (float32-faithful), find_ab_params (LM). Goldens generated from the real reference impl via scripts/gen_golden.py (venv with numba/pynndescent). 34 test cases / 998 assertions, all green.
