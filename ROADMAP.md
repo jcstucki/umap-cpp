@@ -1,0 +1,53 @@
+# UMAP C++ / Metal Port — Roadmap & Progress
+
+Goal: a complete, faithful C++ reproduction of UMAP (lmcinnes/umap), GPU-parallelizable
+via Apple Metal, passing equivalent tests, consumable as a static library + unix CLI executable.
+
+Reference source: `reference/umap/` (shallow clone of lmcinnes/umap, gitignored).
+
+## Status legend
+- [ ] not started  [~] in progress  [x] done (implemented + tested)
+
+## Phase 1 — Core CPU library (faithful port)
+- [ ] CMake scaffold: `libumapcpp` static lib, `umap` CLI, `umap_tests` (Catch2 or doctest)
+- [ ] Distance metrics (euclidean, sqeuclidean, manhattan, chebyshev, minkowski, cosine, correlation, hamming, jaccard, hellinger) — port of `umap/distances.py`
+- [ ] RNG: port of tau_prng (xorshift used in `umap/utils.py`)
+- [ ] RP-tree forest init + NN-descent kNN (port of pynndescent core path used by UMAP)
+- [ ] `smooth_knn_dist` (sigma/rho binary search, SMOOTH_K_TOLERANCE, MIN_K_DIST_SCALE)
+- [ ] `compute_membership_strengths` + `fuzzy_simplicial_set` (incl. set_op_mix_ratio union)
+- [ ] `find_ab_params` (Levenberg-Marquardt fit of 1/(1+a x^{2b}))
+- [ ] Spectral initialization (normalized Laplacian eigenvectors; Eigen + Spectra), random init fallback
+- [ ] `simplicial_set_embedding` / `optimize_layout_euclidean` SGD (negative sampling, epochs_per_sample)
+- [ ] `UMAP` class: fit / fit_transform / transform (transform = kNN of new points vs training, init by weighted mean, constrained SGD)
+- [ ] Sparse input support (CSR)
+
+## Phase 2 — Tests (port of umap/tests)
+- [ ] Test harness + small datasets (iris baked in; synthetic clusters; nn data)
+- [ ] test_umap_nn equivalents (kNN accuracy ≥ thresholds)
+- [ ] test_umap_metrics equivalents (metric correctness vs scipy-computed golden values)
+- [ ] test_umap_trustworthiness equivalents (trustworthiness ≥ thresholds on iris etc.)
+- [ ] test_umap_on_iris equivalents
+- [ ] test_umap_ops / repeated-data / validation-params equivalents
+- [ ] Golden-value comparison vs Python UMAP outputs (scripts/gen_golden.py)
+
+## Phase 3 — Apple Metal GPU parallelization
+- [ ] Metal compute kernels: pairwise/kNN distance computation
+- [ ] Metal SGD layout optimization (epoch-parallel with atomic/lock-free updates, matching numba parallel semantics)
+- [ ] CPU/GPU parity tests (trustworthiness parity, not bitwise)
+- [ ] Runtime dispatch: `--device cpu|gpu`
+
+## Phase 4 — Packaging
+- [ ] CLI: `umap fit --input data.csv|.npy --output emb.csv ...` with all main hyperparams
+- [ ] Install target + umapcpp-config.cmake so other projects can `find_package(umapcpp)`
+- [ ] C API header (umap_c.h) for FFI consumers
+- [ ] README with usage
+
+## Decisions
+- C++17, Apple Silicon primary target; Metal via metal-cpp.
+- Eigen (FetchContent) for linear algebra; Spectra for eigensolver; doctest for tests.
+- Faithfulness bar: same algorithms/constants/defaults as Python; stochastic outputs
+  validated via trustworthiness/kNN-accuracy thresholds like the upstream test suite,
+  plus deterministic sub-component golden tests (smooth_knn, membership strengths, metrics, a/b fit).
+
+## Log
+- 2026-08-24: repo initialized, reference cloned, roadmap written. Phase 1 kickoff.
