@@ -24,6 +24,27 @@ find_package(Threads REQUIRED)  # hogwild parallel mode (std::thread)
 target_link_libraries(umapcpp PUBLIC Threads::Threads)
 # ----------------------------------------------------------------------------
 
+# --- spectral-init additions ------------------------------------------------
+# Eigen + Spectra, header-only via FetchContent. SOURCE_SUBDIR points at a
+# directory without a CMakeLists.txt so MakeAvailable only populates (no
+# add_subdirectory of their build systems).
+include(FetchContent)
+FetchContent_Declare(eigen3
+    URL https://gitlab.com/libeigen/eigen/-/archive/3.4.0/eigen-3.4.0.tar.gz
+    SOURCE_SUBDIR cmake_disabled_do_not_add_subdir
+)
+FetchContent_Declare(spectra
+    URL https://github.com/yixuan/spectra/archive/refs/tags/v1.0.1.tar.gz
+    SOURCE_SUBDIR cmake_disabled_do_not_add_subdir
+)
+FetchContent_MakeAvailable(eigen3 spectra)
+target_sources(umapcpp PRIVATE src/spectral.cpp)
+target_include_directories(umapcpp SYSTEM PUBLIC
+    ${eigen3_SOURCE_DIR}
+    ${spectra_SOURCE_DIR}/include
+)
+# ----------------------------------------------------------------------------
+
 enable_testing()
 
 add_executable(umap_tests
@@ -40,6 +61,10 @@ target_compile_options(umap_tests PRIVATE -O2 -Wall -Wextra)
 
 # --- layout-sgd additions (branch layout-sgd) -------------------------------
 target_sources(umap_tests PRIVATE tests/test_layout.cpp)
+# ----------------------------------------------------------------------------
+
+# --- spectral-init additions ------------------------------------------------
+target_sources(umap_tests PRIVATE tests/test_spectral.cpp)
 # ----------------------------------------------------------------------------
 
 add_test(NAME umap_tests COMMAND umap_tests)
