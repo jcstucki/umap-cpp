@@ -28,6 +28,10 @@ target_link_libraries(umapcpp PUBLIC Threads::Threads)
 target_sources(umapcpp PRIVATE src/nn_descent.cpp)
 # ----------------------------------------------------------------------------
 
+# --- query-path additions ---------------------------------------------------
+target_sources(umapcpp PRIVATE src/nn_query.cpp)
+# ----------------------------------------------------------------------------
+
 enable_testing()
 
 add_executable(umap_tests
@@ -48,6 +52,10 @@ target_sources(umap_tests PRIVATE tests/test_layout.cpp)
 
 # --- nn-descent additions ---------------------------------------------------
 target_sources(umap_tests PRIVATE tests/test_nn_descent.cpp)
+# ----------------------------------------------------------------------------
+
+# --- query-path additions ---------------------------------------------------
+target_sources(umap_tests PRIVATE tests/test_query.cpp)
 # ----------------------------------------------------------------------------
 
 add_test(NAME umap_tests COMMAND umap_tests)

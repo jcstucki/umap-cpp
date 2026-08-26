@@ -231,5 +231,111 @@ void nearest_neighbors_with_state(
     const std::vector<std::array<int64_t, 3>>& tree_rng_states,
     int32_t* knn_indices, float* knn_dists, bool verbose = false);
 
+// --------------------------------------------------- query path (transform)
+// Faithful port of NNDescent.prepare() + query() for the dense path UMAP's
+// transform() hits: graph-informed hub search tree (rp_trees.py::make_hub_tree
+// + convert_tree_format), occlusion-pruned search graph (diversify /
+// diversify_csr / degree_prune with UMAP-default diversify_prob=1.0 and
+// pruning_degree_multiplier=1.5), and the epsilon-bounded graph search
+// (pynndescent_.py::search_closure).
+
+// Converted flat search tree (rp_trees.py::convert_tree_format layout).
+// Internal nodes: children[2i] = left node, children[2i+1] = right node (>0).
+// Leaves: children[2i] = -leaf_start, children[2i+1] = -leaf_end into
+// `indices`.
+struct FlatTree {
+    int64_t n_nodes = 0;
+    int64_t dim = 0;
+    std::vector<float> hyperplanes;  // n_nodes * dim (leaves: zero rows)
+    std::vector<float> offsets;      // n_nodes (leaves: -inf)
+    std::vector<int32_t> children;   // n_nodes * 2
+    std::vector<int32_t> indices;    // data_size (concatenated leaves)
+};
+
+// rp_trees.py::make_hub_tree followed by convert_tree_format. The neighbor
+// graph (`knn_indices`, (n, n_neighbors) row-major, -1 padded) drives the
+// hub-based hyperplane selection; `rng_state` is only consumed by the
+// degenerate-split random fallback. UMAP defaults: leaf_size=30 (search
+// leaf size when NNDescent.leaf_size is None), max_depth=200.
+FlatTree make_hub_tree(const float* data, int64_t n, int64_t dim,
+                       const int32_t* knn_indices, int64_t n_neighbors,
+                       int64_t rng_state[3], int64_t leaf_size, bool angular,
+                       int64_t max_depth);
+
+// Binarised CSR search graph (structure only) + the minimum forward-graph
+// distance (NNDescent._min_distance, used in the epsilon distance bound).
+struct SearchGraph {
+    std::vector<int32_t> indptr;   // n + 1
+    std::vector<int32_t> indices;  // column-sorted within each row
+    float min_distance = 0.0f;
+};
+
+// Port of the graph half of NNDescent._init_search_graph (dense,
+// diversify_method="standard"): forward diversify on a copy of the kNN graph,
+// CSR assembly (zero distances -> FLOAT32_EPS, -1 entries dropped),
+// diversify_csr applied to the forward rows (scipy's zero-copy transpose
+// makes the "reverse" pass operate on the forward CSR arrays), symmetric
+// maximum combine, diagonal removal, degree_prune to
+// round(pruning_degree_multiplier * n_neighbors), binarise. `knn_dists` are
+// the *internal* (uncorrected) metric distances. `rng_state` threads through
+// both diversify passes exactly as in Python.
+SearchGraph build_search_graph(const float* data, int64_t n, int64_t dim,
+                               const int32_t* knn_indices,
+                               const float* knn_dists, int64_t n_neighbors,
+                               DistFn dist, int64_t rng_state[3],
+                               double diversify_prob,
+                               double pruning_degree_multiplier);
+
+// A fitted + prepared index over a copy of the training data. Mirrors what
+// UMAP keeps as `_knn_search_index`: fit-time kNN graph (for
+// fuzzy_simplicial_set) plus everything query() needs.
+class PreparedIndex {
+ public:
+    // NNDescent(data, n_neighbors, metric, random_state=seed,
+    //           n_trees/n_iters = umap "hacked values", max_candidates=60,
+    //           low_memory=True, compressed=False) followed by .prepare().
+    static PreparedIndex build(const float* data, int64_t n, int64_t dim,
+                               int64_t n_neighbors, const std::string& metric,
+                               uint32_t random_seed, bool verbose = false);
+
+    // NNDescent.query(query_data, k, epsilon). Outputs are (n_queries, k)
+    // row-major; indices refer to the original data order. UMAP's transform
+    // calls this with k = n_neighbors and epsilon = 0.12 (0.24 for angular
+    // metrics).
+    void query(const float* query_data, int64_t n_queries, int64_t k,
+               double epsilon, int32_t* out_indices, float* out_dists) const;
+
+    // Fit-time kNN graph in original data order (NNDescent.neighbor_graph:
+    // corrected distances), (n, n_neighbors) row-major.
+    const std::vector<int32_t>& knn_indices() const { return knn_indices_; }
+    const std::vector<float>& knn_dists() const { return knn_dists_; }
+
+    // Introspection (parity tests against the Python reference).
+    const std::vector<int32_t>& vertex_order() const { return vertex_order_; }
+    const SearchGraph& search_graph() const { return search_graph_; }
+    const FlatTree& search_tree() const { return tree_; }
+    const std::array<int64_t, 3>& search_rng_state() const {
+        return search_rng_state_;
+    }
+    float min_distance() const { return search_graph_.min_distance; }
+    int64_t n_points() const { return n_; }
+    int64_t dim() const { return dim_; }
+    int64_t n_neighbors() const { return n_neighbors_; }
+
+ private:
+    int64_t n_ = 0;
+    int64_t dim_ = 0;
+    int64_t n_neighbors_ = 0;
+    MetricInfo metric_;
+    bool normalize_query_ = false;  // pynndescent: metric in ("cosine", "dot")
+    std::vector<float> data_;       // training data re-ordered by vertex_order_
+    std::vector<int32_t> vertex_order_;  // new label -> original label
+    SearchGraph search_graph_;           // re-ordered, rows column-sorted
+    FlatTree tree_;                      // resorted (indices == arange)
+    std::array<int64_t, 3> search_rng_state_ = {0, 0, 0};  // post warm-up
+    std::vector<int32_t> knn_indices_;
+    std::vector<float> knn_dists_;
+};
+
 }  // namespace nnd
 }  // namespace umap
