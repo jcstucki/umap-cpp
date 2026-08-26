@@ -24,6 +24,10 @@ find_package(Threads REQUIRED)  # hogwild parallel mode (std::thread)
 target_link_libraries(umapcpp PUBLIC Threads::Threads)
 # ----------------------------------------------------------------------------
 
+# --- nn-descent additions ---------------------------------------------------
+target_sources(umapcpp PRIVATE src/nn_descent.cpp)
+# ----------------------------------------------------------------------------
+
 enable_testing()
 
 add_executable(umap_tests
@@ -40,6 +44,10 @@ target_compile_options(umap_tests PRIVATE -O2 -Wall -Wextra)
 
 # --- layout-sgd additions (branch layout-sgd) -------------------------------
 target_sources(umap_tests PRIVATE tests/test_layout.cpp)
+# ----------------------------------------------------------------------------
+
+# --- nn-descent additions ---------------------------------------------------
+target_sources(umap_tests PRIVATE tests/test_nn_descent.cpp)
 # ----------------------------------------------------------------------------
 
 add_test(NAME umap_tests COMMAND umap_tests)
