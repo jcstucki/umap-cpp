@@ -1,0 +1,448 @@
+// Implementation of include/umap/spectral.hpp. See that header for the
+// faithfulness notes and documented deviations vs reference/umap/umap/spectral.py.
+#include "umap/spectral.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <numeric>
+#include <stdexcept>
+#include <vector>
+
+#include <Eigen/Dense>
+#include <Eigen/SparseCore>
+#include <Spectra/MatOp/SparseSymShiftSolve.h>
+#include <Spectra/SymEigsShiftSolver.h>
+
+#include "umap/rng.hpp"
+
+namespace umap {
+
+namespace {
+
+// random_state.uniform(low, high) equivalent on tau_prng (distributional, not
+// bit-equal to numpy; documented deviation).
+inline double uniform(int64_t state[3], double low, double high) {
+    return low + (high - low) * static_cast<double>(tau_rand(state));
+}
+
+// Standard normal via Box-Muller on tau_rand (documented deviation from
+// numpy's Gaussian stream).
+inline double std_normal(int64_t state[3]) {
+    double u1 = static_cast<double>(tau_rand(state));
+    double u2 = static_cast<double>(tau_rand(state));
+    if (u1 < 1e-12) u1 = 1e-12;
+    return std::sqrt(-2.0 * std::log(u1)) *
+           std::cos(2.0 * 3.14159265358979323846 * u2);
+}
+
+// graph[np.ix_(idx, idx)] for a canonical CSR matrix; idx must be ascending
+// (it is: indices of component members in vertex order), so per-row column
+// order is preserved.
+SparseMatrix submatrix(const SparseMatrix& g, const std::vector<int32_t>& idx) {
+    std::vector<int32_t> new_col(static_cast<std::size_t>(g.n_cols), -1);
+    for (std::size_t t = 0; t < idx.size(); ++t)
+        new_col[static_cast<std::size_t>(idx[t])] = static_cast<int32_t>(t);
+
+    SparseMatrix out(static_cast<int32_t>(idx.size()),
+                     static_cast<int32_t>(idx.size()));
+    out.indptr.assign(1, 0);
+    for (std::size_t t = 0; t < idx.size(); ++t) {
+        const int32_t row = idx[t];
+        for (int32_t p = g.indptr[row]; p < g.indptr[row + 1]; ++p) {
+            const int32_t nc = new_col[static_cast<std::size_t>(g.indices[p])];
+            if (nc >= 0) {
+                out.indices.push_back(nc);
+                out.data.push_back(g.data[p]);
+            }
+        }
+        out.indptr.push_back(static_cast<int32_t>(out.indices.size()));
+    }
+    return out;
+}
+
+// Upstream fallback layout: gen.uniform(low=-10, high=10, size=(n, dim)).
+std::vector<double> random_fallback_layout(int64_t n, int dim,
+                                           int64_t rng_state[3]) {
+    std::vector<double> out(static_cast<std::size_t>(n) * dim);
+    for (auto& v : out) v = uniform(rng_state, -10.0, 10.0);
+    return out;
+}
+
+// _spectral_layout for the general case, returning float64 like upstream
+// (n x dim row-major). Forward declaration for the multi-component recursion.
+std::vector<double> spectral_layout_f64(const float* data, int64_t n_features,
+                                        const SparseMatrix& graph, int dim,
+                                        int64_t rng_state[3]);
+
+}  // namespace
+
+int32_t connected_components(const SparseMatrix& graph,
+                             std::vector<int32_t>& labels) {
+    // scipy.sparse.csgraph.connected_components defaults: directed=True with
+    // connection='weak', i.e. edges are treated as undirected. Components are
+    // labeled in order of the first-encountered (lowest-index) vertex.
+    const int32_t n = graph.n_rows;
+    const SparseMatrix gt = graph.transpose();
+    labels.assign(static_cast<std::size_t>(n), -1);
+    int32_t n_components = 0;
+    std::vector<int32_t> stack;
+    for (int32_t start = 0; start < n; ++start) {
+        if (labels[start] != -1) continue;
+        const int32_t label = n_components++;
+        labels[start] = label;
+        stack.assign(1, start);
+        while (!stack.empty()) {
+            const int32_t v = stack.back();
+            stack.pop_back();
+            for (const SparseMatrix* m : {&graph, &gt}) {
+                for (int32_t p = m->indptr[v]; p < m->indptr[v + 1]; ++p) {
+                    const int32_t w = m->indices[p];
+                    if (labels[w] == -1) {
+                        labels[w] = label;
+                        stack.push_back(w);
+                    }
+                }
+            }
+        }
+    }
+    return n_components;
+}
+
+bool normalized_laplacian_eigs(const SparseMatrix& graph, int k,
+                               std::vector<double>& eigenvalues,
+                               std::vector<double>& eigenvectors) {
+    const int64_t n = graph.n_rows;
+    if (k >= n) {
+        // Upstream: scipy warns "k >= N ... attempting eigh" then raises an
+        // uncaught TypeError, so spectral init on such graphs is an error.
+        throw std::invalid_argument(
+            "normalized_laplacian_eigs: k must be < n (upstream scipy raises "
+            "for k >= N)");
+    }
+
+    // sqrt_deg = sqrt(graph.sum(axis=0))  (column sums)
+    std::vector<double> sqrt_deg(static_cast<std::size_t>(n), 0.0);
+    for (int32_t i = 0; i < graph.n_rows; ++i)
+        for (int32_t p = graph.indptr[i]; p < graph.indptr[i + 1]; ++p)
+            sqrt_deg[static_cast<std::size_t>(graph.indices[p])] +=
+                static_cast<double>(graph.data[p]);
+    for (auto& d : sqrt_deg) d = std::sqrt(d);
+
+    // L = I - D^{-1/2} A D^{-1/2}
+    std::vector<Eigen::Triplet<double>> trips;
+    trips.reserve(graph.nnz() + static_cast<std::size_t>(n));
+    for (int64_t i = 0; i < n; ++i) trips.emplace_back(i, i, 1.0);
+    for (int32_t i = 0; i < graph.n_rows; ++i)
+        for (int32_t p = graph.indptr[i]; p < graph.indptr[i + 1]; ++p) {
+            const int32_t j = graph.indices[p];
+            trips.emplace_back(
+                i, j,
+                -static_cast<double>(graph.data[p]) /
+                    (sqrt_deg[static_cast<std::size_t>(i)] *
+                     sqrt_deg[static_cast<std::size_t>(j)]));
+        }
+    Eigen::SparseMatrix<double> L(n, n);
+    L.setFromTriplets(trips.begin(), trips.end());
+
+    // Upstream eigsh selection: k smallest ("SM", equal to smallest algebraic
+    // for the PSD Laplacian), ncv = max(2k + 1, sqrt(n)) (scipy clamps to n),
+    // v0 = ones, maxiter = 5n. We solve in shift-invert mode with the small
+    // negative sigma sklearn recommends (-1e-5) for robustness; the selected
+    // eigenpairs and their (unit 2-norm) normalization match ARPACK's.
+    const int64_t ncv64 = std::min<int64_t>(
+        n, std::max<int64_t>(2 * static_cast<int64_t>(k) + 1,
+                             static_cast<int64_t>(std::sqrt(
+                                 static_cast<double>(n)))));
+    const int ncv = static_cast<int>(ncv64);
+    const int maxit =
+        std::max<int>(1000, static_cast<int>(std::min<int64_t>(5 * n, 1 << 30)));
+
+    try {
+        Spectra::SparseSymShiftSolve<double> op(L);
+        Spectra::SymEigsShiftSolver<Spectra::SparseSymShiftSolve<double>> eigs(
+            op, k, ncv, -1e-5);
+        Eigen::VectorXd v0 = Eigen::VectorXd::Ones(n);
+        eigs.init(v0.data());
+        eigs.compute(Spectra::SortRule::LargestMagn, maxit, 1e-10,
+                     Spectra::SortRule::SmallestAlge);
+        if (eigs.info() != Spectra::CompInfo::Successful) return false;
+
+        const Eigen::VectorXd evals = eigs.eigenvalues();
+        const Eigen::MatrixXd evecs = eigs.eigenvectors();
+        // order = np.argsort(eigenvalues) (ascending); Spectra already sorts
+        // by SmallestAlge but we replicate the explicit argsort regardless.
+        std::vector<int> order(static_cast<std::size_t>(k));
+        std::iota(order.begin(), order.end(), 0);
+        std::stable_sort(order.begin(), order.end(),
+                         [&](int a, int b) { return evals[a] < evals[b]; });
+
+        eigenvalues.resize(static_cast<std::size_t>(k));
+        eigenvectors.assign(static_cast<std::size_t>(n) * k, 0.0);
+        for (int c = 0; c < k; ++c) {
+            eigenvalues[static_cast<std::size_t>(c)] = evals[order[c]];
+            for (int64_t i = 0; i < n; ++i)
+                eigenvectors[static_cast<std::size_t>(i) * k + c] =
+                    evecs(i, order[c]);
+        }
+        return true;
+    } catch (const std::exception&) {
+        // e.g. numerically-singular factorization; upstream catches
+        // ArpackError and falls back to random.
+        return false;
+    }
+}
+
+std::vector<double> component_layout(const float* data, int64_t n_samples,
+                                     int64_t n_features, int32_t n_components,
+                                     const std::vector<int32_t>& component_labels,
+                                     int dim, int64_t rng_state[3]) {
+    const std::size_t nc = static_cast<std::size_t>(n_components);
+    if (data == nullptr) {
+        // "We don't have data to work with; just guess":
+        // np.random.random(size=(n_components, dim)) * 10.0
+        std::vector<double> out(nc * static_cast<std::size_t>(dim));
+        for (auto& v : out) v = uniform(rng_state, 0.0, 1.0) * 10.0;
+        return out;
+    }
+    if (dim + 1 > n_components)
+        throw std::invalid_argument(
+            "component_layout: need n_components > dim (upstream only calls "
+            "this with n_components > 2 * dim)");
+
+    // component_centroids[label] = data[component_labels == label].mean(axis=0)
+    Eigen::MatrixXd centroids =
+        Eigen::MatrixXd::Zero(n_components, n_features);
+    std::vector<int64_t> counts(nc, 0);
+    for (int64_t i = 0; i < n_samples; ++i) {
+        const int32_t label = component_labels[static_cast<std::size_t>(i)];
+        counts[static_cast<std::size_t>(label)] += 1;
+        for (int64_t f = 0; f < n_features; ++f)
+            centroids(label, f) += static_cast<double>(data[i * n_features + f]);
+    }
+    for (int32_t c = 0; c < n_components; ++c)
+        centroids.row(c) /= static_cast<double>(counts[static_cast<std::size_t>(c)]);
+
+    // affinity_matrix = np.exp(-(pairwise_distances(centroids) ** 2))
+    // sklearn's csgraph laplacian zeroes the diagonal of the affinity before
+    // computing degrees, so build it with a zero diagonal directly.
+    Eigen::MatrixXd affinity(n_components, n_components);
+    for (int32_t i = 0; i < n_components; ++i) {
+        affinity(i, i) = 0.0;
+        for (int32_t j = i + 1; j < n_components; ++j) {
+            const double d2 = (centroids.row(i) - centroids.row(j)).squaredNorm();
+            const double a = std::exp(-d2);
+            affinity(i, j) = a;
+            affinity(j, i) = a;
+        }
+    }
+
+    // sklearn SpectralEmbedding(affinity="precomputed") == spectral_embedding
+    // with norm_laplacian=True, drop_first=True:
+    //   L = I - D^{-1/2} A D^{-1/2}; k = dim + 1 smallest eigenvectors x;
+    //   embedding rows = x / dd, deterministic sign flip, drop first.
+    Eigen::VectorXd dd = affinity.rowwise().sum().cwiseSqrt();
+    Eigen::MatrixXd L = Eigen::MatrixXd::Identity(n_components, n_components) -
+                        (affinity.array() /
+                         (dd * dd.transpose()).array())
+                            .matrix();
+    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> solver(L);
+    if (solver.info() != Eigen::Success)
+        throw std::runtime_error("component_layout: dense eigensolver failed");
+
+    const int k = dim + 1;
+    // rows of `emb` are eigenvectors (ascending eigenvalue), scaled by 1/dd.
+    Eigen::MatrixXd emb(k, n_components);
+    for (int t = 0; t < k; ++t)
+        emb.row(t) =
+            (solver.eigenvectors().col(t).array() / dd.array()).transpose();
+    // _deterministic_vector_sign_flip: flip each row so its max-|.| entry > 0.
+    for (int t = 0; t < k; ++t) {
+        int arg = 0;
+        for (int c = 1; c < n_components; ++c)
+            if (std::abs(emb(t, c)) > std::abs(emb(t, arg))) arg = c;
+        const double s =
+            (emb(t, arg) > 0.0) ? 1.0 : ((emb(t, arg) < 0.0) ? -1.0 : 0.0);
+        emb.row(t) *= s;
+    }
+
+    // drop_first, transpose to (n_components x dim), then /= max()
+    std::vector<double> out(nc * static_cast<std::size_t>(dim));
+    double max_val = emb(1, 0);
+    for (int t = 1; t < k; ++t)
+        for (int32_t c = 0; c < n_components; ++c)
+            max_val = std::max(max_val, emb(t, c));
+    for (int32_t c = 0; c < n_components; ++c)
+        for (int j = 0; j < dim; ++j)
+            out[static_cast<std::size_t>(c) * dim + j] = emb(j + 1, c) / max_val;
+    return out;
+}
+
+std::vector<float> multi_component_layout(
+    const float* data, int64_t n_features, const SparseMatrix& graph,
+    int32_t n_components, const std::vector<int32_t>& component_labels, int dim,
+    int64_t rng_state[3]) {
+    const int64_t n = graph.n_rows;
+    std::vector<float> result(static_cast<std::size_t>(n) * dim, 0.0f);
+
+    // Meta-embedding of the component centers.
+    std::vector<double> meta;
+    if (n_components > 2 * dim) {
+        meta = component_layout(data, n, n_features, n_components,
+                                component_labels, dim, rng_state);
+    } else {
+        // k = ceil(nc / 2); base = [eye(k) | 0]; meta = [base; -base][:nc]
+        const int32_t k = (n_components + 1) / 2;
+        meta.assign(static_cast<std::size_t>(n_components) * dim, 0.0);
+        for (int32_t c = 0; c < n_components; ++c) {
+            if (c < k)
+                meta[static_cast<std::size_t>(c) * dim + c] = 1.0;
+            else
+                meta[static_cast<std::size_t>(c) * dim + (c - k)] = -1.0;
+        }
+    }
+
+    for (int32_t label = 0; label < n_components; ++label) {
+        std::vector<int32_t> idx;
+        for (int64_t i = 0; i < n; ++i)
+            if (component_labels[static_cast<std::size_t>(i)] == label)
+                idx.push_back(static_cast<int32_t>(i));
+        const int64_t m = static_cast<int64_t>(idx.size());
+
+        // data_range = distances[distances > 0].min() / 2 over euclidean
+        // distances from this component's meta position to all meta positions.
+        double min_pos = -1.0;
+        for (int32_t c = 0; c < n_components; ++c) {
+            double d2 = 0.0;
+            for (int j = 0; j < dim; ++j) {
+                const double diff =
+                    meta[static_cast<std::size_t>(label) * dim + j] -
+                    meta[static_cast<std::size_t>(c) * dim + j];
+                d2 += diff * diff;
+            }
+            const double d = std::sqrt(d2);
+            if (d > 0.0 && (min_pos < 0.0 || d < min_pos)) min_pos = d;
+        }
+        if (min_pos < 0.0)
+            throw std::runtime_error(
+                "multi_component_layout: degenerate meta embedding (no "
+                "positive distances between component centers)");
+        const double data_range = min_pos / 2.0;
+
+        if (m < 2 * dim || m <= dim + 1) {
+            // Tiny component: random placement around the meta position.
+            for (int64_t t = 0; t < m; ++t)
+                for (int j = 0; j < dim; ++j)
+                    result[static_cast<std::size_t>(idx[t]) * dim + j] =
+                        static_cast<float>(
+                            uniform(rng_state, -data_range, data_range) +
+                            meta[static_cast<std::size_t>(label) * dim + j]);
+        } else {
+            const SparseMatrix component_graph = submatrix(graph, idx);
+            std::vector<double> comp_emb = spectral_layout_f64(
+                nullptr, 0, component_graph, dim, rng_state);
+            double max_abs = 0.0;
+            for (const double v : comp_emb) max_abs = std::max(max_abs, std::abs(v));
+            const double expansion = data_range / max_abs;
+            for (int64_t t = 0; t < m; ++t)
+                for (int j = 0; j < dim; ++j)
+                    result[static_cast<std::size_t>(idx[t]) * dim + j] =
+                        static_cast<float>(
+                            comp_emb[static_cast<std::size_t>(t) * dim + j] *
+                                expansion +
+                            meta[static_cast<std::size_t>(label) * dim + j]);
+        }
+    }
+    return result;
+}
+
+namespace {
+
+std::vector<double> spectral_layout_f64(const float* data, int64_t n_features,
+                                        const SparseMatrix& graph, int dim,
+                                        int64_t rng_state[3]) {
+    std::vector<int32_t> labels;
+    const int32_t n_comp = connected_components(graph, labels);
+    if (n_comp > 1) {
+        const std::vector<float> multi = multi_component_layout(
+            data, n_features, graph, n_comp, labels, dim, rng_state);
+        return std::vector<double>(multi.begin(), multi.end());
+    }
+
+    const int k = dim + 1;
+    std::vector<double> eigenvalues;
+    std::vector<double> eigenvectors;  // n x k row-major, ascending eigenvalue
+    if (!normalized_laplacian_eigs(graph, k, eigenvalues, eigenvectors)) {
+        std::fprintf(stderr,
+                     "Spectral initialisation failed! The eigenvector solver\n"
+                     "failed. This is likely due to too small an eigengap. "
+                     "Consider\nadding some noise or jitter to your data.\n\n"
+                     "Falling back to random initialisation!\n");
+        return random_fallback_layout(graph.n_rows, dim, rng_state);
+    }
+    // return eigenvectors[:, order] with order = argsort(eigenvalues)[1:k]
+    // (the argsort is already applied inside normalized_laplacian_eigs).
+    const int64_t n = graph.n_rows;
+    std::vector<double> out(static_cast<std::size_t>(n) * dim);
+    for (int64_t i = 0; i < n; ++i)
+        for (int j = 0; j < dim; ++j)
+            out[static_cast<std::size_t>(i) * dim + j] =
+                eigenvectors[static_cast<std::size_t>(i) * k + (j + 1)];
+    return out;
+}
+
+}  // namespace
+
+std::vector<float> spectral_layout(const float* data, int64_t n_features,
+                                   const SparseMatrix& graph, int dim,
+                                   int64_t rng_state[3]) {
+    const std::vector<double> emb =
+        spectral_layout_f64(data, n_features, graph, dim, rng_state);
+    return std::vector<float>(emb.begin(), emb.end());
+}
+
+std::vector<float> noisy_scale_coords(std::vector<float> coords,
+                                      int64_t rng_state[3], float max_coord,
+                                      float noise) {
+    float max_abs = 0.0f;
+    for (const float v : coords) max_abs = std::max(max_abs, std::abs(v));
+    const double expansion =
+        static_cast<double>(max_coord) / static_cast<double>(max_abs);
+    for (auto& v : coords) {
+        v = static_cast<float>(static_cast<double>(v) * expansion);
+        v += static_cast<float>(std_normal(rng_state) *
+                                static_cast<double>(noise));
+    }
+    return coords;
+}
+
+std::vector<float> initialize_embedding(const float* data, int64_t n_features,
+                                        const SparseMatrix& graph, int dim,
+                                        EmbeddingInit init,
+                                        int64_t rng_state[3]) {
+    switch (init) {
+        case EmbeddingInit::Random: {
+            // random_state.uniform(low=-10, high=10, size=(n, dim)).astype(f32)
+            std::vector<float> out(static_cast<std::size_t>(graph.n_rows) * dim);
+            for (auto& v : out)
+                v = static_cast<float>(uniform(rng_state, -10.0, 10.0));
+            return out;
+        }
+        case EmbeddingInit::Spectral: {
+            std::vector<float> emb =
+                spectral_layout(data, n_features, graph, dim, rng_state);
+            // "We add a little noise to avoid local minima for optimization"
+            return noisy_scale_coords(std::move(emb), rng_state,
+                                      /*max_coord=*/10.0f, /*noise=*/0.0001f);
+        }
+        case EmbeddingInit::PCA:
+        default:
+            // TODO(port): PCA (dense input) / TruncatedSVD (sparse input) of
+            // the source data followed by noisy_scale_coords, as in
+            // umap_.simplicial_set_embedding.
+            throw std::runtime_error(
+                "initialize_embedding: init='pca' is not implemented yet");
+    }
+}
+
+}  // namespace umap
