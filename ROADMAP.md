@@ -22,6 +22,22 @@ Reference source: `reference/umap/` (shallow clone of lmcinnes/umap, gitignored)
 - [x] `UMAP` class: fit / fit_transform / transform (transform = kNN of new points vs training, init by weighted mean, constrained SGD) — `include/umap/umap.hpp` + `src/umap.cpp`: dense float32 input, euclidean output metric; small-data (< 4096, exact kNN via sklearn `_pairwise_callable` replication + stable-argsort fast_knn) and NN-descent branches, seeded numpy RandomState stream parity, spectral/random init, transform (query-path kNN at ε 0.12/0.24 or brute force, adjusted local_connectivity, bipartite membership, init_graph_transform weighted mean, n_epochs//3 rule, move_other=false SGD at α/4). Bit-exact vs Python end-to-end on the small-data+random-init path (fit AND transform); other paths documented tolerances (fastmath kNN dists ~1 ulp, Spectra-vs-ARPACK spectral init, find_ab_params ~1e-7)
 - [x] Sparse input support (CSR) — sparse distance kernels + registry (`include/umap/sparse_distances.hpp`: euclidean/l2, sqeuclidean, manhattan/l1/taxicab, cosine incl. fast alternatives + corrections, arr_union/arr_intersect/sparse_sum/sparse_diff/sparse_mul; other upstream sparse metrics throw not-implemented), sparse RP-tree splits + forest leaf arrays, sparse NN-descent loop and `nearest_neighbors_sparse` with umap_.py routing incl. small-data (<4096) stable-argsort brute force (`include/umap/sparse_nn_descent.hpp`); index-identical to Python end-to-end; sparse transform() query path + UMAP-class sparse fit wiring TODO
 
+## Phase 1b — Full feature completeness (user directive 2026-08-26: ALL features must be ported)
+- [ ] Remaining dense metrics from distances.py (seuclidean/standardised, weighted_minkowski, mahalanobis, matching, kulsinski, rogerstanimoto, russellrao, sokalmichener, sokalsneath, yule, haversine, ll_dirichlet, symmetric_kl, tsss, true_angular, …) + `_grad` gradient variants
+- [ ] Non-euclidean output metrics: `optimize_layout_generic` (+ `output_metric`/`output_metric_kwds` in UMAP class)
+- [ ] densmap + output_dens (`optimize_layout_euclidean` densmap path, dens_lambda/frac/var_shift, aux data)
+- [ ] Supervised/semi-supervised fit (y): target_metric categorical/general, `discrete.py` (fast_intersection, categorical_simplicial_set_intersection), general_simplicial_set_intersection, reset_local_connectivity
+- [ ] metric="precomputed" (inf→-1 pruning) + `precomputed_knn` param
+- [ ] `unique=True` row dedup + inverse mapping
+- [ ] init: "pca", "tswspectral", user ndarray (KDTree jitter branch)
+- [ ] n_epochs as list (embedding_list snapshots)
+- [ ] transform_mode="graph"; finite `disconnection_distance`
+- [ ] `inverse_transform`
+- [ ] `update()` (incremental fit with new data)
+- [ ] Sparse completeness: sparse transform() (sparse hub trees + sparse graph search / prepare), remaining sparse_named_distances metrics
+- [ ] AlignedUMAP (aligned_umap.py)
+- [ ] Out of C++ scope (document in README): ParametricUMAP (TensorFlow/Keras), umap.plot (matplotlib), Bokeh/interactive tooling
+
 ## Phase 2 — Tests (port of umap/tests)
 - [ ] Test harness + small datasets (iris baked in; synthetic clusters; nn data)
 - [ ] test_umap_nn equivalents (kNN accuracy ≥ thresholds)
