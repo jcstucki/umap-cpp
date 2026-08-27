@@ -61,6 +61,58 @@ target_include_directories(umapcpp SYSTEM PUBLIC
 target_sources(umapcpp PRIVATE src/umap.cpp)
 # ----------------------------------------------------------------------------
 
+# --- metal-gpu additions ----------------------------------------------------
+# Apple Metal GPU kernels (brute-force kNN + SGD layout). Gated so CPU-only
+# builds (and non-Apple platforms) keep working: -DUMAP_ENABLE_METAL=OFF.
+if(APPLE)
+    option(UMAP_ENABLE_METAL "Build the Apple Metal GPU kernels" ON)
+else()
+    option(UMAP_ENABLE_METAL "Build the Apple Metal GPU kernels" OFF)
+endif()
+
+target_sources(umapcpp PRIVATE src/device.cpp)  # CPU fallback of metal_available()
+
+if(UMAP_ENABLE_METAL)
+    if(NOT APPLE)
+        message(FATAL_ERROR "UMAP_ENABLE_METAL requires an Apple platform")
+    endif()
+
+    # Compile the .metal shaders into a .metallib at build time.
+    set(UMAP_METAL_SHADER ${CMAKE_CURRENT_SOURCE_DIR}/src/metal/umap_kernels.metal)
+    set(UMAP_METAL_AIR ${CMAKE_CURRENT_BINARY_DIR}/umap_kernels.air)
+    set(UMAP_METALLIB ${CMAKE_CURRENT_BINARY_DIR}/umap_kernels.metallib)
+    add_custom_command(
+        OUTPUT ${UMAP_METAL_AIR}
+        COMMAND xcrun -sdk macosx metal -c ${UMAP_METAL_SHADER} -o ${UMAP_METAL_AIR}
+        DEPENDS ${UMAP_METAL_SHADER}
+        COMMENT "Compiling Metal shaders (umap_kernels.metal -> .air)"
+        VERBATIM)
+    add_custom_command(
+        OUTPUT ${UMAP_METALLIB}
+        COMMAND xcrun -sdk macosx metallib ${UMAP_METAL_AIR} -o ${UMAP_METALLIB}
+        DEPENDS ${UMAP_METAL_AIR}
+        COMMENT "Linking Metal library (umap_kernels.metallib)"
+        VERBATIM)
+    add_custom_target(umap_metallib ALL DEPENDS ${UMAP_METALLIB})
+
+    target_sources(umapcpp PRIVATE
+        src/metal/metal_context.cpp
+        src/metal/gpu_knn.cpp
+        src/metal/gpu_layout.cpp)
+    add_dependencies(umapcpp umap_metallib)
+    # metal-cpp (vendored, Apple's C++ Metal API): SYSTEM to keep -Wpedantic quiet.
+    target_include_directories(umapcpp SYSTEM PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/metal-cpp)
+    target_compile_definitions(umapcpp PUBLIC UMAP_ENABLE_METAL=1)
+    # Default metallib location for this build tree; runtime override via the
+    # UMAP_METALLIB_PATH environment variable (installation story: Phase 4).
+    target_compile_definitions(umapcpp PRIVATE
+        UMAP_DEFAULT_METALLIB="${UMAP_METALLIB}")
+    target_link_libraries(umapcpp PUBLIC
+        "-framework Metal" "-framework Foundation" "-framework QuartzCore")
+endif()
+# ----------------------------------------------------------------------------
+
 enable_testing()
 
 add_executable(umap_tests
@@ -97,6 +149,12 @@ target_sources(umap_tests PRIVATE tests/test_spectral.cpp)
 
 # --- umap-class additions ---------------------------------------------------
 target_sources(umap_tests PRIVATE tests/test_umap.cpp)
+# ----------------------------------------------------------------------------
+
+# --- metal-gpu additions ----------------------------------------------------
+if(UMAP_ENABLE_METAL)
+    target_sources(umap_tests PRIVATE tests/test_metal.cpp)
+endif()
 # ----------------------------------------------------------------------------
 
 add_test(NAME umap_tests COMMAND umap_tests)
