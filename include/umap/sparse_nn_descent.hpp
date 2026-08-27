@@ -63,9 +63,24 @@
 //    the dense path.
 //
 //  transform(X_new) for sparse training data uses the pynndescent *sparse*
-//  prepared-search path (sparse hub trees + sparse graph search), which is
-//  NOT ported yet; a UMAP class should throw for transform-on-sparse until
-//  then (fit/fit_transform are fully covered).
+//  prepared-search path (sparse hub trees + sparse graph search), ported
+//  below as SparsePreparedIndex (mirroring the dense nnd::PreparedIndex).
+//  Wiring for the UMAP class (owned by another agent):
+//    * fit: when n >= 4096 (or force_approximation_algorithm), build the
+//      index via SparsePreparedIndex::build(...) continuing the fit's
+//      NumpyRandomState (draw order identical to NNDescent.__init__; prepare
+//      draws nothing from the RandomState) and consume knn_indices()/
+//      knn_dists() exactly like the dense path keeps its PreparedIndex.
+//    * transform: X_new as CSR (sorted indices, float32);
+//      epsilon = 0.24 if angular trees (cosine) else 0.12; k = n_neighbors:
+//        index.query(q_indptr, q_indices, q_data, n_queries, n_neighbors,
+//                    epsilon, out_ind, out_dist);
+//      downstream (smooth_knn_dist with adjusted local_connectivity,
+//      bipartite membership, init_graph_transform, SGD) is shared with dense.
+//    * small-data fits (n < 4096) never build an index upstream; transform
+//      then brute-forces kNN of X_new vs the training data
+//      (sparse_brute_force_knn generalises; upstream uses sklearn
+//      pairwise_distances in float64).
 // ---------------------------------------------------------------------------
 #pragma once
 
@@ -196,6 +211,143 @@ void nearest_neighbors_sparse_with_state(
     bool angular, const int64_t rng_state[3],
     const std::vector<std::array<int64_t, 3>>& tree_rng_states,
     int32_t* knn_indices, float* knn_dists, bool verbose = false);
+
+// --------------------------------------------------- query path (transform)
+// Faithful port of NNDescent.prepare() + query() for the *sparse* path
+// UMAP's transform() hits when the training data was sparse: graph-informed
+// sparse hub search tree (rp_trees.py::make_sparse_hub_tree +
+// convert_tree_format's sparse branch), occlusion-pruned search graph
+// (sparse.py::diversify / diversify_csr + the shared degree_prune /
+// symmetric-max machinery), and the sparse epsilon-bounded graph search
+// (pynndescent_.py::_init_sparse_search_function's search_closure).
+//
+// Faithfulness notes (vs the numba reference):
+//  * the flat sparse tree stores each internal node's hyperplane as a padded
+//    (2, n_samples) float32 block whose row 0 holds the CSR column indices as
+//    floats; sparse_select_side re-derives the true length by trimming
+//    trailing negative entries. The port stores the trimmed (int32, float32)
+//    pairs directly -- an exact representation of the same information
+//    (indices < 2^24 round-trip through float32 losslessly; degenerate
+//    fallback splits store the sentinel [-1] hyperplane, which trims empty).
+//  * sparse.py::diversify_csr indexes its occluder correctly via order[k]
+//    (unlike the dense diversify_csr's raw-position quirk, which the dense
+//    port replicates separately); both behaviours are kept as upstream.
+//  * the sparse search closure's epsilon bound is
+//    float32(1 + epsilon) * heap_priorities[0] (min_distance is NOT used,
+//    unlike the dense closure), and query vectors are never normalised: the
+//    reference's `dist == alternative_dot/alternative_cosine` check compares
+//    against the *dense* kernels, which a sparse _distance_func never equals.
+//    Both quirks are replicated (cosine is scale-invariant, so only float
+//    rounding is affected).
+
+// Converted flat sparse search tree (convert_tree_format sparse layout, with
+// hyperplanes held trimmed per node -- see notes above). Internal nodes:
+// children[2i] = left node, children[2i+1] = right node (> 0). Leaves:
+// children[2i] = -leaf_start, children[2i+1] = -leaf_end into `indices`.
+struct SparseFlatTree {
+    int64_t n_nodes = 0;
+    std::vector<std::vector<int32_t>> hyperplane_inds;  // per node (trimmed)
+    std::vector<std::vector<float>> hyperplane_data;    // per node (trimmed)
+    std::vector<float> offsets;                         // leaves: -inf
+    std::vector<int32_t> children;                      // n_nodes * 2
+    std::vector<int32_t> indices;                       // concatenated leaves
+};
+
+// rp_trees.py::make_sparse_hub_tree followed by convert_tree_format. The
+// neighbor graph (`knn_indices`, (n, n_neighbors) row-major, -1 padded)
+// drives the top-3-hub edge-cut-minimising hyperplane selection; `rng_state`
+// is only consumed by the degenerate-split random fallback. UMAP defaults:
+// leaf_size=30, max_depth=200.
+SparseFlatTree make_sparse_hub_tree(const CsrView& X,
+                                    const int32_t* knn_indices,
+                                    int64_t n_neighbors, int64_t rng_state[3],
+                                    int64_t leaf_size, bool angular,
+                                    int64_t max_depth);
+
+// Port of the graph half of NNDescent._init_search_graph for sparse data:
+// forward sparse.diversify on a copy of the kNN graph, CSR assembly (zero
+// distances -> FLOAT32_EPS, -1 entries dropped), sparse.diversify_csr
+// applied to the forward rows (scipy's zero-copy transpose quirk, exactly as
+// in the dense port), symmetric maximum combine, diagonal removal,
+// degree_prune to round(pruning_degree_multiplier * n_neighbors), binarise.
+// `knn_dists` are the *internal* (uncorrected) metric distances; `dist` the
+// matching internal metric. `rng_state` threads through both diversify
+// passes exactly as in Python.
+nnd::SearchGraph build_sparse_search_graph(
+    const CsrView& X, const int32_t* knn_indices, const float* knn_dists,
+    int64_t n_neighbors, SparseDistFn dist, int64_t rng_state[3],
+    double diversify_prob, double pruning_degree_multiplier);
+
+// A fitted + prepared index over a copy of the (CSR) training data. Mirrors
+// what UMAP keeps as `_knn_search_index` for sparse input: fit-time kNN
+// graph (for fuzzy_simplicial_set) plus everything query() needs.
+class SparsePreparedIndex {
+ public:
+    // NNDescent(csr_matrix, n_neighbors, metric, random_state=seed,
+    //           n_trees/n_iters = umap "hacked values", max_candidates=60,
+    //           low_memory=True, compressed=False) followed by .prepare().
+    static SparsePreparedIndex build(const int32_t* indptr,
+                                     const int32_t* indices, const float* data,
+                                     int64_t n, int64_t dim,
+                                     int64_t n_neighbors,
+                                     const std::string& metric,
+                                     uint32_t random_seed,
+                                     bool verbose = false);
+
+    // Overload continuing an existing numpy RandomState stream (for the UMAP
+    // class, so init/SGD seeding after NN search stays stream-parallel with
+    // Python). Draw order and count are identical to NNDescent.__init__
+    // (prepare() draws nothing from the RandomState).
+    static SparsePreparedIndex build(const int32_t* indptr,
+                                     const int32_t* indices, const float* data,
+                                     int64_t n, int64_t dim,
+                                     int64_t n_neighbors,
+                                     const std::string& metric,
+                                     NumpyRandomState& numpy_rs,
+                                     bool verbose = false);
+
+    // NNDescent.query(query_data, k, epsilon) for CSR query rows (sorted,
+    // duplicate-free column indices; float32 values). Outputs are
+    // (n_queries, k) row-major; indices refer to the original data order.
+    // UMAP's transform calls this with k = n_neighbors and epsilon = 0.12
+    // (0.24 for angular metrics).
+    void query(const int32_t* q_indptr, const int32_t* q_indices,
+               const float* q_data, int64_t n_queries, int64_t k,
+               double epsilon, int32_t* out_indices, float* out_dists) const;
+
+    // Fit-time kNN graph in original data order (NNDescent.neighbor_graph:
+    // corrected distances), (n, n_neighbors) row-major.
+    const std::vector<int32_t>& knn_indices() const { return knn_indices_; }
+    const std::vector<float>& knn_dists() const { return knn_dists_; }
+
+    // Introspection (parity tests against the Python reference).
+    const std::vector<int32_t>& vertex_order() const { return vertex_order_; }
+    const nnd::SearchGraph& search_graph() const { return search_graph_; }
+    const SparseFlatTree& search_tree() const { return tree_; }
+    const std::array<int64_t, 3>& search_rng_state() const {
+        return search_rng_state_;
+    }
+    float min_distance() const { return search_graph_.min_distance; }
+    int64_t n_points() const { return n_; }
+    int64_t dim() const { return dim_; }
+    int64_t n_neighbors() const { return n_neighbors_; }
+
+ private:
+    int64_t n_ = 0;
+    int64_t dim_ = 0;
+    int64_t n_neighbors_ = 0;
+    spdist::SparseMetricInfo metric_;
+    // training data re-ordered by vertex_order_ (owned CSR)
+    std::vector<int32_t> data_indptr_;
+    std::vector<int32_t> data_indices_;
+    std::vector<float> data_data_;
+    std::vector<int32_t> vertex_order_;  // new label -> original label
+    nnd::SearchGraph search_graph_;      // re-ordered, rows column-sorted
+    SparseFlatTree tree_;                // resorted (indices == arange)
+    std::array<int64_t, 3> search_rng_state_ = {0, 0, 0};  // post warm-up
+    std::vector<int32_t> knn_indices_;
+    std::vector<float> knn_dists_;
+};
 
 }  // namespace spnnd
 }  // namespace umap
