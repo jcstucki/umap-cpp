@@ -32,6 +32,10 @@ target_sources(umapcpp PRIVATE src/nn_descent.cpp)
 target_sources(umapcpp PRIVATE src/nn_query.cpp)
 # ----------------------------------------------------------------------------
 
+# --- sparse-input additions -------------------------------------------------
+target_sources(umapcpp PRIVATE src/sparse_distances.cpp src/sparse_nn_descent.cpp)
+# ----------------------------------------------------------------------------
+
 # --- spectral-init additions ------------------------------------------------
 # Eigen + Spectra, header-only via FetchContent. SOURCE_SUBDIR points at a
 # directory without a CMakeLists.txt so MakeAvailable only populates (no
@@ -81,6 +85,10 @@ target_sources(umap_tests PRIVATE tests/test_nn_descent.cpp)
 
 # --- query-path additions ---------------------------------------------------
 target_sources(umap_tests PRIVATE tests/test_query.cpp)
+# ----------------------------------------------------------------------------
+
+# --- sparse-input additions -------------------------------------------------
+target_sources(umap_tests PRIVATE tests/test_sparse.cpp)
 # ----------------------------------------------------------------------------
 
 # --- spectral-init additions ------------------------------------------------
