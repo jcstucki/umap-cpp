@@ -99,6 +99,22 @@ std::vector<float> simplicial_set_embedding_from_init(
     const SparseMatrix& graph, const float* init_embedding, int n_components,
     double a, double b, const int64_t rng_state[3], int n_epochs = -1,
     double gamma = 1.0, double initial_alpha = 1.0,
-    double negative_sample_rate = 5.0, bool parallel = false);
+    double negative_sample_rate = 5.0, bool parallel = false,
+    bool graph_prefiltered = false);
+
+// --- umap-class additions ---------------------------------------------------
+// The n_epochs-resolution + weight-filtering prologue of
+// umap_.py::simplicial_set_embedding, split out because UMAP.fit needs the
+// *filtered* graph before this point (spectral initialisation runs on it):
+//   - default_epochs = 500 if n_samples <= 10000 else 200; n_epochs < 0 means
+//     "None" and resolves to the default;
+//   - graph.data[graph.data < graph.data.max() / n_epochs] = 0.0 (the divisor
+//     is default_epochs when n_epochs <= 10), then eliminate_zeros().
+// Returns the resolved n_epochs; `graph` is modified in place.
+// simplicial_set_embedding_from_init applies this internally unless
+// graph_prefiltered is true (in which case the caller must pass the resolved
+// n_epochs and an already-filtered graph).
+int resolve_epochs_and_filter_graph(SparseMatrix& graph, int n_epochs);
+// ----------------------------------------------------------------------------
 
 }  // namespace umap

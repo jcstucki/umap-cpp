@@ -17,22 +17,27 @@ SmoothKnnResult smooth_knn_dist(const float* distances, int n_samples,
     res.rhos.assign(static_cast<std::size_t>(n_samples), 0.0f);
     res.sigmas.assign(static_cast<std::size_t>(n_samples), 0.0f);
 
-    // np.mean over the full (float32) matrix.
-    double total = 0.0;
+    // np.mean over the full (float32) matrix. numba's np.mean on a float32
+    // array accumulates and divides in float32, sequentially.
+    float total = 0.0f;
     const std::size_t n_total =
         static_cast<std::size_t>(n_samples) * static_cast<std::size_t>(n_neighbors);
     for (std::size_t i = 0; i < n_total; ++i) total += distances[i];
-    const float mean_distances =
-        static_cast<float>(total / static_cast<double>(n_total));
+    const float mean_distances = total / static_cast<float>(n_total);
 
     std::vector<float> non_zero_dists;
     non_zero_dists.reserve(static_cast<std::size_t>(n_neighbors));
 
     for (int i = 0; i < n_samples; ++i) {
-        // numba locals: lo/hi/mid/psum are float32
-        float lo = 0.0f;
-        float hi = NPY_FLOATMAX;
-        float mid = 1.0f;
+        // The reference declares lo/hi/mid/psum float32 in the numba `locals`
+        // dict, but with parallel=True the prange body is lifted into a
+        // parfor gufunc where `locals` does NOT apply: the actual compiled
+        // code runs the whole bisection in float64 (verified against the
+        // reference row by row; only `d` stays float32 since the arrays are
+        // float32).
+        double lo = 0.0;
+        double hi = static_cast<double>(NPY_FLOATMAX);
+        double mid = 1.0;
 
         const float* ith_distances =
             distances + static_cast<std::size_t>(i) * n_neighbors;
@@ -47,10 +52,13 @@ SmoothKnnResult smooth_knn_dist(const float* distances, int n_samples,
             if (index > 0) {
                 res.rhos[i] = non_zero_dists[static_cast<std::size_t>(index) - 1];
                 if (interpolation > SMOOTH_K_TOLERANCE) {
-                    res.rhos[i] += static_cast<float>(
+                    // rho[i] += interpolation * (nz[index] - nz[index-1]):
+                    // f4 + f8 product evaluated in f8, single-rounded on store.
+                    res.rhos[i] = static_cast<float>(
+                        static_cast<double>(res.rhos[i]) +
                         interpolation *
-                        (non_zero_dists[static_cast<std::size_t>(index)] -
-                         non_zero_dists[static_cast<std::size_t>(index) - 1]));
+                            (non_zero_dists[static_cast<std::size_t>(index)] -
+                             non_zero_dists[static_cast<std::size_t>(index) - 1]));
                 }
             } else {
                 res.rhos[i] =
@@ -63,50 +71,51 @@ SmoothKnnResult smooth_knn_dist(const float* distances, int n_samples,
         }
 
         for (int n = 0; n < n_iter; ++n) {
-            float psum = 0.0f;
+            double psum = 0.0;
             for (int j = 1; j < n_neighbors; ++j) {
-                float d = ith_distances[j] - res.rhos[i];
+                const float d = ith_distances[j] - res.rhos[i];  // f4 - f4
                 if (d > 0.0f) {
-                    psum += std::exp(-(d / mid));
+                    psum += std::exp(-(static_cast<double>(d) / mid));
                 } else {
-                    psum += 1.0f;
+                    psum += 1.0;
                 }
             }
 
-            if (std::fabs(static_cast<double>(psum) - target) < SMOOTH_K_TOLERANCE) {
+            if (std::fabs(psum - target) < SMOOTH_K_TOLERANCE) {
                 break;
             }
 
-            if (static_cast<double>(psum) > target) {
+            if (psum > target) {
                 hi = mid;
-                mid = (lo + hi) / 2.0f;
+                mid = (lo + hi) / 2.0;
             } else {
                 lo = mid;
-                if (hi >= NPY_FLOATMAX) {
-                    mid *= 2.0f;
+                if (hi >= static_cast<double>(NPY_FLOATMAX)) {
+                    mid *= 2.0;
                 } else {
-                    mid = (lo + hi) / 2.0f;
+                    mid = (lo + hi) / 2.0;
                 }
             }
         }
 
-        res.sigmas[i] = mid;
+        res.sigmas[i] = static_cast<float>(mid);
 
+        // np.mean(ith_distances): float32 accumulation/division under numba.
         if (res.rhos[i] > 0.0f) {
-            double row_total = 0.0;
+            float row_total = 0.0f;
             for (int j = 0; j < n_neighbors; ++j) row_total += ith_distances[j];
             const float mean_ith_distances =
-                static_cast<float>(row_total / n_neighbors);
-            if (res.sigmas[i] <
-                static_cast<float>(MIN_K_DIST_SCALE * mean_ith_distances)) {
-                res.sigmas[i] =
-                    static_cast<float>(MIN_K_DIST_SCALE * mean_ith_distances);
+                row_total / static_cast<float>(n_neighbors);
+            const double clamp =
+                MIN_K_DIST_SCALE * static_cast<double>(mean_ith_distances);
+            if (static_cast<double>(res.sigmas[i]) < clamp) {
+                res.sigmas[i] = static_cast<float>(clamp);
             }
         } else {
-            if (res.sigmas[i] <
-                static_cast<float>(MIN_K_DIST_SCALE * mean_distances)) {
-                res.sigmas[i] =
-                    static_cast<float>(MIN_K_DIST_SCALE * mean_distances);
+            const double clamp =
+                MIN_K_DIST_SCALE * static_cast<double>(mean_distances);
+            if (static_cast<double>(res.sigmas[i]) < clamp) {
+                res.sigmas[i] = static_cast<float>(clamp);
             }
         }
     }

@@ -53,6 +53,10 @@ target_include_directories(umapcpp SYSTEM PUBLIC
 )
 # ----------------------------------------------------------------------------
 
+# --- umap-class additions ---------------------------------------------------
+target_sources(umapcpp PRIVATE src/umap.cpp)
+# ----------------------------------------------------------------------------
+
 enable_testing()
 
 add_executable(umap_tests
@@ -81,6 +85,10 @@ target_sources(umap_tests PRIVATE tests/test_query.cpp)
 
 # --- spectral-init additions ------------------------------------------------
 target_sources(umap_tests PRIVATE tests/test_spectral.cpp)
+# ----------------------------------------------------------------------------
+
+# --- umap-class additions ---------------------------------------------------
+target_sources(umap_tests PRIVATE tests/test_umap.cpp)
 # ----------------------------------------------------------------------------
 
 add_test(NAME umap_tests COMMAND umap_tests)

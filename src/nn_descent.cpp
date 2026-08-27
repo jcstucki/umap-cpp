@@ -889,6 +889,15 @@ void nearest_neighbors(const float* data, int64_t n, int64_t dim,
                        int64_t n_neighbors, const std::string& metric,
                        bool angular, uint32_t random_seed,
                        int32_t* knn_indices, float* knn_dists, bool verbose) {
+    NumpyRandomState numpy_rs(random_seed);
+    nearest_neighbors(data, n, dim, n_neighbors, metric, angular, numpy_rs,
+                      knn_indices, knn_dists, verbose);
+}
+
+void nearest_neighbors(const float* data, int64_t n, int64_t dim,
+                       int64_t n_neighbors, const std::string& metric,
+                       bool angular, NumpyRandomState& numpy_rs,
+                       int32_t* knn_indices, float* knn_dists, bool verbose) {
     (void)angular;  // only affects callable metrics in pynndescent
     MetricInfo m = resolve_metric(metric);
 
@@ -901,7 +910,6 @@ void nearest_neighbors(const float* data, int64_t n, int64_t dim,
 
     // NNDescent.__init__ seeding order: rng_state, search_rng_state, then the
     // per-tree states inside make_forest.
-    NumpyRandomState numpy_rs(random_seed);
     std::array<int64_t, 3> rng_state_arr = numpy_rs.rng_state3();
     std::array<int64_t, 3> search_rng_state = numpy_rs.rng_state3();
     (void)search_rng_state;  // consumed for draw-order parity; search not ported

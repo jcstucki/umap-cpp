@@ -31,6 +31,7 @@
 #pragma once
 
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <random>
 #include <string>
@@ -67,8 +68,46 @@ class NumpyRandomState {
         return {randint_pynn(), randint_pynn(), randint_pynn()};
     }
 
+    // ---- umap-class additions: numpy legacy continuous draws ----
+    // rk_double: 53-bit uniform double in [0, 1).
+    double random_sample() {
+        uint64_t a = mt_() >> 5;  // 27 bits
+        uint64_t b = mt_() >> 6;  // 26 bits
+        return (static_cast<double>(a) * 67108864.0 + static_cast<double>(b)) /
+               9007199254740992.0;
+    }
+
+    // RandomState.uniform(low, high) for scalars (rk_uniform).
+    double uniform(double low, double high) {
+        return low + (high - low) * random_sample();
+    }
+
+    // rk_gauss: legacy polar (Marsaglia) method with the cached second value,
+    // exactly as numpy's RandomState.standard_normal / normal.
+    double gauss() {
+        if (has_gauss_) {
+            has_gauss_ = false;
+            return gauss_;
+        }
+        double x1, x2, r2;
+        do {
+            x1 = 2.0 * random_sample() - 1.0;
+            x2 = 2.0 * random_sample() - 1.0;
+            r2 = x1 * x1 + x2 * x2;
+        } while (r2 >= 1.0 || r2 == 0.0);
+        const double f = std::sqrt(-2.0 * std::log(r2) / r2);
+        gauss_ = f * x1;
+        has_gauss_ = true;
+        return f * x2;
+    }
+
+    // RandomState.normal(loc, scale) for scalars (rk_normal).
+    double normal(double loc, double scale) { return loc + scale * gauss(); }
+
  private:
     std::mt19937 mt_;
+    bool has_gauss_ = false;
+    double gauss_ = 0.0;
 };
 
 // Python-semantics modulo (result sign follows the divisor; here divisor > 0).
@@ -222,6 +261,16 @@ void nearest_neighbors(const float* data, int64_t n, int64_t dim,
                        int32_t* knn_indices, float* knn_dists,
                        bool verbose = false);
 
+// Overload continuing an existing numpy RandomState stream (the situation in
+// UMAP.fit, where the same random_state object is consumed by NNDescent and
+// then by the embedding initialisation). Draw order matches
+// NNDescent.__init__: rng_state (3), search_rng_state (3), per-tree states.
+void nearest_neighbors(const float* data, int64_t n, int64_t dim,
+                       int64_t n_neighbors, const std::string& metric,
+                       bool angular, NumpyRandomState& numpy_rs,
+                       int32_t* knn_indices, float* knn_dists,
+                       bool verbose = false);
+
 // Same, but with explicit tau-prng states (for tests / callers that extracted
 // states from Python): `rng_state` is NNDescent.rng_state and
 // `tree_rng_states` the per-tree states drawn in make_forest.
@@ -297,6 +346,15 @@ class PreparedIndex {
     static PreparedIndex build(const float* data, int64_t n, int64_t dim,
                                int64_t n_neighbors, const std::string& metric,
                                uint32_t random_seed, bool verbose = false);
+
+    // Overload continuing an existing numpy RandomState stream (used by the
+    // UMAP class so init/SGD seeding after NN search stays stream-parallel
+    // with Python). Numpy draw order and count are identical to
+    // NNDescent.__init__ (prepare() draws nothing from the RandomState).
+    static PreparedIndex build(const float* data, int64_t n, int64_t dim,
+                               int64_t n_neighbors, const std::string& metric,
+                               NumpyRandomState& numpy_rs,
+                               bool verbose = false);
 
     // NNDescent.query(query_data, k, epsilon). Outputs are (n_queries, k)
     // row-major; indices refer to the original data order. UMAP's transform

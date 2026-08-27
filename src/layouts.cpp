@@ -230,16 +230,8 @@ void optimize_layout_euclidean(
     }
 }
 
-std::vector<float> simplicial_set_embedding_from_init(
-    const SparseMatrix& graph_in, const float* init_embedding, int n_components,
-    double a, double b, const int64_t rng_state[3], int n_epochs, double gamma,
-    double initial_alpha, double negative_sample_rate, bool parallel) {
-    // graph = graph.tocoo(); graph.sum_duplicates() — identity for our
-    // canonical CSR (row-major, per-row sorted, no duplicates).
-    SparseMatrix graph = graph_in;
-    const int n_samples = graph.n_rows;
-    const int n_vertices = graph.n_cols;
-
+// --- umap-class additions ---------------------------------------------------
+int resolve_epochs_and_filter_graph(SparseMatrix& graph, int n_epochs) {
     // For smaller datasets we can use more epochs.
     const int default_epochs = (graph.n_rows <= 10000) ? 500 : 200;
     if (n_epochs < 0) n_epochs = default_epochs;  // n_epochs is None
@@ -260,6 +252,29 @@ std::vector<float> simplicial_set_embedding_from_init(
         }
     }
     graph.eliminate_zeros();
+    return n_epochs;
+}
+// ----------------------------------------------------------------------------
+
+std::vector<float> simplicial_set_embedding_from_init(
+    const SparseMatrix& graph_in, const float* init_embedding, int n_components,
+    double a, double b, const int64_t rng_state[3], int n_epochs, double gamma,
+    double initial_alpha, double negative_sample_rate, bool parallel,
+    bool graph_prefiltered) {
+    // graph = graph.tocoo(); graph.sum_duplicates() — identity for our
+    // canonical CSR (row-major, per-row sorted, no duplicates).
+    SparseMatrix graph = graph_in;
+    const int n_samples = graph.n_rows;
+    const int n_vertices = graph.n_cols;
+
+    if (!graph_prefiltered) {
+        n_epochs = resolve_epochs_and_filter_graph(graph, n_epochs);
+    } else if (n_epochs < 0) {
+        throw std::invalid_argument(
+            "simplicial_set_embedding_from_init: graph_prefiltered requires "
+            "the resolved n_epochs");
+    }
+    const int n_epochs_max = n_epochs;
 
     // head = graph.row; tail = graph.col (COO of the canonical CSR).
     std::vector<int32_t> head;
