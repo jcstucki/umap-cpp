@@ -24,6 +24,10 @@ find_package(Threads REQUIRED)  # hogwild parallel mode (std::thread)
 target_link_libraries(umapcpp PUBLIC Threads::Threads)
 # ----------------------------------------------------------------------------
 
+# --- metrics-full additions -------------------------------------------------
+target_sources(umapcpp PRIVATE src/layouts_generic.cpp)
+# ----------------------------------------------------------------------------
+
 # --- nn-descent additions ---------------------------------------------------
 target_sources(umapcpp PRIVATE src/nn_descent.cpp)
 # ----------------------------------------------------------------------------
@@ -129,6 +133,12 @@ target_compile_options(umap_tests PRIVATE -O2 -Wall -Wextra)
 
 # --- layout-sgd additions (branch layout-sgd) -------------------------------
 target_sources(umap_tests PRIVATE tests/test_layout.cpp)
+# ----------------------------------------------------------------------------
+
+# --- metrics-full additions -------------------------------------------------
+target_sources(umap_tests PRIVATE
+    tests/test_metrics_full.cpp
+    tests/test_layout_generic.cpp)
 # ----------------------------------------------------------------------------
 
 # --- nn-descent additions ---------------------------------------------------
