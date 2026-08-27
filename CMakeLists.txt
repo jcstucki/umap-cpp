@@ -151,6 +151,10 @@ target_sources(umap_tests PRIVATE tests/test_spectral.cpp)
 target_sources(umap_tests PRIVATE tests/test_umap.cpp)
 # ----------------------------------------------------------------------------
 
+# --- feature-bundle additions ------------------------------------------------
+target_sources(umap_tests PRIVATE tests/test_umap_features.cpp)
+# ----------------------------------------------------------------------------
+
 # --- metal-gpu additions ----------------------------------------------------
 if(UMAP_ENABLE_METAL)
     target_sources(umap_tests PRIVATE tests/test_metal.cpp)

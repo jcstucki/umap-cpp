@@ -167,16 +167,19 @@ MembershipStrengths compute_membership_strengths(
 FuzzySimplicialSetResult fuzzy_simplicial_set(
     int n_samples, const int32_t* knn_indices, const float* knn_dists,
     int n_neighbors, double set_op_mix_ratio, double local_connectivity,
-    bool apply_set_operations, bool return_dists) {
+    bool apply_set_operations, bool return_dists, int n_cols) {
     FuzzySimplicialSetResult out;
+    if (n_cols < 0) n_cols = n_neighbors;
 
+    // The row width of the knn arrays comes from their shape upstream; the
+    // smoothing target k stays float(n_neighbors) even when they differ.
     SmoothKnnResult smooth = smooth_knn_dist(
-        knn_dists, n_samples, n_neighbors, static_cast<double>(n_neighbors),
+        knn_dists, n_samples, n_cols, static_cast<double>(n_neighbors),
         /*n_iter=*/64, local_connectivity);
 
     MembershipStrengths ms = compute_membership_strengths(
         knn_indices, knn_dists, smooth.sigmas.data(), smooth.rhos.data(),
-        n_samples, n_neighbors, return_dists);
+        n_samples, n_cols, return_dists);
 
     SparseMatrix result =
         SparseMatrix::from_coo(n_samples, n_samples, ms.rows, ms.cols, ms.vals);

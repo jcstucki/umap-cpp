@@ -69,13 +69,24 @@ std::vector<double> make_epochs_per_sample(const float* weights,
 //                  is deterministic.
 //  densmap:        TODO: densMAP objective not yet ported; must be false
 //                  (parameters accepted for signature parity only).
+//  epochs_list / embedding_list: the "n_epochs is a list" variant. When
+//                  epochs_list is non-null, n_epochs is overridden with
+//                  max(*epochs_list) (as upstream does) and a copy of
+//                  head_embedding is appended to *embedding_list after every
+//                  epoch n with n in *epochs_list (checked after the alpha
+//                  decay, exactly where the reference snapshots), plus one
+//                  final copy after the last epoch. The reference then returns
+//                  the list instead of the embedding; here head_embedding
+//                  still holds the final state (== embedding_list->back()).
 void optimize_layout_euclidean(
     float* head_embedding, int n_head_vertices, float* tail_embedding, int dim,
     const std::vector<int32_t>& head, const std::vector<int32_t>& tail,
     int n_epochs, int n_vertices, const std::vector<double>& epochs_per_sample,
     double a, double b, const int64_t rng_state[3], double gamma = 1.0,
     double initial_alpha = 1.0, double negative_sample_rate = 5.0,
-    bool parallel = false, bool densmap = false, bool move_other = false);
+    bool parallel = false, bool densmap = false, bool move_other = false,
+    const std::vector<int>* epochs_list = nullptr,
+    std::vector<std::vector<float>>* embedding_list = nullptr);
 
 // The non-initialisation glue of umap_.py::simplicial_set_embedding for the
 // euclidean output metric, densmap off:
@@ -95,12 +106,18 @@ void optimize_layout_euclidean(
 // `init_embedding` (n_samples x n_components, row-major float32) and this
 // function applies the [0, 10] rescale before optimisation. rng_state stands
 // in for the reference's random_state.randint(INT32_MIN, INT32_MAX, 3).
+// epochs_list / embedding_list mirror optimize_layout_euclidean's list
+// variant; when epochs_list is set, n_epochs must be max(*epochs_list) (the
+// value the reference's `n_epochs_max` takes for filtering and
+// epochs-per-sample) and the snapshots land in *embedding_list.
 std::vector<float> simplicial_set_embedding_from_init(
     const SparseMatrix& graph, const float* init_embedding, int n_components,
     double a, double b, const int64_t rng_state[3], int n_epochs = -1,
     double gamma = 1.0, double initial_alpha = 1.0,
     double negative_sample_rate = 5.0, bool parallel = false,
-    bool graph_prefiltered = false);
+    bool graph_prefiltered = false,
+    const std::vector<int>* epochs_list = nullptr,
+    std::vector<std::vector<float>>* embedding_list = nullptr);
 
 // --- umap-class additions ---------------------------------------------------
 // The n_epochs-resolution + weight-filtering prologue of

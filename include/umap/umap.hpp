@@ -23,11 +23,39 @@
 //     filtering, optimize_layout_euclidean with move_other=False and
 //     initial_alpha / 4 against the (copied) training embedding.
 //
-// Deferred (upstream branches NOT ported): sparse input, precomputed
-// metric/knn, unique=True, supervised fit (y), densmap / output_dens,
-// non-euclidean output metrics, init="pca"/"tswspectral" or ndarray init,
-// n_epochs lists, transform_mode="graph", disconnection_distance overrides,
-// inverse_transform / update.
+// Feature-bundle additions (Phase 1b, dense paths):
+//   * metric="precomputed": X is an n x n distance matrix. Small data reuses
+//     the precomputed dmat directly (sklearn pairwise_distances passthrough);
+//     the standard branch replicates nearest_neighbors' precomputed path
+//     (fast_knn_indices + inf -> -1 pruning, no search index -- transform
+//     then raises like upstream). transform() with precomputed after a
+//     small-data fit takes the argpartition kNN path with the upstream
+//     warning + asserts. The upstream *sparse* precomputed branch is not
+//     ported.
+//   * precomputed_knn: (indices, dists[, search_index]) tuples bypass kNN
+//     computation with upstream's validation/warning semantics, including
+//     the elif-chain quirk that skips column pruning when n < 4096 (the
+//     fuzzy set then runs on the wider arrays with k = n_neighbors).
+//   * unique=true: np.unique(axis=0) row dedup (lexicographic stable sort),
+//     fit on the unique rows, inverse-mapped embedding (unique_inverse()).
+//   * init="pca" (dense PCA, sklearn svd_flip u_based_decision=False sign
+//     convention, noisy_scale_coords; computed in float64 vs sklearn's
+//     float32 LAPACK -- documented tolerance) and init as a user ndarray
+//     (init_array), including the KDTree duplicate-row jitter branch
+//     (exact 2-NN, np.mean pairwise-summation parity).
+//   * n_epochs as a list (n_epochs_list): runs to max(list), snapshots at
+//     each listed epoch; embedding_list() (inverse-expanded like upstream).
+//   * transform_mode="graph": fit skips the embedding exactly like upstream;
+//     fit_transform_graph() / transform_graph() return the CSR the reference
+//     returns from fit_transform / transform.
+//   * disconnection_distance: per-metric DISCONNECTION_DISTANCES defaults,
+//     edge removal in all fit branches and in transform's kNN, fully
+//     disconnected vertices -> NaN rows + upstream warning texts (stderr).
+//
+// Deferred (upstream branches NOT ported): sparse-input UMAP-class wiring,
+// sparse precomputed distances, supervised fit (y), densmap / output_dens,
+// non-euclidean output metrics, init="tswspectral", inverse_transform /
+// update / AlignedUMAP.
 //
 // Seeded parity: when random_state is set, the numpy legacy RandomState
 // stream is replicated draw for draw (NN-descent seeding, init draws --
@@ -54,19 +82,37 @@
 #include <string>
 #include <vector>
 
+#include "umap/fuzzy_simplicial_set.hpp"
 #include "umap/nn_descent.hpp"
 #include "umap/sparse_matrix.hpp"
 
 namespace umap {
 
+// --- feature-bundle additions -----------------------------------------------
+// The `precomputed_knn=(knn_indices, knn_dists[, knn_search_index])` tuple.
+// indices/dists are row-major (n_samples x n_neighbors); search_index may be
+// null (upstream warns and transform() becomes unavailable).
+struct PrecomputedKnn {
+    std::vector<int32_t> indices;
+    std::vector<float> dists;
+    int64_t n_samples = 0;
+    int64_t n_neighbors = 0;
+    std::shared_ptr<nnd::PreparedIndex> search_index;
+};
+
+// umap_.py::DISCONNECTION_DISTANCES defaults for bounded metrics; every other
+// metric maps to +inf.
+double default_disconnection_distance(const std::string& metric);
+// ----------------------------------------------------------------------------
+
 // Constructor defaults mirror umap.UMAP's signature (the subset ported).
 struct UMAPParams {
     int n_neighbors = 15;
     int n_components = 2;
-    std::string metric = "euclidean";
+    std::string metric = "euclidean";     // named metrics or "precomputed"
     std::optional<int> n_epochs;          // None -> 500/200 (fit), 100/30 (transform)
     double learning_rate = 1.0;
-    std::string init = "spectral";        // "spectral" | "random" ("pca"/"tswspectral" TODO)
+    std::string init = "spectral";        // "spectral" | "random" | "pca" ("tswspectral" TODO)
     double min_dist = 0.1;
     double spread = 1.0;
     double set_op_mix_ratio = 1.0;
@@ -81,6 +127,23 @@ struct UMAPParams {
     bool angular_rp_forest = false;       // accepted for parity; named metrics decide trees
     bool force_approximation_algorithm = false;
     bool verbose = false;
+    // --- feature-bundle additions -------------------------------------------
+    // n_epochs given as a list (upstream: the same n_epochs parameter). At
+    // most one of n_epochs / n_epochs_list may be set; the intermediate
+    // embeddings land in UMAP::embedding_list().
+    std::optional<std::vector<int>> n_epochs_list;
+    // init as a user ndarray (upstream: init=np.ndarray). When set, `init`
+    // (the string) is ignored. Row-major n_samples x init_array_cols;
+    // init_array_cols = -1 means n_components (the only valid width --
+    // upstream raises "init ndarray must match n_components value").
+    std::optional<std::vector<float>> init_array;
+    int64_t init_array_cols = -1;
+    bool unique = false;
+    // None -> DISCONNECTION_DISTANCES.get(metric, inf).
+    std::optional<double> disconnection_distance;
+    std::string transform_mode = "embedding";  // "embedding" | "graph"
+    std::optional<PrecomputedKnn> precomputed_knn;
+    // ------------------------------------------------------------------------
 };
 
 class UMAP {
@@ -91,12 +154,24 @@ class UMAP {
     UMAP& fit(const float* X, int64_t n_samples, int64_t n_features);
 
     // fit + return a copy of the embedding (n_samples x n_components).
+    // transform_mode="graph" raises here (the reference returns the graph from
+    // fit_transform; in C++ use fit_transform_graph for that variant).
     std::vector<float> fit_transform(const float* X, int64_t n_samples,
                                      int64_t n_features);
 
     // Transform new points (row-major n_queries x n_features) into the
     // existing embedded space; returns n_queries x n_components.
     std::vector<float> transform(const float* X_new, int64_t n_queries) const;
+
+    // --- feature-bundle additions -------------------------------------------
+    // fit_transform for transform_mode="graph": returns self.graph_ (the CSR
+    // fuzzy simplicial set) like the reference's fit_transform.
+    const SparseMatrix& fit_transform_graph(const float* X, int64_t n_samples,
+                                            int64_t n_features);
+    // transform for transform_mode="graph": the bipartite membership graph
+    // (n_queries x n_train CSR) the reference's transform returns.
+    SparseMatrix transform_graph(const float* X_new, int64_t n_queries) const;
+    // ------------------------------------------------------------------------
 
     // -------- fitted attributes (valid after fit) --------
     const std::vector<float>& embedding() const { return embedding_; }
@@ -117,10 +192,38 @@ class UMAP {
     int64_t n_features() const { return dim_; }
     const UMAPParams& params() const { return params_; }
 
+    // --- feature-bundle additions -------------------------------------------
+    // self.embedding_list_ (n_epochs_list fits only): one inverse-expanded
+    // snapshot per listed epoch that is reached, plus the final embedding.
+    const std::vector<std::vector<float>>& embedding_list() const {
+        return embedding_list_;
+    }
+    // self._unique_inverse_ (unique=true fits only): original row -> row of
+    // the deduplicated data (np.unique return_inverse semantics).
+    const std::vector<int64_t>& unique_inverse() const {
+        return unique_inverse_;
+    }
+    // self._disconnection_distance after resolution (valid after fit).
+    double disconnection_distance() const { return disconnection_distance_; }
+    // Disconnection bookkeeping from the last fit (raise_disconnected_warning
+    // inputs): edges removed by the threshold and vertices of graph_ with an
+    // all-zero row.
+    int64_t edges_removed() const { return edges_removed_; }
+    int64_t vertices_disconnected() const { return vertices_disconnected_; }
+    // ------------------------------------------------------------------------
+
  private:
     void validate_parameters() const;
-    std::vector<float> make_fit_init(const SparseMatrix& filtered_graph,
+    std::vector<float> make_fit_init(const float* data, int64_t n_index,
+                                     const SparseMatrix& filtered_graph,
                                      nnd::NumpyRandomState& rs) const;
+    // The shared transform prologue: kNN of the new points vs the training
+    // data (precomputed / brute-force / query paths), disconnection pruning,
+    // smooth_knn_dist and compute_membership_strengths(bipartite=True).
+    // Returns the COO triplets in generation order (the transform SGD's edge
+    // order upstream).
+    MembershipStrengths transform_membership(const float* X_new,
+                                             int64_t n_queries) const;
 
     UMAPParams params_;
     double a_ = 0.0;
@@ -132,14 +235,23 @@ class UMAP {
     int64_t n_ = 0;
     int64_t dim_ = 0;
     std::vector<float> raw_data_;                    // training data copy
-    std::unique_ptr<nnd::PreparedIndex> knn_index_;  // standard branch only
+    std::shared_ptr<nnd::PreparedIndex> knn_index_;  // standard branch only
     std::vector<int32_t> knn_indices_;
     std::vector<float> knn_dists_;
+    int64_t knn_cols_ = 0;  // knn array width (may exceed n_neighbors_)
     SparseMatrix graph_;
     std::vector<float> sigmas_;
     std::vector<float> rhos_;
     std::vector<float> fit_init_;
     std::vector<float> embedding_;  // n_ x n_components row-major float32
+    // --- feature-bundle additions -------------------------------------------
+    bool force_approximation_algorithm_ = false;  // effective (pknn may set it)
+    double disconnection_distance_ = 0.0;         // _disconnection_distance
+    int64_t edges_removed_ = 0;
+    int64_t vertices_disconnected_ = 0;
+    std::vector<int64_t> unique_inverse_;
+    std::vector<std::vector<float>> embedding_list_;
+    // ------------------------------------------------------------------------
 };
 
 // Replication of the small-data branches' pairwise_distances(X, metric=
@@ -169,5 +281,24 @@ void fast_knn_from_dmat(const std::vector<float>& dmat, int64_t n, int64_t m,
 // NaN; rows containing a strength of exactly 1.0 copy that training point.
 std::vector<float> init_graph_transform(const SparseMatrix& graph,
                                         const float* embedding, int dim);
+
+// --- feature-bundle additions -----------------------------------------------
+// np.unique(X, axis=0, return_index=True, return_inverse=True) semantics for a
+// dense row-major float32 matrix: rows are compared lexicographically by value
+// (-0.0 == 0.0, like numpy's structured-dtype field comparison) with a stable
+// (mergesort) argsort, `index` collects the first original occurrence of each
+// unique row in sorted order, `inverse` maps original rows to unique rows.
+void unique_rows(const float* X, int64_t n, int64_t dim,
+                 std::vector<int64_t>& index, std::vector<int64_t>& inverse);
+
+// sklearn PCA(n_components).fit_transform for dense data: center by column
+// means, thin SVD, svd_flip(u, v, u_based_decision=False) sign convention
+// (each component's sign makes the largest-|.|-entry of the corresponding row
+// of V^T positive), returns U * S truncated to n_components (row-major
+// float32). Computed in float64 (sklearn runs float32 LAPACK on float32
+// input; documented ~1e-4-level tolerance vs the reference).
+std::vector<float> pca_fit_transform(const float* X, int64_t n, int64_t dim,
+                                     int n_components);
+// ----------------------------------------------------------------------------
 
 }  // namespace umap

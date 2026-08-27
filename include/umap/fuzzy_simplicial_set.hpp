@@ -50,10 +50,16 @@ struct FuzzySimplicialSetResult {
 // Build the (symmetrised) fuzzy simplicial set from a precomputed kNN graph.
 // knn_indices: row-major (n_samples x n_neighbors) int32 (-1 marks missing);
 // knn_dists: row-major (n_samples x n_neighbors) float32, rows sorted ascending.
+//
+// n_cols is the actual column count of the knn arrays; -1 means n_neighbors.
+// Upstream the two can differ: fuzzy_simplicial_set derives the row width from
+// knn_dists.shape[1] while smooth_knn_dist's target k is float(n_neighbors)
+// (this happens for `precomputed_knn` tuples wider than n_neighbors on small
+// data, where UMAP._validate_parameters skips the pruning branch).
 FuzzySimplicialSetResult fuzzy_simplicial_set(
     int n_samples, const int32_t* knn_indices, const float* knn_dists,
     int n_neighbors, double set_op_mix_ratio = 1.0,
     double local_connectivity = 1.0, bool apply_set_operations = true,
-    bool return_dists = false);
+    bool return_dists = false, int n_cols = -1);
 
 }  // namespace umap

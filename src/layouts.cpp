@@ -143,7 +143,19 @@ void optimize_layout_euclidean(
     int n_epochs, int n_vertices, const std::vector<double>& epochs_per_sample,
     double a, double b, const int64_t rng_state[3], double gamma,
     double initial_alpha, double negative_sample_rate, bool parallel,
-    bool densmap, bool move_other) {
+    bool densmap, bool move_other, const std::vector<int>* epochs_list,
+    std::vector<std::vector<float>>* embedding_list) {
+    // layouts.py: if isinstance(n_epochs, list): epochs_list = n_epochs;
+    //             n_epochs = max(epochs_list)
+    if (epochs_list != nullptr) {
+        if (epochs_list->empty() || embedding_list == nullptr) {
+            throw std::invalid_argument(
+                "optimize_layout_euclidean: epochs_list requires a non-empty "
+                "list and an embedding_list output");
+        }
+        n_epochs = *std::max_element(epochs_list->begin(), epochs_list->end());
+        embedding_list->clear();
+    }
     if (densmap) {
         // TODO(densmap): port _optimize_layout_euclidean_densmap_epoch_init and
         // the densmap_flag gradient correction. Accepted for signature parity.
@@ -227,6 +239,24 @@ void optimize_layout_euclidean(
 
         alpha = initial_alpha *
                 (1.0 - (static_cast<double>(n) / static_cast<double>(n_epochs)));
+
+        // if epochs_list is not None and n in epochs_list:
+        //     embedding_list.append(head_embedding.copy())
+        if (epochs_list != nullptr &&
+            std::find(epochs_list->begin(), epochs_list->end(), n) !=
+                epochs_list->end()) {
+            embedding_list->emplace_back(
+                head_embedding,
+                head_embedding +
+                    static_cast<std::size_t>(n_head_vertices) * dim);
+        }
+    }
+
+    // Add the last embedding to the list as well.
+    if (epochs_list != nullptr) {
+        embedding_list->emplace_back(
+            head_embedding,
+            head_embedding + static_cast<std::size_t>(n_head_vertices) * dim);
     }
 }
 
@@ -235,7 +265,9 @@ int resolve_epochs_and_filter_graph(SparseMatrix& graph, int n_epochs) {
     // For smaller datasets we can use more epochs.
     const int default_epochs = (graph.n_rows <= 10000) ? 500 : 200;
     if (n_epochs < 0) n_epochs = default_epochs;  // n_epochs is None
-    const int n_epochs_max = n_epochs;  // list-of-epochs variant not supported
+    // For the list-of-epochs variant callers pass max(list) here (upstream's
+    // n_epochs_max).
+    const int n_epochs_max = n_epochs;
 
     // graph.data[graph.data < graph.data.max() / n_epochs_max] = 0.0
     // (threshold computed in float32, like np.float32.max() / float(n)).
@@ -260,7 +292,8 @@ std::vector<float> simplicial_set_embedding_from_init(
     const SparseMatrix& graph_in, const float* init_embedding, int n_components,
     double a, double b, const int64_t rng_state[3], int n_epochs, double gamma,
     double initial_alpha, double negative_sample_rate, bool parallel,
-    bool graph_prefiltered) {
+    bool graph_prefiltered, const std::vector<int>* epochs_list,
+    std::vector<std::vector<float>>* embedding_list) {
     // graph = graph.tocoo(); graph.sum_duplicates() — identity for our
     // canonical CSR (row-major, per-row sorted, no duplicates).
     SparseMatrix graph = graph_in;
@@ -319,7 +352,8 @@ std::vector<float> simplicial_set_embedding_from_init(
                               n_components, head, tail, n_epochs, n_vertices,
                               epochs_per_sample, a, b, rng_state, gamma,
                               initial_alpha, negative_sample_rate, parallel,
-                              /*densmap=*/false, /*move_other=*/true);
+                              /*densmap=*/false, /*move_other=*/true,
+                              epochs_list, embedding_list);
     return embedding;
 }
 
