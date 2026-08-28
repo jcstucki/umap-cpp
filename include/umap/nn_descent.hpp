@@ -170,9 +170,10 @@ struct MetricInfo {
 };
 
 // Supported: "euclidean"/"l2", "sqeuclidean", "manhattan"/"taxicab"/"l1",
-// "cosine". Throws std::invalid_argument otherwise. The angular-trees decision
-// replicates pynndescent's metric list (umap's `angular` flag only matters for
-// callable metrics, which we do not support).
+// "cosine", and (tests-port additions, pynndescent fast_distance_alternatives
+// ports) "jaccard" + "hellinger". Throws std::invalid_argument otherwise. The
+// angular-trees decision replicates pynndescent's metric list (umap's
+// `angular` flag only matters for callable metrics, which we do not support).
 MetricInfo resolve_metric(const std::string& name);
 
 // ------------------------------------------------------------------ RP trees

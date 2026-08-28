@@ -144,6 +144,13 @@ struct UMAPParams {
     std::string transform_mode = "embedding";  // "embedding" | "graph"
     std::optional<PrecomputedKnn> precomputed_knn;
     // ------------------------------------------------------------------------
+    // --- tests-port additions -----------------------------------------------
+    // sklearn check_array finiteness validation. Upstream exposes this as the
+    // fit/fit_transform/transform kwarg `ensure_all_finite` (default True);
+    // the C++ port keeps it in the params struct. "true" -> NaN and inf
+    // raise; "allow-nan" -> only inf raises; "false" -> no check.
+    std::string ensure_all_finite = "true";
+    // ------------------------------------------------------------------------
 };
 
 class UMAP {
@@ -171,6 +178,19 @@ class UMAP {
     // transform for transform_mode="graph": the bipartite membership graph
     // (n_queries x n_train CSR) the reference's transform returns.
     SparseMatrix transform_graph(const float* X_new, int64_t n_queries) const;
+    // ------------------------------------------------------------------------
+
+    // --- tests-port additions -----------------------------------------------
+    // sklearn get_feature_names_out API (umap_.py inherits it via
+    // ClassNamePrefixFeaturesOutMixin: "umap0", "umap1", ... regardless of
+    // input feature names). Required by test_umap_get_feature_names_out.py.
+    std::vector<std::string> get_feature_names_out() const {
+        std::vector<std::string> out;
+        out.reserve(static_cast<std::size_t>(params_.n_components));
+        for (int i = 0; i < params_.n_components; ++i)
+            out.push_back("umap" + std::to_string(i));
+        return out;
+    }
     // ------------------------------------------------------------------------
 
     // -------- fitted attributes (valid after fit) --------

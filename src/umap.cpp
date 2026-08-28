@@ -593,8 +593,49 @@ std::vector<float> UMAP::make_fit_init(const float* data, int64_t n_index,
     return out;
 }
 
+// --- tests-port additions (branch tests-port) -------------------------------
+// sklearn check_array's finiteness validation (upstream fit/transform take an
+// ensure_all_finite kwarg, default True, forwarded to check_array; the C++
+// port exposes it as UMAPParams::ensure_all_finite). Required by the
+// test_data_input.py port. Error strings follow sklearn's.
+namespace {
+void check_all_finite(const float* X, int64_t n, int64_t dim,
+                      const std::string& mode) {
+    if (mode == "false") return;
+    if (mode != "true" && mode != "allow-nan")
+        throw std::invalid_argument(
+            "ensure_all_finite should be a bool or \"allow-nan\". Got \"" +
+            mode + "\" instead");
+    const std::size_t total = static_cast<std::size_t>(n) * dim;
+    for (std::size_t i = 0; i < total; ++i) {
+        const float v = X[i];
+        if (std::isinf(v))
+            throw std::invalid_argument(
+                "Input contains infinity or a value too large for "
+                "dtype('float32').");
+        if (mode == "true" && std::isnan(v))
+            throw std::invalid_argument("Input contains NaN.");
+    }
+}
+}  // namespace
+// ----------------------------------------------------------------------------
+
 UMAP& UMAP::fit(const float* X, int64_t n_samples, int64_t n_features) {
     validate_parameters();
+    // --- tests-port additions: check_array finiteness + upstream's hellinger
+    // negative-data guard (umap_.py::fit "Metric 'hellinger' does not support
+    // negative values"), required by test_data_input.py /
+    // test_umap_validation_params.py::test_umap_bad_hellinger_data.
+    check_all_finite(X, n_samples, n_features, params_.ensure_all_finite);
+    if (params_.metric == "hellinger") {
+        const std::size_t total =
+            static_cast<std::size_t>(n_samples) * n_features;
+        for (std::size_t i = 0; i < total; ++i)
+            if (X[i] < 0.0f)
+                throw std::invalid_argument(
+                    "Metric 'hellinger' does not support negative values");
+    }
+    // ------------------------------------------------------------------------
     n_ = n_samples;
     dim_ = n_features;
     raw_data_.assign(X, X + static_cast<std::size_t>(n_samples) * n_features);
@@ -1084,6 +1125,11 @@ std::vector<float> UMAP::transform(const float* X_new,
         throw std::invalid_argument(
             "Transform unavailable when model was fit with only a single "
             "data sample.");
+    // --- tests-port additions: check_array finiteness (see fit) -------------
+    check_all_finite(X_new, n_queries,
+                     params_.metric == "precomputed" ? n_ : dim_,
+                     params_.ensure_all_finite);
+    // ------------------------------------------------------------------------
     const int dim_out = params_.n_components;
 
     // Input-hash shortcut: transforming the training data returns embedding_.
