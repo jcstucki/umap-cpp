@@ -169,6 +169,10 @@ target_sources(umap_tests PRIVATE tests/test_sparse.cpp)
 target_sources(umap_tests PRIVATE tests/test_sparse_query.cpp)
 # ----------------------------------------------------------------------------
 
+# --- sparse-metrics additions -----------------------------------------------
+target_sources(umap_tests PRIVATE tests/test_sparse_metrics_full.cpp)
+# ----------------------------------------------------------------------------
+
 # --- spectral-init additions ------------------------------------------------
 target_sources(umap_tests PRIVATE tests/test_spectral.cpp)
 # ----------------------------------------------------------------------------

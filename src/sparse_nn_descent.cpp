@@ -558,8 +558,10 @@ NNHeap sparse_nn_descent(const CsrView& X, int64_t n_neighbors,
 
 void sparse_brute_force_knn(const CsrView& X, int64_t n_neighbors,
                             const std::string& metric, int32_t* knn_indices,
-                            float* knn_dists) {
-    spdist::SparseMetricInfo m = spdist::resolve_sparse_metric(metric);
+                            float* knn_dists,
+                            const spdist::SparseMetricKwds& kwds) {
+    spdist::SparseMetricInfo m =
+        spdist::resolve_sparse_metric(metric, X.n_cols, kwds);
     const int64_t n = X.n_rows;
     std::vector<float> row(static_cast<size_t>(n));
     std::vector<int32_t> order(static_cast<size_t>(n));
@@ -580,12 +582,11 @@ void sparse_brute_force_knn(const CsrView& X, int64_t n_neighbors,
 namespace {
 
 void run_sparse_nearest_neighbors(const CsrView& X, int64_t n_neighbors,
-                                  const std::string& metric,
+                                  const spdist::SparseMetricInfo& m,
                                   int64_t rng_state[3],
                                   const LeafArray& leaf_array, int64_t n_iters,
                                   int32_t* knn_indices, float* knn_dists,
                                   bool verbose) {
-    spdist::SparseMetricInfo m = spdist::resolve_sparse_metric(metric);
     const int64_t max_candidates = 60;  // umap_.py::nearest_neighbors
     const double delta = 0.001;         // NNDescent default
 
@@ -607,15 +608,21 @@ void nearest_neighbors_sparse(const int32_t* indptr, const int32_t* indices,
                               int64_t n_neighbors, const std::string& metric,
                               bool angular, uint32_t random_seed,
                               int32_t* knn_indices, float* knn_dists,
-                              bool force_approximation, bool verbose) {
-    (void)angular;  // only affects callable metrics in pynndescent
+                              bool force_approximation, bool verbose,
+                              const spdist::SparseMetricKwds& kwds) {
     CsrView X{indptr, indices, data, n, dim};
-    spdist::SparseMetricInfo m = spdist::resolve_sparse_metric(metric);
+    spdist::SparseMetricInfo m =
+        spdist::resolve_sparse_metric(metric, dim, kwds);
+    // `angular` (umap's angular_rp_forest) only affects callable metrics in
+    // pynndescent -- here, ll_dirichlet (angular_from_param).
+    const bool angular_trees =
+        m.angular_from_param ? angular : m.angular_trees;
 
     // UMAP.fit small-data branch (n < 4096, force_approximation_algorithm
     // False): exact pairwise distances + stable-argsort kNN.
     if (n < 4096 && !force_approximation) {
-        sparse_brute_force_knn(X, n_neighbors, metric, knn_indices, knn_dists);
+        sparse_brute_force_knn(X, n_neighbors, metric, knn_indices, knn_dists,
+                               kwds);
         return;
     }
 
@@ -635,12 +642,12 @@ void nearest_neighbors_sparse(const int32_t* indptr, const int32_t* indices,
     (void)search_rng_state;  // consumed for draw-order parity; search not ported
 
     LeafArray leaf_array = make_sparse_forest_leaf_array(
-        X, n_neighbors, n_trees, /*leaf_size=*/-1, m.angular_trees,
+        X, n_neighbors, n_trees, /*leaf_size=*/-1, angular_trees,
         /*max_depth=*/200, numpy_rs);
 
     int64_t rng_state[3] = {rng_state_arr[0], rng_state_arr[1],
                             rng_state_arr[2]};
-    run_sparse_nearest_neighbors(X, n_neighbors, metric, rng_state, leaf_array,
+    run_sparse_nearest_neighbors(X, n_neighbors, m, rng_state, leaf_array,
                                  n_iters, knn_indices, knn_dists, verbose);
 }
 
@@ -649,21 +656,24 @@ void nearest_neighbors_sparse_with_state(
     int64_t n, int64_t dim, int64_t n_neighbors, const std::string& metric,
     bool angular, const int64_t rng_state_in[3],
     const std::vector<std::array<int64_t, 3>>& tree_rng_states,
-    int32_t* knn_indices, float* knn_dists, bool verbose) {
-    (void)angular;
+    int32_t* knn_indices, float* knn_dists, bool verbose,
+    const spdist::SparseMetricKwds& kwds) {
     CsrView X{indptr, indices, data, n, dim};
-    spdist::SparseMetricInfo m = spdist::resolve_sparse_metric(metric);
+    spdist::SparseMetricInfo m =
+        spdist::resolve_sparse_metric(metric, dim, kwds);
+    const bool angular_trees =
+        m.angular_from_param ? angular : m.angular_trees;
 
     const int64_t n_iters = std::max<int64_t>(
         5, static_cast<int64_t>(
                std::nearbyint(std::log2(static_cast<double>(n)))));
 
     LeafArray leaf_array = make_sparse_forest_leaf_array_from_states(
-        X, n_neighbors, /*leaf_size=*/-1, m.angular_trees, /*max_depth=*/200,
+        X, n_neighbors, /*leaf_size=*/-1, angular_trees, /*max_depth=*/200,
         tree_rng_states);
 
     int64_t rng_state[3] = {rng_state_in[0], rng_state_in[1], rng_state_in[2]};
-    run_sparse_nearest_neighbors(X, n_neighbors, metric, rng_state, leaf_array,
+    run_sparse_nearest_neighbors(X, n_neighbors, m, rng_state, leaf_array,
                                  n_iters, knn_indices, knn_dists, verbose);
 }
 

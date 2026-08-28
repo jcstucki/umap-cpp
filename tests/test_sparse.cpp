@@ -181,10 +181,11 @@ TEST_CASE("resolve_sparse_metric registry: supported set + not-implemented throw
     CHECK(c.correction == &spdist::sparse_correct_alternative_cosine);
     CHECK(c.angular_trees);
 
-    // valid upstream but not ported -> throws (documented behaviour)
+    // absent upstream or unported -> throws (documented behaviour; the full
+    // registry is exercised in tests/test_sparse_metrics_full.cpp)
     for (const char* name :
-         {"chebyshev", "minkowski", "hamming", "jaccard", "correlation",
-          "hellinger", "canberra", "braycurtis", "not_a_metric"}) {
+         {"yule", "dot", "kantorovich", "wasserstein", "wasserstein_1d",
+          "jensen-shannon", "symmetric_kl", "bit_jaccard", "not_a_metric"}) {
         CHECK_THROWS_AS(spdist::resolve_sparse_metric(name),
                         std::invalid_argument);
     }
@@ -389,7 +390,7 @@ TEST_CASE("nearest_neighbors_sparse throws for unsupported metrics") {
     std::vector<float> dist(bf_n * 5);
     CHECK_THROWS_AS(
         spnnd::nearest_neighbors_sparse(bf_indptr, bf_indices, bf_data, bf_n,
-                                        bf_dim, 5, "hellinger", false, 42,
+                                        bf_dim, 5, "wasserstein_1d", false, 42,
                                         ind.data(), dist.data()),
         std::invalid_argument);
 }
