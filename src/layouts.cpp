@@ -504,7 +504,8 @@ void optimize_layout_euclidean(
 
 // --- umap-class additions ---------------------------------------------------
 int resolve_epochs_and_filter_graph(SparseMatrix& graph, int n_epochs,
-                                    int default_epochs_boost) {
+                                    int default_epochs_boost,
+                                    SparseMatrix* write_through) {
     // For smaller datasets we can use more epochs (+200 for densMAP, which
     // callers pass through default_epochs_boost).
     const int default_epochs =
@@ -526,6 +527,13 @@ int resolve_epochs_and_filter_graph(SparseMatrix& graph, int n_epochs,
                                                             : default_epochs);
         for (float& v : graph.data) {
             if (v < threshold) v = 0.0f;
+        }
+        // scipy tocoo() data sharing: the filter writes through into the
+        // caller's stored graph (structure untouched -- see layouts.hpp).
+        if (write_through != nullptr) {
+            for (float& v : write_through->data) {
+                if (v < threshold) v = 0.0f;
+            }
         }
     }
     graph.eliminate_zeros();

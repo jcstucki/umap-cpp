@@ -19,6 +19,11 @@
 #include "umap/fuzzy_simplicial_set.hpp"
 #include "umap/layouts.hpp"
 #include "umap/spectral.hpp"
+// --- supervised-sparse additions --------------------------------------------
+#include "umap/sparse_distances.hpp"
+#include "umap/sparse_nn_descent.hpp"
+#include "umap/supervised.hpp"
+// ----------------------------------------------------------------------------
 
 namespace umap {
 
@@ -328,6 +333,170 @@ void unique_rows(const float* X, int64_t n, int64_t dim,
     }
 }
 
+// --- supervised-sparse additions --------------------------------------------
+
+void csr_unique_rows(const int32_t* indptr, const int32_t* indices,
+                     const float* data, int64_t n,
+                     std::vector<int64_t>& index,
+                     std::vector<int64_t>& inverse) {
+    // utils.py::csr_unique: each lil row becomes the tuple
+    // (column indices..., values...); np.unique on the object array sorts the
+    // tuples (Python comparison: elementwise numeric, then by length) with a
+    // stable sort because return_index is requested.
+    std::vector<std::vector<double>> keys(static_cast<std::size_t>(n));
+    for (int64_t i = 0; i < n; ++i) {
+        std::vector<double>& key = keys[static_cast<std::size_t>(i)];
+        const int32_t start = indptr[i];
+        const int32_t end = indptr[i + 1];
+        key.reserve(static_cast<std::size_t>(end - start) * 2);
+        for (int32_t k = start; k < end; ++k)
+            key.push_back(static_cast<double>(indices[k]));
+        for (int32_t k = start; k < end; ++k)
+            key.push_back(static_cast<double>(data[k]));
+    }
+    std::vector<int64_t> perm(static_cast<std::size_t>(n));
+    std::iota(perm.begin(), perm.end(), 0);
+    std::stable_sort(perm.begin(), perm.end(), [&keys](int64_t a, int64_t b) {
+        return keys[static_cast<std::size_t>(a)] <
+               keys[static_cast<std::size_t>(b)];
+    });
+    index.clear();
+    inverse.assign(static_cast<std::size_t>(n), 0);
+    int64_t group = -1;
+    for (int64_t j = 0; j < n; ++j) {
+        if (j == 0 || keys[static_cast<std::size_t>(
+                          perm[static_cast<std::size_t>(j) - 1])] !=
+                          keys[static_cast<std::size_t>(
+                              perm[static_cast<std::size_t>(j)])]) {
+            index.push_back(perm[static_cast<std::size_t>(j)]);
+            ++group;
+        }
+        inverse[static_cast<std::size_t>(perm[static_cast<std::size_t>(j)])] =
+            group;
+    }
+}
+
+std::vector<float> sparse_pairwise_distances_sklearn(
+    const int32_t* x_indptr, const int32_t* x_indices, const float* x_data,
+    int64_t nx, const int32_t* y_indptr, const int32_t* y_indices,
+    const float* y_data, int64_t ny, const std::string& metric, bool x_is_y) {
+    std::vector<float> out(static_cast<std::size_t>(nx) * ny);
+
+    if (metric == "euclidean" || metric == "l2") {
+        // sklearn _euclidean_distances_upcast on float32 CSR data: chunks are
+        // upcast to float64 (exact) -- row norms accumulate sequentially over
+        // the stored order, dot products merge the two rows by ascending
+        // column (scipy SMMP accumulation order), and each element is rounded
+        // to float32 as ((-2*dot) + XX_i) + YY_j.
+        const auto row_norms = [](const int32_t* indptr, const float* data,
+                                  int64_t n) {
+            std::vector<double> norms(static_cast<std::size_t>(n));
+            for (int64_t i = 0; i < n; ++i) {
+                double s = 0.0;
+                for (int32_t k = indptr[i]; k < indptr[i + 1]; ++k) {
+                    const double v = static_cast<double>(data[k]);
+                    s += v * v;
+                }
+                norms[static_cast<std::size_t>(i)] = s;
+            }
+            return norms;
+        };
+        const std::vector<double> XX = row_norms(x_indptr, x_data, nx);
+        const std::vector<double> YY =
+            x_is_y ? XX : row_norms(y_indptr, y_data, ny);
+        for (int64_t i = 0; i < nx; ++i) {
+            for (int64_t j = 0; j < ny; ++j) {
+                double s = 0.0;
+                int32_t ai = x_indptr[i];
+                int32_t aj = y_indptr[j];
+                while (ai < x_indptr[i + 1] && aj < y_indptr[j + 1]) {
+                    const int32_t ci = x_indices[ai];
+                    const int32_t cj = y_indices[aj];
+                    if (ci == cj) {
+                        s += static_cast<double>(x_data[ai]) *
+                             static_cast<double>(y_data[aj]);
+                        ++ai;
+                        ++aj;
+                    } else if (ci < cj) {
+                        ++ai;
+                    } else {
+                        ++aj;
+                    }
+                }
+                float d = static_cast<float>(
+                    ((-2.0 * s) + XX[static_cast<std::size_t>(i)]) +
+                    YY[static_cast<std::size_t>(j)]);
+                d = std::max(d, 0.0f);  // np.maximum(distances, 0)
+                if (x_is_y && i == j) d = 0.0f;  // fill_diagonal
+                out[static_cast<std::size_t>(i) * ny + j] = std::sqrt(d);
+            }
+        }
+        return out;
+    }
+
+    if (metric == "cosine") {
+        // cosine_distances = 1 - cosine_similarity. normalize(X) replicates
+        // sklearn's inplace_csr_row_normalize_l2 (float32 squares accumulated
+        // into a float64 sum, float64 division rounded to float32); the
+        // normalized sparse matmul replicates scipy's float32 kernel, whose
+        // multiply-accumulate is contracted to fmaf in the shipped wheels.
+        const auto normalize_l2 = [](const int32_t* indptr, const float* data,
+                                     int64_t n, int64_t nnz) {
+            std::vector<float> nd(data, data + nnz);
+            for (int64_t i = 0; i < n; ++i) {
+                double s = 0.0;
+                for (int32_t k = indptr[i]; k < indptr[i + 1]; ++k) {
+                    const float sq = data[k] * data[k];
+                    s += static_cast<double>(sq);
+                }
+                if (s == 0.0) continue;
+                const double root = std::sqrt(s);
+                for (int32_t k = indptr[i]; k < indptr[i + 1]; ++k)
+                    nd[static_cast<std::size_t>(k)] = static_cast<float>(
+                        static_cast<double>(data[k]) / root);
+            }
+            return nd;
+        };
+        const std::vector<float> xn =
+            normalize_l2(x_indptr, x_data, nx, x_indptr[nx]);
+        const std::vector<float> yn =
+            x_is_y ? xn : normalize_l2(y_indptr, y_data, ny, y_indptr[ny]);
+        for (int64_t i = 0; i < nx; ++i) {
+            for (int64_t j = 0; j < ny; ++j) {
+                float s = 0.0f;
+                int32_t ai = x_indptr[i];
+                int32_t aj = y_indptr[j];
+                while (ai < x_indptr[i + 1] && aj < y_indptr[j + 1]) {
+                    const int32_t ci = x_indices[ai];
+                    const int32_t cj = y_indices[aj];
+                    if (ci == cj) {
+                        s = std::fmaf(xn[static_cast<std::size_t>(ai)],
+                                      yn[static_cast<std::size_t>(aj)], s);
+                        ++ai;
+                        ++aj;
+                    } else if (ci < cj) {
+                        ++ai;
+                    } else {
+                        ++aj;
+                    }
+                }
+                float d = (-s) + 1.0f;               // S *= -1; S += 1
+                d = std::min(std::max(d, 0.0f), 2.0f);  // np.clip(S, 0, 2)
+                if (x_is_y && i == j) d = 0.0f;
+                out[static_cast<std::size_t>(i) * ny + j] = d;
+            }
+        }
+        return out;
+    }
+
+    throw std::invalid_argument(
+        "sparse_pairwise_distances_sklearn: metric '" + metric +
+        "' is not supported for sparse data in the C++ port (upstream "
+        "densifies via pairwise_special_metric)");
+}
+
+// ----------------------------------------------------------------------------
+
 namespace {
 
 // numpy's DOUBLE_pairwise_sum / np.add.reduce seeding, mirroring the float32
@@ -489,6 +658,11 @@ void UMAP::validate_parameters() const {
         throw std::invalid_argument("learning_rate must be positive");
     if (p.n_neighbors < 2)
         throw std::invalid_argument("n_neighbors must be greater than 1");
+    // --- supervised-sparse additions ----------------------------------------
+    if (p.target_n_neighbors < 2 && p.target_n_neighbors != -1)
+        throw std::invalid_argument(
+            "target_n_neighbors must be greater than 1");
+    // ------------------------------------------------------------------------
     if (p.n_components < 1)
         throw std::invalid_argument("n_components must be greater than 0");
     if (p.n_epochs.has_value() && *p.n_epochs < 0)
@@ -698,11 +872,82 @@ std::vector<float> UMAP::make_fit_init(const float* data, int64_t n_index,
     return out;
 }
 
-UMAP& UMAP::fit(const float* X, int64_t n_samples, int64_t n_features) {
+UMAP& UMAP::fit(const float* X, int64_t n_samples, int64_t n_features,
+                const float* y) {
+    sparse_data_ = false;
+    raw_indptr_.clear();
+    raw_indices_.clear();
+    raw_values_.clear();
+    sparse_knn_index_.reset();
+    return fit_impl(X, n_samples, n_features, y);
+}
+
+// --- supervised-sparse additions --------------------------------------------
+UMAP& UMAP::fit(const int32_t* indptr, const int32_t* indices,
+                const float* data, int64_t n_samples, int64_t n_features,
+                const float* y) {
+    // Branches upstream supports for sparse input but this port does not:
+    if (params_.metric == "precomputed")
+        throw std::invalid_argument(
+            "UMAP: metric='precomputed' with sparse input (the upstream "
+            "sparse precomputed branch) is not ported");
+    if (params_.precomputed_knn.has_value())
+        throw std::invalid_argument(
+            "UMAP: precomputed_knn with sparse input is not ported");
+    if (!params_.init_array.has_value() && params_.init == "pca")
+        throw std::invalid_argument(
+            "UMAP: init='pca' with sparse input (upstream TruncatedSVD) is "
+            "not ported");
+    sparse_data_ = true;
+    knn_index_.reset();
+    raw_indptr_.assign(indptr, indptr + n_samples + 1);
+    raw_indices_.assign(indices, indices + indptr[n_samples]);
+    raw_values_.assign(data, data + indptr[n_samples]);
+    // if self._sparse_data and not X.has_sorted_indices: X.sort_indices()
+    for (int64_t i = 0; i < n_samples; ++i) {
+        const int32_t start = raw_indptr_[static_cast<std::size_t>(i)];
+        const int32_t end = raw_indptr_[static_cast<std::size_t>(i) + 1];
+        bool sorted = true;
+        for (int32_t k = start + 1; k < end; ++k) {
+            if (raw_indices_[static_cast<std::size_t>(k) - 1] >
+                raw_indices_[static_cast<std::size_t>(k)]) {
+                sorted = false;
+                break;
+            }
+        }
+        if (sorted) continue;
+        std::vector<std::pair<int32_t, float>> row;
+        row.reserve(static_cast<std::size_t>(end - start));
+        for (int32_t k = start; k < end; ++k)
+            row.emplace_back(raw_indices_[static_cast<std::size_t>(k)],
+                             raw_values_[static_cast<std::size_t>(k)]);
+        std::sort(row.begin(), row.end(),
+                  [](const std::pair<int32_t, float>& a,
+                     const std::pair<int32_t, float>& b) {
+                      return a.first < b.first;
+                  });
+        for (int32_t k = start; k < end; ++k) {
+            raw_indices_[static_cast<std::size_t>(k)] =
+                row[static_cast<std::size_t>(k - start)].first;
+            raw_values_[static_cast<std::size_t>(k)] =
+                row[static_cast<std::size_t>(k - start)].second;
+        }
+    }
+    return fit_impl(nullptr, n_samples, n_features, y);
+}
+// ----------------------------------------------------------------------------
+
+UMAP& UMAP::fit_impl(const float* X, int64_t n_samples, int64_t n_features,
+                     const float* y) {
     validate_parameters();
     n_ = n_samples;
     dim_ = n_features;
-    raw_data_.assign(X, X + static_cast<std::size_t>(n_samples) * n_features);
+    if (sparse_data_) {
+        raw_data_.clear();
+    } else {
+        raw_data_.assign(X,
+                         X + static_cast<std::size_t>(n_samples) * n_features);
+    }
     embedding_list_.clear();
     unique_inverse_.clear();
     edges_removed_ = 0;
@@ -781,11 +1026,18 @@ UMAP& UMAP::fit(const float* X, int64_t n_samples, int64_t n_features) {
         }
     }
 
-    // unique=True: np.unique(X, axis=0) row dedup; otherwise the identity.
+    // unique=True: np.unique(X, axis=0) row dedup (csr_unique for sparse
+    // input); otherwise the identity.
     std::vector<int64_t> index;
     std::vector<int64_t> inverse;
     if (params_.unique) {
-        unique_rows(raw_data_.data(), n_samples, n_features, index, inverse);
+        if (sparse_data_) {
+            csr_unique_rows(raw_indptr_.data(), raw_indices_.data(),
+                            raw_values_.data(), n_samples, index, inverse);
+        } else {
+            unique_rows(raw_data_.data(), n_samples, n_features, index,
+                        inverse);
+        }
         unique_inverse_ = inverse;
     } else {
         index.resize(static_cast<std::size_t>(n_samples));
@@ -796,7 +1048,7 @@ UMAP& UMAP::fit(const float* X, int64_t n_samples, int64_t n_features) {
     // X_indexed = X[index] (a fresh copy upstream too -- fancy indexing).
     std::vector<float> X_indexed_store;
     const float* X_indexed = raw_data_.data();
-    if (params_.unique) {
+    if (params_.unique && !sparse_data_) {
         X_indexed_store.resize(static_cast<std::size_t>(n_index) * n_features);
         for (int64_t i = 0; i < n_index; ++i) {
             std::memcpy(X_indexed_store.data() + i * n_features,
@@ -806,6 +1058,32 @@ UMAP& UMAP::fit(const float* X, int64_t n_samples, int64_t n_features) {
         }
         X_indexed = X_indexed_store.data();
     }
+    // --- supervised-sparse additions ----------------------------------------
+    // Sparse X[index]: row-gathered CSR (identity reuses the raw arrays).
+    std::vector<int32_t> sp_indptr_store, sp_indices_store;
+    std::vector<float> sp_values_store;
+    const int32_t* sp_indptr = raw_indptr_.data();
+    const int32_t* sp_indices = raw_indices_.data();
+    const float* sp_values = raw_values_.data();
+    if (params_.unique && sparse_data_) {
+        sp_indptr_store.assign(1, 0);
+        for (int64_t i = 0; i < n_index; ++i) {
+            const int64_t src = index[static_cast<std::size_t>(i)];
+            for (int32_t k = raw_indptr_[static_cast<std::size_t>(src)];
+                 k < raw_indptr_[static_cast<std::size_t>(src) + 1]; ++k) {
+                sp_indices_store.push_back(
+                    raw_indices_[static_cast<std::size_t>(k)]);
+                sp_values_store.push_back(
+                    raw_values_[static_cast<std::size_t>(k)]);
+            }
+            sp_indptr_store.push_back(
+                static_cast<int32_t>(sp_indices_store.size()));
+        }
+        sp_indptr = sp_indptr_store.data();
+        sp_indices = sp_indices_store.data();
+        sp_values = sp_values_store.data();
+    }
+    // ------------------------------------------------------------------------
 
     if (n_index <= params_.n_neighbors) {
         if (n_index == 1) {
@@ -840,12 +1118,22 @@ UMAP& UMAP::fit(const float* X, int64_t n_samples, int64_t n_features) {
         // Handle small cases efficiently by computing all distances.
         small_data_ = true;
         knn_index_.reset();
+        sparse_knn_index_.reset();
         std::vector<float> dmat;
         if (params_.metric == "precomputed") {
             // pairwise_distances(X, metric="precomputed") is a validated
             // passthrough of the input distance matrix.
             dmat.assign(X_indexed,
                         X_indexed + static_cast<std::size_t>(n_index) * n_index);
+        } else if (sparse_data_) {
+            // --- supervised-sparse additions --------------------------------
+            // pairwise_distances(X_csr, metric=self.metric): sklearn's native
+            // sparse float32 kernels (euclidean/l2, cosine).
+            dmat = sparse_pairwise_distances_sklearn(
+                sp_indptr, sp_indices, sp_values, n_index, sp_indptr,
+                sp_indices, sp_values, n_index, params_.metric,
+                /*x_is_y=*/true);
+            // ----------------------------------------------------------------
         } else {
             dmat = pairwise_distances_sklearn(X_indexed, n_index, X_indexed,
                                               n_index, n_features,
@@ -922,6 +1210,18 @@ UMAP& UMAP::fit(const float* X, int64_t n_samples, int64_t n_features) {
                 knn_indices_ = pknn->indices;
                 knn_dists_ = pknn->dists;
             }
+        } else if (sparse_data_) {
+            // --- supervised-sparse additions --------------------------------
+            // Sparse NN-descent (continuing the numpy RandomState stream)
+            // with the prepared sparse search index kept for transform().
+            sparse_knn_index_ = std::make_shared<spnnd::SparsePreparedIndex>(
+                spnnd::SparsePreparedIndex::build(
+                    sp_indptr, sp_indices, sp_values, n_index, n_features,
+                    n_neighbors_, params_.metric, rs, params_.verbose));
+            knn_indices_ = sparse_knn_index_->knn_indices();
+            knn_dists_ = sparse_knn_index_->knn_dists();
+            knn_cols_ = n_neighbors_;
+            // ----------------------------------------------------------------
         } else {
             // NN-descent (continuing the numpy RandomState stream) with the
             // prepared search index kept for transform().
@@ -960,21 +1260,22 @@ UMAP& UMAP::fit(const float* X, int64_t n_samples, int64_t n_features) {
 
     // Report the number of vertices with degree 0 in our graph_ (they were
     // properly disconnected) and mirror raise_disconnected_warning.
-    std::vector<bool> disconnected(static_cast<std::size_t>(graph_.n_rows),
-                                   false);
     vertices_disconnected_ = 0;
     for (int32_t i = 0; i < graph_.n_rows; ++i) {
         float row_sum = 0.0f;
         for (int32_t k = graph_.indptr[i]; k < graph_.indptr[i + 1]; ++k)
             row_sum += graph_.data[k];
-        if (row_sum == 0.0f) {
-            disconnected[static_cast<std::size_t>(i)] = true;
-            ++vertices_disconnected_;
-        }
+        if (row_sum == 0.0f) ++vertices_disconnected_;
     }
     raise_disconnected_warning(edges_removed_, vertices_disconnected_,
                                disconnection_distance_, n_,
                                params_.verbose);
+
+    // --- supervised-sparse additions ----------------------------------------
+    // Supervised / semi-supervised fit: intersect graph_ with the target
+    // simplicial set built from y (self._supervised path of umap_.py::fit).
+    if (y != nullptr) supervise_graph(y, index, n_samples, rs);
+    // ------------------------------------------------------------------------
 
     if (params_.transform_mode == "embedding") {
         // _fit_embed_data -> simplicial_set_embedding. The weight filtering
@@ -993,8 +1294,24 @@ UMAP& UMAP::fit(const float* X, int64_t n_samples, int64_t n_features) {
         }
         // Use more epochs for densMAP (upstream: default_epochs += 200).
         const int n_epochs = resolve_epochs_and_filter_graph(
-            g, requested_epochs, params_.densmap ? 200 : 0);
-        fit_init_ = make_fit_init(X_indexed, n_index, g, rs);
+            g, requested_epochs, params_.densmap ? 200 : 0,
+            /*write_through=*/&graph_);
+        // disconnected_vertices for the NaN mask: computed upstream *after*
+        // _fit_embed_data from self.graph_ -- which the epoch filter just
+        // mutated through the shared scipy data array (write_through above).
+        // A target_weight near 1.0 supervised fit can fully disconnect
+        // vertices whose neighbours all carry other labels.
+        std::vector<bool> disconnected(static_cast<std::size_t>(graph_.n_rows),
+                                       false);
+        for (int32_t i = 0; i < graph_.n_rows; ++i) {
+            float row_sum = 0.0f;
+            for (int32_t k = graph_.indptr[i]; k < graph_.indptr[i + 1]; ++k)
+                row_sum += graph_.data[k];
+            if (row_sum == 0.0f)
+                disconnected[static_cast<std::size_t>(i)] = true;
+        }
+        fit_init_ = make_fit_init(sparse_data_ ? nullptr : X_indexed, n_index,
+                                  g, rs);
         const std::vector<float>& init_emb = fit_init_;
         const auto r3 = rs.rng_state3();
         const int64_t rng_state[3] = {r3[0], r3[1], r3[2]};
@@ -1146,8 +1463,186 @@ UMAP& UMAP::fit(const float* X, int64_t n_samples, int64_t n_features) {
     return *this;
 }
 
+// --- supervised-sparse additions --------------------------------------------
+
+namespace {
+
+// utils.py::fast_knn_indices semantics on a float64 distance matrix (the
+// supervised small-data target path: sklearn pairwise on float64 y), with the
+// row gather still in float64; fuzzy_simplicial_set then casts to float32
+// (knn_dists.astype(np.float32)).
+void fast_knn_from_dmat_f64(const std::vector<double>& dmat, int64_t n,
+                            int64_t m, int64_t n_neighbors,
+                            int32_t* knn_indices, float* knn_dists) {
+    std::vector<int32_t> order(static_cast<std::size_t>(m));
+    for (int64_t row = 0; row < n; ++row) {
+        const double* d = dmat.data() + row * m;
+        std::iota(order.begin(), order.end(), 0);
+        std::stable_sort(order.begin(), order.end(),
+                         [d](int32_t a, int32_t b) { return d[a] < d[b]; });
+        for (int64_t j = 0; j < n_neighbors; ++j) {
+            knn_indices[row * n_neighbors + j] = order[j];
+            knn_dists[row * n_neighbors + j] =
+                static_cast<float>(d[order[j]]);
+        }
+    }
+}
+
+// sklearn pairwise_distances on the (n, 1) float64 target column.
+// "euclidean"/"l2" replicate euclidean_distances' float64 dot-trick
+// (distances = (-2 * X @ X.T + XX) + YY, maximum(0), zero diagonal, sqrt) --
+// exact for 1-d input. Other named metrics evaluate the double-precision
+// registry directly (upstream routes through sklearn / pairwise_special_
+// metric; documented deviation, exact for the usual 1-d integer-ish labels).
+std::vector<double> target_pairwise_f64(const std::vector<double>& y,
+                                        const std::string& metric,
+                                        const MetricKwds& kwds) {
+    const int64_t n = static_cast<int64_t>(y.size());
+    std::vector<double> out(static_cast<std::size_t>(n) * n);
+    if (metric == "euclidean" || metric == "l2") {
+        for (int64_t i = 0; i < n; ++i) {
+            const double xx = y[static_cast<std::size_t>(i)] *
+                              y[static_cast<std::size_t>(i)];
+            for (int64_t j = 0; j < n; ++j) {
+                const double yy = y[static_cast<std::size_t>(j)] *
+                                  y[static_cast<std::size_t>(j)];
+                double v = ((-2.0 * (y[static_cast<std::size_t>(i)] *
+                                     y[static_cast<std::size_t>(j)])) +
+                            xx) +
+                           yy;
+                v = std::max(v, 0.0);
+                if (i == j) v = 0.0;
+                out[static_cast<std::size_t>(i) * n + j] = std::sqrt(v);
+            }
+        }
+        return out;
+    }
+    const DistanceFn fn = make_metric(metric, kwds);
+    for (int64_t i = 0; i < n; ++i) {
+        for (int64_t j = 0; j < n; ++j) {
+            out[static_cast<std::size_t>(i) * n + j] =
+                fn(&y[static_cast<std::size_t>(i)],
+                   &y[static_cast<std::size_t>(j)], 1);
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+void UMAP::supervise_graph(const float* y, const std::vector<int64_t>& index,
+                           int64_t n_samples, nnd::NumpyRandomState& rs) {
+    const int64_t n_index = static_cast<int64_t>(index.size());
+    // y_ = check_array(y, ensure_2d=False)[index] (float64).
+    std::vector<double> y_(static_cast<std::size_t>(n_index));
+    for (int64_t i = 0; i < n_index; ++i)
+        y_[static_cast<std::size_t>(i)] = static_cast<double>(
+            y[index[static_cast<std::size_t>(i)]]);
+
+    const std::string& tm = params_.target_metric;
+    if (tm == "categorical") {
+        // far_dist from target_weight; unknown labels (-1) use the default
+        // unknown_dist = 1.0.
+        const double far_dist =
+            params_.target_weight < 1.0
+                ? 2.5 * (1.0 / (1.0 - params_.target_weight))
+                : 1.0e12;
+        graph_ = discrete_metric_simplicial_set_intersection(
+            graph_, y_.data(), /*unknown_dist=*/1.0, far_dist);
+        return;
+    }
+    if (tm == "hierarchical_categorical" || tm == "ordinal" || tm == "count" ||
+        tm == "string" || tm == "myers") {
+        // dist.DISCRETE_METRICS branch: metric_kws come from
+        // get_discrete_params(y_, target_metric), NOT target_metric_kwds.
+        const double scale = params_.target_weight < 1.0
+                                 ? 2.5 * (1.0 / (1.0 - params_.target_weight))
+                                 : 1.0e12;
+        std::function<double(double, double)> metric_fn;
+        if (tm == "ordinal") {
+            // {"support_size": float(data.max() - data.min()) / 2.0}
+            double mn = y_[0], mx = y_[0];
+            for (const double v : y_) {
+                mn = std::min(mn, v);
+                mx = std::max(mx, v);
+            }
+            const double support_size = (mx - mn) / 2.0;
+            metric_fn = [support_size](double a, double b) {
+                return ordinal_distance(a, b, support_size);
+            };
+        } else if (tm == "count") {
+            // scipy.stats.tmin/tmax/tmean with no limits are plain
+            // min/max/np.mean; normalisation = count_distance(min, max,
+            // poisson_lambda=lambda) / 2.
+            double mn = y_[0], mx = y_[0];
+            for (const double v : y_) {
+                mn = std::min(mn, v);
+                mx = std::max(mx, v);
+            }
+            const double lambda_ =
+                numpy_mean_f64(y_.data(), static_cast<int64_t>(y_.size()));
+            const double normalisation =
+                count_distance(mn, mx, lambda_, 1.0) / 2.0;
+            metric_fn = [lambda_, normalisation](double a, double b) {
+                return count_distance(a, b, lambda_, normalisation);
+            };
+        } else {
+            // "string"/"myers" need object-dtype y; "hierarchical_
+            // categorical" gets {} from get_discrete_params and KeyErrors
+            // upstream (cat_hierarchy=[{}] has no entries).
+            throw std::invalid_argument(
+                "UMAP: target_metric '" + tm +
+                "' is not supported in the C++ port");
+        }
+        graph_ = discrete_metric_simplicial_set_intersection(
+            graph_, y_.data(), /*unknown_dist=*/1.0, /*far_dist=*/5.0,
+            metric_fn, scale);
+        return;
+    }
+
+    // General (non-discrete) target metric: build the target fuzzy
+    // simplicial set (apply_set_operations=False!) and intersect.
+    const int target_n_neighbors = params_.target_n_neighbors == -1
+                                       ? n_neighbors_
+                                       : params_.target_n_neighbors;
+    FuzzySimplicialSetResult tfuzzy;
+    std::vector<int32_t> tknn_i(static_cast<std::size_t>(n_index) *
+                                target_n_neighbors);
+    std::vector<float> tknn_d(static_cast<std::size_t>(n_index) *
+                              target_n_neighbors);
+    if (n_samples < 4096) {
+        // "Handle the small case as precomputed as before" -- upstream tests
+        // *original* y length (y.shape[0]), not the deduplicated length.
+        const std::vector<double> ydmat =
+            target_pairwise_f64(y_, tm, params_.target_metric_kwds);
+        fast_knn_from_dmat_f64(ydmat, n_index, n_index, target_n_neighbors,
+                               tknn_i.data(), tknn_d.data());
+    } else {
+        // Standard case: fuzzy_simplicial_set(y_, ...) -> NN-descent on the
+        // float32-cast target column, continuing the RandomState stream.
+        std::vector<float> y32(static_cast<std::size_t>(n_index));
+        for (int64_t i = 0; i < n_index; ++i)
+            y32[static_cast<std::size_t>(i)] =
+                static_cast<float>(y_[static_cast<std::size_t>(i)]);
+        nnd::nearest_neighbors(y32.data(), n_index, 1, target_n_neighbors, tm,
+                               params_.target_metric_kwds, /*angular=*/false,
+                               rs, tknn_i.data(), tknn_d.data(),
+                               params_.verbose);
+    }
+    tfuzzy = fuzzy_simplicial_set(
+        static_cast<int>(n_index), tknn_i.data(), tknn_d.data(),
+        target_n_neighbors, /*set_op_mix_ratio=*/1.0,
+        /*local_connectivity=*/1.0, /*apply_set_operations=*/false,
+        /*return_dists=*/false);
+    graph_ = general_simplicial_set_intersection(graph_, tfuzzy.graph,
+                                                 params_.target_weight);
+    graph_ = reset_local_connectivity(graph_);
+}
+
+// ----------------------------------------------------------------------------
+
 std::vector<float> UMAP::fit_transform(const float* X, int64_t n_samples,
-                                       int64_t n_features) {
+                                       int64_t n_features, const float* y) {
     if (params_.transform_mode == "graph") {
         throw std::invalid_argument(
             "fit_transform returns the graph when transform_mode='graph'; "
@@ -1158,9 +1653,29 @@ std::vector<float> UMAP::fit_transform(const float* X, int64_t n_samples,
             "Unrecognized transform mode " + params_.transform_mode +
             "; should be one of 'embedding' or 'graph'");
     }
-    fit(X, n_samples, n_features);
+    fit(X, n_samples, n_features, y);
     return embedding_;
 }
+
+// --- supervised-sparse additions --------------------------------------------
+std::vector<float> UMAP::fit_transform(const int32_t* indptr,
+                                       const int32_t* indices,
+                                       const float* data, int64_t n_samples,
+                                       int64_t n_features, const float* y) {
+    if (params_.transform_mode == "graph") {
+        throw std::invalid_argument(
+            "fit_transform returns the graph when transform_mode='graph'; "
+            "use fit_transform_graph()");
+    }
+    if (params_.transform_mode != "embedding") {
+        throw std::invalid_argument(
+            "Unrecognized transform mode " + params_.transform_mode +
+            "; should be one of 'embedding' or 'graph'");
+    }
+    fit(indptr, indices, data, n_samples, n_features, y);
+    return embedding_;
+}
+// ----------------------------------------------------------------------------
 
 const SparseMatrix& UMAP::fit_transform_graph(const float* X,
                                               int64_t n_samples,
@@ -1273,6 +1788,12 @@ SparseMatrix UMAP::transform_graph(const float* X_new,
         throw std::invalid_argument(
             "Transform unavailable when model was fit with only a single "
             "data sample.");
+    // --- supervised-sparse additions ----------------------------------------
+    if (sparse_data_)
+        throw std::invalid_argument(
+            "UMAP: model was fit with sparse data; use the CSR "
+            "transform_graph overload");
+    // ------------------------------------------------------------------------
     // Input-hash shortcut: upstream returns self.graph_.
     if (n_queries == n_ &&
         std::memcmp(X_new, raw_data_.data(),
@@ -1307,7 +1828,12 @@ std::vector<float> UMAP::transform(const float* X_new,
         throw std::invalid_argument(
             "Transform unavailable when model was fit with only a single "
             "data sample.");
-    const int dim_out = params_.n_components;
+    // --- supervised-sparse additions ----------------------------------------
+    if (sparse_data_)
+        throw std::invalid_argument(
+            "UMAP: model was fit with sparse data; use the CSR transform "
+            "overload");
+    // ------------------------------------------------------------------------
 
     // Input-hash shortcut: transforming the training data returns embedding_.
     if (n_queries == n_ &&
@@ -1330,12 +1856,16 @@ std::vector<float> UMAP::transform(const float* X_new,
             "transform: n_epochs as a list is not supported (the reference "
             "raises a TypeError)");
     }
+    const MembershipStrengths ms = transform_membership(X_new, n_queries);
+    return transform_from_membership(ms, n_queries);
+}
 
+std::vector<float> UMAP::transform_from_membership(
+    const MembershipStrengths& ms, int64_t n_queries) const {
+    const int dim_out = params_.n_components;
     nnd::NumpyRandomState rs(params_.transform_seed);
     const auto r3 = rs.rng_state3();
     const int64_t rng_state[3] = {r3[0], r3[1], r3[2]};
-
-    const MembershipStrengths ms = transform_membership(X_new, n_queries);
 
     // Weighted-mean initialisation uses the *unfiltered* graph in canonical
     // CSR form (graph.tocsr(); eliminate_zeros()).
@@ -1407,5 +1937,155 @@ std::vector<float> UMAP::transform(const float* X_new,
     }
     return embedding;
 }
+
+// --- supervised-sparse additions --------------------------------------------
+
+MembershipStrengths UMAP::transform_membership_sparse(
+    const int32_t* q_indptr, const int32_t* q_indices, const float* q_data,
+    int64_t n_queries) const {
+    int64_t cols;
+    std::vector<int32_t> indices;
+    std::vector<float> dists;
+    if (small_data_) {
+        // pairwise_distances(X_new, self._raw_data, metric=self.metric) +
+        // argpartition/argsort (== stable k-smallest per row).
+        cols = n_neighbors_;
+        const std::vector<float> dmat = sparse_pairwise_distances_sklearn(
+            q_indptr, q_indices, q_data, n_queries, raw_indptr_.data(),
+            raw_indices_.data(), raw_values_.data(), n_, params_.metric,
+            /*x_is_y=*/false);
+        indices.resize(static_cast<std::size_t>(n_queries) * cols);
+        dists.resize(static_cast<std::size_t>(n_queries) * cols);
+        fast_knn_from_dmat(dmat, n_queries, n_, cols, indices.data(),
+                           dists.data());
+    } else {
+        if (!sparse_knn_index_) {
+            throw std::runtime_error(
+                "No search index available: transforming data"
+                " into an existing embedding is not supported");
+        }
+        cols = params_.n_neighbors;
+        // epsilon = 0.24 if self._knn_search_index._angular_trees else 0.12.
+        const double epsilon =
+            spdist::resolve_sparse_metric(params_.metric).angular_trees ? 0.24
+                                                                        : 0.12;
+        indices.resize(static_cast<std::size_t>(n_queries) * cols);
+        dists.resize(static_cast<std::size_t>(n_queries) * cols);
+        sparse_knn_index_->query(q_indptr, q_indices, q_data, n_queries, cols,
+                                 epsilon, indices.data(), dists.data());
+    }
+
+    // indices[dists >= self._disconnection_distance] = -1.
+    for (std::size_t i = 0; i < dists.size(); ++i) {
+        if (static_cast<double>(dists[i]) >= disconnection_distance_)
+            indices[i] = -1;
+    }
+
+    const double adjusted_local_connectivity =
+        std::max(0.0, params_.local_connectivity - 1.0);
+    const SmoothKnnResult sk = smooth_knn_dist(
+        dists.data(), static_cast<int>(n_queries), static_cast<int>(cols),
+        static_cast<double>(n_neighbors_), 64, adjusted_local_connectivity);
+    return compute_membership_strengths(
+        indices.data(), dists.data(), sk.sigmas.data(), sk.rhos.data(),
+        static_cast<int>(n_queries), static_cast<int>(cols),
+        /*return_dists=*/false, /*bipartite=*/true);
+}
+
+namespace {
+
+// The transform input-hash shortcut for sparse queries: same CSR content as
+// the training data.
+bool same_csr(const int32_t* q_indptr, const int32_t* q_indices,
+              const float* q_data, int64_t n_queries,
+              const std::vector<int32_t>& indptr,
+              const std::vector<int32_t>& indices,
+              const std::vector<float>& data) {
+    if (n_queries + 1 != static_cast<int64_t>(indptr.size())) return false;
+    for (int64_t i = 0; i <= n_queries; ++i) {
+        if (q_indptr[i] != indptr[static_cast<std::size_t>(i)]) return false;
+    }
+    const std::size_t nnz = indices.size();
+    return std::memcmp(q_indices, indices.data(), nnz * sizeof(int32_t)) ==
+               0 &&
+           std::memcmp(q_data, data.data(), nnz * sizeof(float)) == 0;
+}
+
+}  // namespace
+
+std::vector<float> UMAP::transform(const int32_t* q_indptr,
+                                   const int32_t* q_indices,
+                                   const float* q_data,
+                                   int64_t n_queries) const {
+    if (!fitted_)
+        throw std::runtime_error("UMAP: transform() called before fit()");
+    if (params_.transform_mode == "graph") {
+        throw std::invalid_argument(
+            "transform returns the graph when transform_mode='graph'; use "
+            "transform_graph()");
+    }
+    if (n_ == 1)
+        throw std::invalid_argument(
+            "Transform unavailable when model was fit with only a single "
+            "data sample.");
+    if (!sparse_data_)
+        throw std::invalid_argument(
+            "UMAP: model was fit with dense data; use the dense transform "
+            "overload");
+
+    // Input-hash shortcut: transforming the training data returns embedding_.
+    if (same_csr(q_indptr, q_indices, q_data, n_queries, raw_indptr_,
+                 raw_indices_, raw_values_)) {
+        return embedding_;
+    }
+    if (params_.densmap)
+        throw std::runtime_error(
+            "Transforming data into an existing embedding not supported "
+            "for densMAP.");
+    if (params_.n_epochs_list.has_value()) {
+        throw std::invalid_argument(
+            "transform: n_epochs as a list is not supported (the reference "
+            "raises a TypeError)");
+    }
+
+    const MembershipStrengths ms =
+        transform_membership_sparse(q_indptr, q_indices, q_data, n_queries);
+    return transform_from_membership(ms, n_queries);
+}
+
+SparseMatrix UMAP::transform_graph(const int32_t* q_indptr,
+                                   const int32_t* q_indices,
+                                   const float* q_data,
+                                   int64_t n_queries) const {
+    if (!fitted_)
+        throw std::runtime_error("UMAP: transform_graph() called before fit()");
+    if (params_.transform_mode != "graph") {
+        throw std::invalid_argument(
+            "transform_graph requires transform_mode='graph'");
+    }
+    if (n_ == 1)
+        throw std::invalid_argument(
+            "Transform unavailable when model was fit with only a single "
+            "data sample.");
+    if (!sparse_data_)
+        throw std::invalid_argument(
+            "UMAP: model was fit with dense data; use the dense "
+            "transform_graph overload");
+    if (same_csr(q_indptr, q_indices, q_data, n_queries, raw_indptr_,
+                 raw_indices_, raw_values_)) {
+        return graph_;
+    }
+    if (params_.densmap)
+        throw std::runtime_error(
+            "Transforming data into an existing embedding not supported "
+            "for densMAP.");
+    const MembershipStrengths ms =
+        transform_membership_sparse(q_indptr, q_indices, q_data, n_queries);
+    return SparseMatrix::from_coo(static_cast<int32_t>(n_queries),
+                                  static_cast<int32_t>(n_), ms.rows, ms.cols,
+                                  ms.vals);
+}
+
+// ----------------------------------------------------------------------------
 
 }  // namespace umap

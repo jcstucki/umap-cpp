@@ -52,10 +52,42 @@
 //     edge removal in all fit branches and in transform's kNN, fully
 //     disconnected vertices -> NaN rows + upstream warning texts (stderr).
 //
-// Deferred (upstream branches NOT ported): sparse-input UMAP-class wiring,
-// sparse precomputed distances, supervised fit (y), densmap / output_dens,
-// non-euclidean output metrics, init="tswspectral", inverse_transform /
-// update / AlignedUMAP.
+// --- supervised-sparse additions (Phase 1b) ---------------------------------
+//   * Supervised / semi-supervised fit(X, y): target_metric="categorical"
+//     (fast_intersection with far_dist from target_weight, -1 labels =
+//     unknown), the DISCRETE_METRICS branch for "ordinal"/"count"
+//     (get_discrete_params + fast_metric_intersection; "string"/"myers"
+//     need object-dtype y and "hierarchical_categorical" KeyErrors upstream
+//     -- all three raise here), and the general branch (target fuzzy
+//     simplicial set with apply_set_operations=False, sklearn float64
+//     pairwise for n < 4096 / NN-descent otherwise,
+//     general_simplicial_set_intersection + reset_local_connectivity).
+//     The disconnected-vertex NaN mask is recomputed from the intersected
+//     graph, as upstream does inside the embedding block.
+//   * Sparse (CSR) input wiring: fit/fit_transform/transform overloads taking
+//     scipy-layout CSR arrays. Small data (n < 4096) replicates sklearn's
+//     sparse pairwise_distances float32 semantics for euclidean/l2
+//     (_euclidean_distances_upcast: float64 chunks over float32 data) and
+//     cosine (inplace_csr_row_normalize_l2 with a float64 accumulator +
+//     scipy's fmaf-contracted float32 sparse matmul); other metrics raise
+//     (upstream densifies via pairwise_special_metric -- not ported). The
+//     standard branch builds a SparsePreparedIndex (continuing the numpy
+//     RandomState stream) whose query() serves transform at epsilon 0.12 /
+//     0.24 (angular). unique=True uses csr_unique object-row semantics.
+//     Not ported for sparse input: metric="precomputed" (upstream's sparse
+//     precomputed branch), precomputed_knn, init="pca" (TruncatedSVD).
+//     Deviation: transform's small-data kNN breaks exact distance ties in
+//     stable order, not numpy argpartition/argsort order (ties are common
+//     for sparse cosine at low density -- disjoint rows are all at 1.0).
+//   * graph() after a transform_mode="embedding" fit contains explicit zeros
+//     at sub-threshold entries: upstream's epoch weight filter writes through
+//     scipy's shared tocoo() data array into self.graph_ (replicated via
+//     resolve_epochs_and_filter_graph's write_through -- see layouts.hpp),
+//     and the NaN disconnection mask is computed from that mutated graph.
+// ----------------------------------------------------------------------------
+//
+// Deferred (upstream branches NOT ported): sparse precomputed distances,
+// init="tswspectral", inverse_transform / update / AlignedUMAP.
 //
 // Seeded parity: when random_state is set, the numpy legacy RandomState
 // stream is replicated draw for draw (NN-descent seeding, init draws --
@@ -87,6 +119,12 @@
 #include "umap/sparse_matrix.hpp"
 
 namespace umap {
+
+// --- supervised-sparse additions --------------------------------------------
+namespace spnnd {
+class SparsePreparedIndex;
+}
+// ----------------------------------------------------------------------------
 
 // --- feature-bundle additions -----------------------------------------------
 // The `precomputed_knn=(knn_indices, knn_dists[, knn_search_index])` tuple.
@@ -163,6 +201,18 @@ struct UMAPParams {
     double dens_var_shift = 0.1;
     bool output_dens = false;
     // ------------------------------------------------------------------------
+    // --- supervised-sparse additions ----------------------------------------
+    // Supervised fit target parameters (umap.UMAP defaults). target_metric
+    // may be "categorical" (default), a DISCRETE_METRICS name ("ordinal" /
+    // "count" supported; get_discrete_params overrides target_metric_kwds
+    // exactly like upstream) or any named metric for the general target
+    // branch ("l2"/"euclidean" replicate sklearn's float64 pairwise path
+    // bit-exactly for 1-d targets).
+    std::string target_metric = "categorical";
+    MetricKwds target_metric_kwds;
+    int target_n_neighbors = -1;  // -1 -> use _n_neighbors
+    double target_weight = 0.5;
+    // ------------------------------------------------------------------------
 };
 
 class UMAP {
@@ -170,13 +220,37 @@ class UMAP {
     explicit UMAP(UMAPParams params = UMAPParams());
 
     // Fit X (row-major n_samples x n_features float32) into an embedded space.
-    UMAP& fit(const float* X, int64_t n_samples, int64_t n_features);
+    // y (optional): per-sample target labels for supervised dimension
+    // reduction (float; categorical labels with -1.0 marking "unknown" for
+    // the default target_metric="categorical", or continuous values for the
+    // general target branch), matching upstream's fit(X, y) semantics.
+    UMAP& fit(const float* X, int64_t n_samples, int64_t n_features,
+              const float* y = nullptr);
 
     // fit + return a copy of the embedding (n_samples x n_components).
     // transform_mode="graph" raises here (the reference returns the graph from
     // fit_transform; in C++ use fit_transform_graph for that variant).
     std::vector<float> fit_transform(const float* X, int64_t n_samples,
-                                     int64_t n_features);
+                                     int64_t n_features,
+                                     const float* y = nullptr);
+
+    // --- supervised-sparse additions ----------------------------------------
+    // Sparse (CSR, scipy layout: sorted duplicate-free column indices per
+    // row, float32 data) fit / fit_transform / transform. n_features is the
+    // number of columns of the CSR matrix.
+    UMAP& fit(const int32_t* indptr, const int32_t* indices, const float* data,
+              int64_t n_samples, int64_t n_features, const float* y = nullptr);
+    std::vector<float> fit_transform(const int32_t* indptr,
+                                     const int32_t* indices, const float* data,
+                                     int64_t n_samples, int64_t n_features,
+                                     const float* y = nullptr);
+    std::vector<float> transform(const int32_t* q_indptr,
+                                 const int32_t* q_indices, const float* q_data,
+                                 int64_t n_queries) const;
+    SparseMatrix transform_graph(const int32_t* q_indptr,
+                                 const int32_t* q_indices, const float* q_data,
+                                 int64_t n_queries) const;
+    // ------------------------------------------------------------------------
 
     // Transform new points (row-major n_queries x n_features) into the
     // existing embedded space; returns n_queries x n_components.
@@ -207,6 +281,7 @@ class UMAP {
     const std::vector<float>& fit_init() const { return fit_init_; }
     int effective_n_neighbors() const { return n_neighbors_; }  // _n_neighbors
     bool small_data() const { return small_data_; }
+    bool sparse_data() const { return sparse_data_; }  // self._sparse_data
     int64_t n_samples() const { return n_; }
     int64_t n_features() const { return dim_; }
     const UMAPParams& params() const { return params_; }
@@ -245,6 +320,14 @@ class UMAP {
     std::vector<float> make_fit_init(const float* data, int64_t n_index,
                                      const SparseMatrix& filtered_graph,
                                      nnd::NumpyRandomState& rs) const;
+    // The shared fit body (dense when X != nullptr, sparse otherwise; the
+    // sparse overload fills the raw CSR members first).
+    UMAP& fit_impl(const float* X, int64_t n_samples, int64_t n_features,
+                   const float* y);
+    // The y-handling block of fit(): intersect graph_ with the target
+    // simplicial set (categorical / discrete / general branches).
+    void supervise_graph(const float* y, const std::vector<int64_t>& index,
+                         int64_t n_samples, nnd::NumpyRandomState& rs);
     // The shared transform prologue: kNN of the new points vs the training
     // data (precomputed / brute-force / query paths), disconnection pruning,
     // smooth_knn_dist and compute_membership_strengths(bipartite=True).
@@ -252,6 +335,18 @@ class UMAP {
     // order upstream).
     MembershipStrengths transform_membership(const float* X_new,
                                              int64_t n_queries) const;
+    // --- supervised-sparse additions ----------------------------------------
+    // Sparse variant of the transform prologue (brute force vs the training
+    // CSR for small data, SparsePreparedIndex::query otherwise).
+    MembershipStrengths transform_membership_sparse(const int32_t* q_indptr,
+                                                    const int32_t* q_indices,
+                                                    const float* q_data,
+                                                    int64_t n_queries) const;
+    // The shared transform epilogue (init_graph_transform + SGD), used by
+    // both the dense and sparse transform overloads.
+    std::vector<float> transform_from_membership(const MembershipStrengths& ms,
+                                                 int64_t n_queries) const;
+    // ------------------------------------------------------------------------
 
     UMAPParams params_;
     double a_ = 0.0;
@@ -264,6 +359,13 @@ class UMAP {
     int64_t dim_ = 0;
     std::vector<float> raw_data_;                    // training data copy
     std::shared_ptr<nnd::PreparedIndex> knn_index_;  // standard branch only
+    // --- supervised-sparse additions ----------------------------------------
+    bool sparse_data_ = false;         // self._sparse_data
+    std::vector<int32_t> raw_indptr_;  // training CSR copy (sparse fits)
+    std::vector<int32_t> raw_indices_;
+    std::vector<float> raw_values_;
+    std::shared_ptr<spnnd::SparsePreparedIndex> sparse_knn_index_;
+    // ------------------------------------------------------------------------
     std::vector<int32_t> knn_indices_;
     std::vector<float> knn_dists_;
     int64_t knn_cols_ = 0;  // knn array width (may exceed n_neighbors_)
@@ -338,6 +440,36 @@ void unique_rows(const float* X, int64_t n, int64_t dim,
 // input; documented ~1e-4-level tolerance vs the reference).
 std::vector<float> pca_fit_transform(const float* X, int64_t n, int64_t dim,
                                      int n_components);
+// ----------------------------------------------------------------------------
+
+// --- supervised-sparse additions -----------------------------------------------
+// utils.py::csr_unique semantics: rows of a CSR matrix keyed as the tuple
+// (column indices..., values...) and deduplicated with np.unique object-array
+// ordering (lexicographic on the concatenated key; a key that is a strict
+// prefix of another sorts first). `index` holds the first original occurrence
+// of each unique row in key-sorted order, `inverse` maps original rows to
+// unique rows.
+void csr_unique_rows(const int32_t* indptr, const int32_t* indices,
+                     const float* data, int64_t n,
+                     std::vector<int64_t>& index,
+                     std::vector<int64_t>& inverse);
+
+// Replication of sklearn pairwise_distances on scipy CSR float32 input for
+// the metrics the sparse small-data branch supports bit-exactly:
+//   * "euclidean"/"l2": _euclidean_distances_upcast -- float64 row norms
+//     (sequential over stored order) and dot products (ascending-column
+//     merge), (-2*dot + XX_i) + YY_j rounded to float32, maximum(0), zero
+//     diagonal when X is Y, float32 sqrt;
+//   * "cosine": inplace_csr_row_normalize_l2 (float32 squares accumulated in
+//     float64, float64 divide rounded to float32), scipy's float32 sparse
+//     matmul with fmaf contraction (ascending-column merge), S = 1 - S,
+//     clip(0, 2), zero diagonal when X is Y.
+// Everything else throws (upstream falls back to densified
+// pairwise_special_metric -- not ported). Row-major nx x ny float32 output.
+std::vector<float> sparse_pairwise_distances_sklearn(
+    const int32_t* x_indptr, const int32_t* x_indices, const float* x_data,
+    int64_t nx, const int32_t* y_indptr, const int32_t* y_indices,
+    const float* y_data, int64_t ny, const std::string& metric, bool x_is_y);
 // ----------------------------------------------------------------------------
 
 }  // namespace umap

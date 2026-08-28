@@ -175,8 +175,19 @@ std::vector<float> simplicial_set_embedding_from_init(
 // simplicial_set_embedding_from_init applies this internally unless
 // graph_prefiltered is true (in which case the caller must pass the resolved
 // n_epochs and an already-filtered graph).
+//
+// write_through (optional): a second matrix whose data receives the same
+// sub-threshold zeroing WITHOUT eliminate_zeros. This replicates a scipy
+// sharing quirk upstream: simplicial_set_embedding's `graph = graph.tocoo()`
+// shares the .data array with self.graph_ (coo.tocoo() returns self;
+// csr.tocoo() reuses the data buffer), so the epoch-based weight filter
+// writes explicit zeros back into the model's stored graph_ -- its structure
+// (indptr/indices) is untouched because eliminate_zeros() rebuilds only the
+// local copy. UMAP::fit passes its graph_ here; `write_through` must hold
+// identical data to `graph` on entry.
 int resolve_epochs_and_filter_graph(SparseMatrix& graph, int n_epochs,
-                                    int default_epochs_boost = 0);
+                                    int default_epochs_boost = 0,
+                                    SparseMatrix* write_through = nullptr);
 // ----------------------------------------------------------------------------
 
 }  // namespace umap
