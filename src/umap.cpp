@@ -977,12 +977,12 @@ UMAP& UMAP::fit(const int32_t* indptr, const int32_t* indices,
 UMAP& UMAP::fit_impl(const float* X, int64_t n_samples, int64_t n_features,
                      const float* y) {
     validate_parameters();
-    // --- tests-port additions: check_array finiteness + upstream's hellinger
-    // negative-data guard (umap_.py::fit "Metric 'hellinger' does not support
-    // negative values"), required by test_data_input.py /
-    // test_umap_validation_params.py::test_umap_bad_hellinger_data.
-    check_all_finite(X, n_samples, n_features, params_.ensure_all_finite);
-    if (params_.metric == "hellinger") {
+    // --- tests-port additions: upstream's hellinger negative-data guard
+    // (umap_.py::fit "Metric 'hellinger' does not support negative values"),
+    // required by test_umap_validation_params.py::test_umap_bad_hellinger_data.
+    // The check_array finiteness validation lives in the public fit()
+    // overloads (X is nullptr here on the sparse path).
+    if (X != nullptr && params_.metric == "hellinger") {
         const std::size_t total =
             static_cast<std::size_t>(n_samples) * n_features;
         for (std::size_t i = 0; i < total; ++i)
