@@ -1,0 +1,272 @@
+// Port of reference/umap/umap/tests/test_umap_on_iris.py to doctest (upstream
+// test names + thresholds preserved). iris is the real sklearn load_iris
+// dataset and iris_selection the conftest np.random.choice mask, both baked in
+// tests/upstream_data.hpp.
+//
+// Skips (see tests/PORTING_NOTES.md):
+//   * test_umap_trustworthiness_on_sphere_iris -- output_metric="haversine" is
+//     not wired into the UMAP class yet (optimize_layout_generic is ported).
+//   * test_umap_transform_on_iris_modified_dtype -- upstream re-casts
+//     embedding_ to float64 and checks transform still works; the C++
+//     embedding is always float32, there is no dtype to modify.
+//   * test_umap_sparse_transform_on_iris / test_precomputed_sparse_transform_
+//     on_iris -- sparse input / sparse precomputed not wired into the class.
+//   * test_umap_clusterability_on_supervised_iris -- supervised fit (y).
+//   * test_umap_inverse_transform_on_iris -- inverse_transform not ported.
+// Adaptation:
+//   * test_precomputed_knn_on_iris: the pytest.warns bookkeeping is replaced
+//     by behavioural checks (the C++ port emits the same warnings on stderr);
+//     the NotImplementedError match "search index" maps to the C++
+//     std::invalid_argument whose message contains "search index".
+#include <cmath>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include "doctest.h"
+#include "trustworthiness.hpp"
+#include "umap/nn_descent.hpp"
+#include "umap/umap.hpp"
+#include "upstream_data.hpp"
+#include "upstream_helpers.hpp"
+
+namespace {
+
+using umap::PrecomputedKnn;
+using umap::UMAP;
+using umap::UMAPParams;
+
+constexpr int64_t kIrisN = 150, kIrisDim = 4;
+
+const std::vector<float>& iris_f32() {
+    static const std::vector<float> data =
+        testutil::to_f32(updata::iris_data, kIrisN * kIrisDim);
+    return data;
+}
+
+const std::vector<float>& iris_subset() {  // iris.data[iris_selection]
+    static const std::vector<float> data = testutil::select_rows(
+        iris_f32().data(), kIrisN, kIrisDim, updata::iris_selection, true);
+    return data;
+}
+
+const std::vector<float>& iris_rest() {  // iris.data[~iris_selection]
+    static const std::vector<float> data = testutil::select_rows(
+        iris_f32().data(), kIrisN, kIrisDim, updata::iris_selection, false);
+    return data;
+}
+
+int64_t subset_n() {
+    return static_cast<int64_t>(iris_subset().size() / kIrisDim);
+}
+int64_t rest_n() { return static_cast<int64_t>(iris_rest().size() / kIrisDim); }
+
+UMAPParams iris_params() {  // UMAP(n_neighbors=10, min_dist=0.01, rs=42)
+    UMAPParams p;
+    p.n_neighbors = 10;
+    p.min_dist = 0.01;
+    p.random_state = 42;
+    return p;
+}
+
+// conftest session fixtures, built once.
+UMAP& iris_model() {
+    static UMAP model = [] {
+        UMAP m(iris_params());
+        m.fit(iris_f32().data(), kIrisN, kIrisDim);
+        return m;
+    }();
+    return model;
+}
+
+UMAP& iris_subset_model() {
+    static UMAP model = [] {
+        UMAP m(iris_params());
+        m.fit(iris_subset().data(), subset_n(), kIrisDim);
+        return m;
+    }();
+    return model;
+}
+
+bool throws_containing(const std::function<void()>& fn,
+                       const std::string& needle) {
+    try {
+        fn();
+    } catch (const std::exception& e) {
+        return std::string(e.what()).find(needle) != std::string::npos;
+    }
+    return false;
+}
+
+double graph_rms(const umap::SparseMatrix& a, const umap::SparseMatrix& b) {
+    REQUIRE(a.n_rows == b.n_rows);
+    REQUIRE(a.n_cols == b.n_cols);
+    const std::size_t total =
+        static_cast<std::size_t>(a.n_rows) * static_cast<std::size_t>(a.n_cols);
+    std::vector<double> da(total, 0.0), db(total, 0.0);
+    for (int64_t i = 0; i < a.n_rows; ++i)
+        for (int32_t k = a.indptr[i]; k < a.indptr[i + 1]; ++k)
+            da[i * a.n_cols + a.indices[k]] = a.data[k];
+    for (int64_t i = 0; i < b.n_rows; ++i)
+        for (int32_t k = b.indptr[i]; k < b.indptr[i + 1]; ++k)
+            db[i * b.n_cols + b.indices[k]] = b.data[k];
+    double s = 0.0;
+    for (std::size_t i = 0; i < total; ++i) {
+        const double diff = da[i] - db[i];
+        s += diff * diff;
+    }
+    return std::sqrt(s / static_cast<double>(total));
+}
+
+}  // namespace
+
+TEST_SUITE("test_umap_on_iris.py") {
+
+TEST_CASE("test_umap_trustworthiness_on_iris") {
+    const std::vector<float>& emb = iris_model().embedding();
+    const double trust = testutil::trustworthiness(
+        iris_f32().data(), kIrisN, kIrisDim, emb.data(), 2, 10);
+    CAPTURE(trust);
+    CHECK(trust >= 0.97);
+}
+
+TEST_CASE("test_initialized_umap_trustworthiness_on_iris") {
+    // init = iris.data[:, 2:] (150 x 2 ndarray init).
+    std::vector<float> init(kIrisN * 2);
+    for (int64_t i = 0; i < kIrisN; ++i) {
+        init[i * 2 + 0] = static_cast<float>(updata::iris_data[i * 4 + 2]);
+        init[i * 2 + 1] = static_cast<float>(updata::iris_data[i * 4 + 3]);
+    }
+    UMAPParams p = iris_params();
+    p.n_epochs = 200;
+    p.init_array = init;
+    p.init_array_cols = 2;
+    UMAP model(p);
+    const std::vector<float> emb =
+        model.fit_transform(iris_f32().data(), kIrisN, kIrisDim);
+    const double trust = testutil::trustworthiness(
+        iris_f32().data(), kIrisN, kIrisDim, emb.data(), 2, 10);
+    CAPTURE(trust);
+    CHECK(trust >= 0.97);
+}
+
+// output_metric="haversine" is not wired into the UMAP class yet.
+TEST_CASE("test_umap_trustworthiness_on_sphere_iris" * doctest::skip()) {}
+
+TEST_CASE("test_umap_transform_on_iris") {
+    const std::vector<float> emb =
+        iris_subset_model().transform(iris_rest().data(), rest_n());
+    const double trust = testutil::trustworthiness(
+        iris_rest().data(), rest_n(), kIrisDim, emb.data(), 2, 10);
+    CAPTURE(trust);
+    CHECK(trust >= 0.80);
+}
+
+TEST_CASE("test_umap_transform_on_iris_w_pynndescent") {
+    UMAPParams p = iris_params();
+    p.n_epochs = 100;
+    p.force_approximation_algorithm = true;
+    UMAP model(p);
+    model.fit(iris_subset().data(), subset_n(), kIrisDim);
+    const std::vector<float> emb =
+        model.transform(iris_rest().data(), rest_n());
+    const double trust = testutil::trustworthiness(
+        iris_rest().data(), rest_n(), kIrisDim, emb.data(), 2, 10);
+    CAPTURE(trust);
+    CHECK(trust >= 0.85);
+}
+
+TEST_CASE("test_umap_transform_on_iris_modified_dtype" * doctest::skip()) {}
+TEST_CASE("test_umap_sparse_transform_on_iris" * doctest::skip()) {}
+
+TEST_CASE("test_precomputed_transform_on_iris") {
+    // distance_matrix = squareform(pdist(data)) in float64, cast like upstream.
+    const std::vector<double> data64 = testutil::select_rows(
+        updata::iris_data, kIrisN, kIrisDim, updata::iris_selection, true);
+    const std::vector<double> rest64 = testutil::select_rows(
+        updata::iris_data, kIrisN, kIrisDim, updata::iris_selection, false);
+    const int64_t n = subset_n(), nq = rest_n();
+    const std::vector<double> dmat64 = testutil::pairwise_euclidean_f64(
+        data64.data(), n, data64.data(), n, kIrisDim);
+    const std::vector<float> dmat =
+        testutil::to_f32(dmat64.data(), dmat64.size());
+    UMAPParams p = iris_params();
+    p.n_epochs = 100;
+    p.metric = "precomputed";
+    UMAP model(p);
+    model.fit(dmat.data(), n, n);
+    const std::vector<double> new_dmat64 = testutil::pairwise_euclidean_f64(
+        rest64.data(), nq, data64.data(), n, kIrisDim);
+    const std::vector<float> new_dmat =
+        testutil::to_f32(new_dmat64.data(), new_dmat64.size());
+    const std::vector<float> emb = model.transform(new_dmat.data(), nq);
+    const double trust = testutil::trustworthiness(
+        iris_rest().data(), nq, kIrisDim, emb.data(), 2, 10);
+    CAPTURE(trust);
+    CHECK(trust >= 0.85);
+}
+
+TEST_CASE("test_precomputed_sparse_transform_on_iris" * doctest::skip()) {}
+TEST_CASE("test_umap_clusterability_on_supervised_iris" * doctest::skip()) {}
+TEST_CASE("test_umap_inverse_transform_on_iris" * doctest::skip()) {}
+
+TEST_CASE("test_precomputed_knn_on_iris") {
+    const int64_t n = subset_n();
+    // knn = nearest_neighbors(data, 10, "euclidean", None, False, 42): the
+    // NNDescent branch returning (indices, dists, search_index).
+    auto index = std::make_shared<umap::nnd::PreparedIndex>(
+        umap::nnd::PreparedIndex::build(iris_subset().data(), n, kIrisDim, 10,
+                                        "euclidean", 42u));
+    PrecomputedKnn knn;
+    knn.n_samples = n;
+    knn.n_neighbors = 10;
+    knn.indices = index->knn_indices();
+    knn.dists = index->knn_dists();
+
+    // force_approximation_algorithm is ignored when a precomputed knn is used.
+    UMAPParams p = iris_params();
+    PrecomputedKnn knn_with_index = knn;
+    knn_with_index.search_index = index;
+    p.precomputed_knn = knn_with_index;
+    p.force_approximation_algorithm = false;
+    UMAP with_pknn(p);
+    with_pknn.fit(iris_subset().data(), n, kIrisDim);
+
+    // Similarity graphs should nearly agree with the plain subset model
+    // (threshold empirically chosen upstream).
+    CHECK(graph_rms(with_pknn.graph(), iris_subset_model().graph()) < 0.005);
+
+    // precomputed_knn=(knn[0], knn[1]) (no search index): upstream warns
+    // "transforming new data" but the fit embedding is identical.
+    UMAPParams p2 = iris_params();
+    p2.precomputed_knn = knn;  // no search_index
+    UMAP no_index(p2);
+    no_index.fit(iris_subset().data(), n, kIrisDim);
+    REQUIRE(no_index.embedding().size() == with_pknn.embedding().size());
+    for (std::size_t i = 0; i < no_index.embedding().size(); ++i) {
+        CAPTURE(i);
+        CHECK(no_index.embedding()[i] == with_pknn.embedding()[i]);
+    }
+
+    // #848: no search index -> transform raises mentioning the search index.
+    CHECK(throws_containing(
+        [&] { no_index.transform(iris_rest().data(), rest_n()); },
+        "search index"));
+
+    // force_approximation_algorithm=True is likewise ignored.
+    UMAPParams p3 = iris_params();
+    p3.precomputed_knn = knn;
+    p3.force_approximation_algorithm = true;
+    UMAP force_true(p3);
+    force_true.fit(iris_subset().data(), n, kIrisDim);
+    REQUIRE(force_true.embedding().size() == no_index.embedding().size());
+    for (std::size_t i = 0; i < force_true.embedding().size(); ++i) {
+        CAPTURE(i);
+        CHECK(force_true.embedding()[i] == no_index.embedding()[i]);
+    }
+}
+
+}  // TEST_SUITE

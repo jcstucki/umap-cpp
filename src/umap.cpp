@@ -872,8 +872,40 @@ std::vector<float> UMAP::make_fit_init(const float* data, int64_t n_index,
     return out;
 }
 
+// --- tests-port additions (branch tests-port) -------------------------------
+// sklearn check_array's finiteness validation (upstream fit/transform take an
+// ensure_all_finite kwarg, default True, forwarded to check_array; the C++
+// port exposes it as UMAPParams::ensure_all_finite). Required by the
+// test_data_input.py port. Error strings follow sklearn's.
+namespace {
+void check_all_finite(const float* X, int64_t n, int64_t dim,
+                      const std::string& mode) {
+    if (mode == "false") return;
+    if (mode != "true" && mode != "allow-nan")
+        throw std::invalid_argument(
+            "ensure_all_finite should be a bool or \"allow-nan\". Got \"" +
+            mode + "\" instead");
+    const std::size_t total = static_cast<std::size_t>(n) * dim;
+    for (std::size_t i = 0; i < total; ++i) {
+        const float v = X[i];
+        if (std::isinf(v))
+            throw std::invalid_argument(
+                "Input contains infinity or a value too large for "
+                "dtype('float32').");
+        if (mode == "true" && std::isnan(v))
+            throw std::invalid_argument("Input contains NaN.");
+    }
+}
+}  // namespace
+// ----------------------------------------------------------------------------
+
 UMAP& UMAP::fit(const float* X, int64_t n_samples, int64_t n_features,
                 const float* y) {
+    // --- tests-port additions: check_array finiteness --------------------
+    check_all_finite(X, n_samples,
+                     params_.metric == "precomputed" ? n_samples : n_features,
+                     params_.ensure_all_finite);
+    // ----------------------------------------------------------------------
     sparse_data_ = false;
     raw_indptr_.clear();
     raw_indices_.clear();
@@ -903,6 +935,11 @@ UMAP& UMAP::fit(const int32_t* indptr, const int32_t* indices,
     raw_indptr_.assign(indptr, indptr + n_samples + 1);
     raw_indices_.assign(indices, indices + indptr[n_samples]);
     raw_values_.assign(data, data + indptr[n_samples]);
+    // --- tests-port additions: finiteness over sparse values --------------
+    check_all_finite(raw_values_.data(),
+                     static_cast<int64_t>(raw_values_.size()), 1,
+                     params_.ensure_all_finite);
+    // ----------------------------------------------------------------------
     // if self._sparse_data and not X.has_sorted_indices: X.sort_indices()
     for (int64_t i = 0; i < n_samples; ++i) {
         const int32_t start = raw_indptr_[static_cast<std::size_t>(i)];
@@ -940,6 +977,20 @@ UMAP& UMAP::fit(const int32_t* indptr, const int32_t* indices,
 UMAP& UMAP::fit_impl(const float* X, int64_t n_samples, int64_t n_features,
                      const float* y) {
     validate_parameters();
+    // --- tests-port additions: check_array finiteness + upstream's hellinger
+    // negative-data guard (umap_.py::fit "Metric 'hellinger' does not support
+    // negative values"), required by test_data_input.py /
+    // test_umap_validation_params.py::test_umap_bad_hellinger_data.
+    check_all_finite(X, n_samples, n_features, params_.ensure_all_finite);
+    if (params_.metric == "hellinger") {
+        const std::size_t total =
+            static_cast<std::size_t>(n_samples) * n_features;
+        for (std::size_t i = 0; i < total; ++i)
+            if (X[i] < 0.0f)
+                throw std::invalid_argument(
+                    "Metric 'hellinger' does not support negative values");
+    }
+    // ------------------------------------------------------------------------
     n_ = n_samples;
     dim_ = n_features;
     if (sparse_data_) {
@@ -1833,6 +1884,11 @@ std::vector<float> UMAP::transform(const float* X_new,
         throw std::invalid_argument(
             "UMAP: model was fit with sparse data; use the CSR transform "
             "overload");
+    // ------------------------------------------------------------------------
+    // --- tests-port additions: check_array finiteness (see fit) -------------
+    check_all_finite(X_new, n_queries,
+                     params_.metric == "precomputed" ? n_ : dim_,
+                     params_.ensure_all_finite);
     // ------------------------------------------------------------------------
 
     // Input-hash shortcut: transforming the training data returns embedding_.

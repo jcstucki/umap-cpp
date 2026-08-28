@@ -241,11 +241,28 @@ std::vector<double> component_layout(const float* data, int64_t n_samples,
     // with norm_laplacian=True, drop_first=True:
     //   L = I - D^{-1/2} A D^{-1/2}; k = dim + 1 smallest eigenvectors x;
     //   embedding rows = x / dd, deterministic sign flip, drop first.
+    // --- tests-port fix (real bug found by test_umap_ops.py::
+    // test_multi_component_layout): scipy csgraph_laplacian(normed=True)
+    // guards isolated (zero-degree) vertices -- w[w == 0] = 1 and the
+    // Laplacian diagonal is 1 - isolated_node_mask. Without the guard,
+    // components whose mutual affinities exp(-d^2) underflow to 0 (very
+    // distant blobs) produced a NaN Laplacian and a solver failure, where
+    // sklearn/scipy succeed. dd (the returned diag) keeps the guarded values,
+    // exactly like scipy's return_diag=True.
     Eigen::VectorXd dd = affinity.rowwise().sum().cwiseSqrt();
-    Eigen::MatrixXd L = Eigen::MatrixXd::Identity(n_components, n_components) -
-                        (affinity.array() /
-                         (dd * dd.transpose()).array())
-                            .matrix();
+    std::vector<bool> isolated(static_cast<std::size_t>(n_components), false);
+    for (int32_t i = 0; i < n_components; ++i)
+        if (dd(i) == 0.0) {
+            isolated[static_cast<std::size_t>(i)] = true;
+            dd(i) = 1.0;
+        }
+    Eigen::MatrixXd L(n_components, n_components);
+    for (int32_t i = 0; i < n_components; ++i)
+        for (int32_t j = 0; j < n_components; ++j)
+            L(i, j) = (i == j)
+                          ? (isolated[static_cast<std::size_t>(i)] ? 0.0 : 1.0)
+                          : -affinity(i, j) / (dd(i) * dd(j));
+    // ------------------------------------------------------------------------
     Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> solver(L);
     if (solver.info() != Eigen::Success)
         throw std::runtime_error("component_layout: dense eigensolver failed");

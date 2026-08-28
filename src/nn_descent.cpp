@@ -262,6 +262,90 @@ float identity_sq(const float* x, const float* y, int64_t dim) {
     return squared_euclidean(x, y, dim);
 }
 
+// --- tests-port additions (branch tests-port) -------------------------------
+// jaccard + hellinger support for the dense NN-descent path, required by the
+// upstream test-suite port (test_umap_ops.py::test_disconnected_data runs
+// UMAP(metric="jaccard"/"hellinger", force_approximation_algorithm=True)).
+// Faithful ports of pynndescent/distances.py fast_distance_alternatives:
+// alternative_jaccard / correct_alternative_jaccard and alternative_hellinger
+// / correct_alternative_hellinger (numba float32 locals), plus the plain
+// float32 kernels as true_dist. Both metrics are in pynndescent's
+// angular-trees list (pynndescent_.py).
+float alternative_jaccard(const float* x, const float* y, int64_t dim) {
+    float num_non_zero = 0.0f;
+    float num_equal = 0.0f;
+    for (int64_t i = 0; i < dim; ++i) {
+        const bool x_true = x[i] != 0.0f;
+        const bool y_true = y[i] != 0.0f;
+        num_non_zero += (x_true || y_true) ? 1.0f : 0.0f;
+        num_equal += (x_true && y_true) ? 1.0f : 0.0f;
+    }
+    if (num_non_zero == 0.0f) return 0.0f;
+    return -std::log2(num_equal / num_non_zero);  // -log2(0) == +inf
+}
+
+float alt_jaccard_correction(float v) {
+    return static_cast<float>(1.0 - std::pow(2.0, -static_cast<double>(v)));
+}
+
+float true_jaccard(const float* x, const float* y, int64_t dim) {
+    float num_non_zero = 0.0f;
+    float num_equal = 0.0f;
+    for (int64_t i = 0; i < dim; ++i) {
+        const bool x_true = x[i] != 0.0f;
+        const bool y_true = y[i] != 0.0f;
+        num_non_zero += (x_true || y_true) ? 1.0f : 0.0f;
+        num_equal += (x_true && y_true) ? 1.0f : 0.0f;
+    }
+    if (num_non_zero == 0.0f) return 0.0f;
+    return (num_non_zero - num_equal) / num_non_zero;
+}
+
+float alternative_hellinger(const float* x, const float* y, int64_t dim) {
+    float result = 0.0f;
+    float l1_norm_x = 0.0f;
+    float l1_norm_y = 0.0f;
+    for (int64_t i = 0; i < dim; ++i) {
+        result += std::sqrt(x[i] * y[i]);
+        l1_norm_x += x[i];
+        l1_norm_y += y[i];
+    }
+    if (l1_norm_x == 0.0f && l1_norm_y == 0.0f) {
+        return 0.0f;
+    } else if (l1_norm_x == 0.0f || l1_norm_y == 0.0f) {
+        return kFloat32Max;
+    } else if (result <= 0.0f) {
+        return kFloat32Max;
+    } else {
+        result = std::sqrt(l1_norm_x * l1_norm_y) / result;
+        return std::log2(result);
+    }
+}
+
+float alt_hellinger_correction(float d) {
+    return static_cast<float>(
+        std::sqrt(1.0 - std::pow(2.0, -static_cast<double>(d))));
+}
+
+float true_hellinger(const float* x, const float* y, int64_t dim) {
+    float result = 0.0f;
+    float l1_norm_x = 0.0f;
+    float l1_norm_y = 0.0f;
+    for (int64_t i = 0; i < dim; ++i) {
+        result += std::sqrt(x[i] * y[i]);
+        l1_norm_x += x[i];
+        l1_norm_y += y[i];
+    }
+    if (l1_norm_x == 0.0f && l1_norm_y == 0.0f) {
+        return 0.0f;
+    } else if (l1_norm_x == 0.0f || l1_norm_y == 0.0f) {
+        return 1.0f;
+    } else {
+        return std::sqrt(1.0f - result / std::sqrt(l1_norm_x * l1_norm_y));
+    }
+}
+// ----------------------------------------------------------------------------
+
 }  // namespace
 
 MetricInfo resolve_metric(const std::string& name) {
@@ -286,6 +370,18 @@ MetricInfo resolve_metric(const std::string& name) {
         m.correction = alt_cosine_correction;
         m.true_dist = true_cosine;
         m.angular_trees = true;           // pynndescent angular metric list
+        // --- tests-port additions (branch tests-port): jaccard + hellinger --
+    } else if (name == "jaccard") {
+        m.dist = alternative_jaccard;     // fast_distance_alternatives
+        m.correction = alt_jaccard_correction;
+        m.true_dist = true_jaccard;
+        m.angular_trees = true;           // pynndescent angular metric list
+    } else if (name == "hellinger") {
+        m.dist = alternative_hellinger;   // fast_distance_alternatives
+        m.correction = alt_hellinger_correction;
+        m.true_dist = true_hellinger;
+        m.angular_trees = true;           // pynndescent angular metric list
+        // --------------------------------------------------------------------
     } else {
         throw std::invalid_argument("umap::nnd::resolve_metric: unsupported metric '" +
                                     name + "'");
