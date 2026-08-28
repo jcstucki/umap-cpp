@@ -241,6 +241,38 @@ float sparse_euclidean(const int32_t* ind1, const float* data1, int64_t n1,
     return static_cast<float>(std::sqrt(result));
 }
 
+float sparse_dot_product(const int32_t* ind1, const float* data1, int64_t n1,
+                         const int32_t* ind2, const float* data2, int64_t n2) {
+    // sparse.py::sparse_dot_product: f4 result/val locals, merge over the
+    // index intersection with early returns on exhaustion. The numba version
+    // reads ind1[0]/ind2[0] unconditionally (UB for empty inputs); we guard.
+    if (n1 == 0 || n2 == 0) return 0.0f;
+    float result = 0.0f;
+    int64_t i1 = 0, i2 = 0;
+    int32_t j1 = ind1[i1];
+    int32_t j2 = ind2[i2];
+    while (true) {
+        if (j1 == j2) {
+            float val = data1[i1] * data2[i2];
+            result += val;
+            ++i1;
+            if (i1 >= n1) return result;
+            j1 = ind1[i1];
+            ++i2;
+            if (i2 >= n2) return result;
+            j2 = ind2[i2];
+        } else if (j1 < j2) {
+            ++i1;
+            if (i1 >= n1) return result;
+            j1 = ind1[i1];
+        } else {
+            ++i2;
+            if (i2 >= n2) return result;
+            j2 = ind2[i2];
+        }
+    }
+}
+
 float sparse_squared_euclidean(const int32_t* ind1, const float* data1,
                                int64_t n1, const int32_t* ind2,
                                const float* data2, int64_t n2) {

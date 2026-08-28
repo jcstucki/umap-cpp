@@ -68,6 +68,15 @@ void sparse_mul(const int32_t* ind1, const float* data1, int64_t n1,
                 std::vector<int32_t>& result_ind,
                 std::vector<float>& result_data);
 
+// sparse.py::sparse_dot_product -- float32 accumulation over the index
+// intersection (declared f4 locals). Used by the sparse search-tree descent
+// (rp_trees.py::sparse_select_side). NB: the numba version indexes ind1[0] /
+// ind2[0] before checking sizes, so empty inputs are undefined behaviour
+// upstream; here they return 0.0f (documented deviation, unreachable for
+// non-empty hyperplanes/queries).
+float sparse_dot_product(const int32_t* ind1, const float* data1, int64_t n1,
+                         const int32_t* ind2, const float* data2, int64_t n2);
+
 // ------------------------------------------------------------------- metrics
 
 // True metrics (as tabulated in sparse_named_distances).

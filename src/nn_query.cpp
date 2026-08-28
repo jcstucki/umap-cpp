@@ -30,10 +30,10 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
-#include <map>
 #include <numeric>
 #include <utility>
 
+#include "nn_query_detail.hpp"
 #include "umap/rng.hpp"
 
 namespace umap {
@@ -41,14 +41,15 @@ namespace nnd {
 
 namespace {
 
-constexpr double EPS = 1e-8;                    // rp_trees.py
-constexpr float FLOAT32_EPS = 1.1920929e-07f;   // np.finfo(np.float32).eps
+using detail::EPS;
+using detail::FLOAT32_EPS;
+using detail::GraphRows;
+using detail::compute_global_degrees;
+using detail::get_top_k_hub_indices;
+using detail::iabs32;
+
 constexpr float MIN_SPLIT_BALANCE = 0.1f;       // rp_trees.py
 const float INF = std::numeric_limits<float>::infinity();
-
-inline int32_t iabs32(int32_t v) {
-    return v < 0 ? static_cast<int32_t>(0u - static_cast<uint32_t>(v)) : v;
-}
 
 // utils.py::norm -- float64 accumulation, float64 return.
 inline double l2_norm(const float* vec, int64_t dim) {
@@ -59,44 +60,6 @@ inline double l2_norm(const float* vec, int64_t dim) {
 }
 
 // ------------------------------------------------------------ hub tree build
-
-// rp_trees.py::compute_global_degrees
-std::vector<int32_t> compute_global_degrees(const int32_t* knn_indices,
-                                            int64_t n, int64_t k) {
-    std::vector<int32_t> degrees(static_cast<size_t>(n), 0);
-    for (int64_t i = 0; i < n; ++i)
-        for (int64_t j = 0; j < k; ++j) {
-            int32_t nb = knn_indices[i * k + j];
-            if (nb >= 0 && nb < n) ++degrees[nb];
-        }
-    return degrees;
-}
-
-// rp_trees.py::get_top_k_hub_indices (insertion-based top-k, ties keep the
-// earlier-inserted entry).
-std::vector<int32_t> get_top_k_hub_indices(const std::vector<int32_t>& indices,
-                                           const std::vector<int32_t>& degrees,
-                                           int64_t k) {
-    const int64_t n_points = static_cast<int64_t>(indices.size());
-    const int64_t actual_k = std::min<int64_t>(k, n_points);
-    std::vector<int32_t> top_degrees(static_cast<size_t>(actual_k), -1);
-    std::vector<int32_t> top_indices(static_cast<size_t>(actual_k), 0);
-    for (int64_t i = 0; i < n_points; ++i) {
-        int32_t deg = degrees[indices[i]];
-        if (deg > top_degrees[actual_k - 1]) {
-            int64_t insert_pos = actual_k - 1;
-            while (insert_pos > 0 && deg > top_degrees[insert_pos - 1])
-                --insert_pos;
-            for (int64_t j = actual_k - 1; j > insert_pos; --j) {
-                top_degrees[j] = top_degrees[j - 1];
-                top_indices[j] = top_indices[j - 1];
-            }
-            top_degrees[insert_pos] = deg;
-            top_indices[insert_pos] = indices[i];
-        }
-    }
-    return top_indices;
-}
 
 struct HubSplitResult {
     std::vector<int32_t> left;
@@ -383,12 +346,6 @@ std::pair<int64_t, int64_t> recursive_convert(const HubTreeNodes& t,
 
 // ------------------------------------------------------------ search graph
 
-// One CSR row held as parallel (col, val) arrays in insertion order.
-struct GraphRows {
-    std::vector<std::vector<int32_t>> col;
-    std::vector<std::vector<float>> val;
-};
-
 // pynndescent_.py::diversify (dense; operates in place on copies of the kNN
 // graph arrays).
 void diversify_dense(int32_t* indices, float* distances, int64_t n, int64_t k,
@@ -532,68 +489,17 @@ SearchGraph build_search_graph(const float* data, int64_t n, int64_t dim,
     // COO -> CSR: rows keep insertion (distance-ascending) order; zero
     // distances become FLOAT32_EPS; -1 entries are dropped.
     GraphRows fwd;
-    fwd.col.resize(static_cast<size_t>(n));
-    fwd.val.resize(static_cast<size_t>(n));
-    float min_distance = INF;
-    for (int64_t i = 0; i < n; ++i) {
-        for (int64_t j = 0; j < k; ++j) {
-            int32_t c = div_ind[i * k + j];
-            if (c == -1) continue;
-            float v = div_dist[i * k + j];
-            if (v == 0.0f) v = FLOAT32_EPS;
-            fwd.col[i].push_back(c);
-            fwd.val[i].push_back(v);
-            if (v < min_distance) min_distance = v;
-        }
-    }
+    float min_distance = detail::assemble_forward_rows(
+        div_ind.data(), div_dist.data(), n, k, fwd);
 
     // "Reverse" diversification (operates on the forward rows; see header).
     diversify_csr_rows(fwd, data, dim, dist, rng_state, diversify_prob);
 
-    // M = elementwise max(F2, F2^T); drop the diagonal.
-    std::vector<std::map<int32_t, float>> sym(static_cast<size_t>(n));
-    for (int64_t i = 0; i < n; ++i) {
-        for (size_t p = 0; p < fwd.col[i].size(); ++p) {
-            int32_t j = fwd.col[i][p];
-            float v = fwd.val[i][p];
-            if (j == i) continue;  // setdiag(0) + eliminate_zeros
-            auto upd = [v](std::map<int32_t, float>& row, int32_t c) {
-                auto it = row.find(c);
-                if (it == row.end())
-                    row.emplace(c, v);
-                else if (v > it->second)
-                    it->second = v;
-            };
-            upd(sym[i], j);
-            upd(sym[j], static_cast<int32_t>(i));
-        }
-    }
-
-    // degree_prune: cut at the (max_degree+1)-th smallest value per row, keep
-    // entries <= cut (ties at the cut survive, as upstream).
+    // M = elementwise max(F2, F2^T); drop the diagonal; degree_prune.
     const int64_t max_degree = static_cast<int64_t>(
         std::nearbyint(pruning_degree_multiplier * static_cast<double>(k)));
-    std::vector<float> row_vals;
-    SearchGraph out;
+    SearchGraph out = detail::finalize_search_graph(fwd, n, max_degree);
     out.min_distance = min_distance;
-    out.indptr.assign(static_cast<size_t>(n + 1), 0);
-    for (int64_t i = 0; i < n; ++i) {
-        std::map<int32_t, float>& row = sym[i];
-        if (static_cast<int64_t>(row.size()) > max_degree) {
-            row_vals.clear();
-            for (const auto& kv : row) row_vals.push_back(kv.second);
-            std::sort(row_vals.begin(), row_vals.end());
-            float cut_value = row_vals[max_degree];
-            for (auto it = row.begin(); it != row.end();) {
-                if (it->second > cut_value)
-                    it = row.erase(it);
-                else
-                    ++it;
-            }
-        }
-        for (const auto& kv : row) out.indices.push_back(kv.first);
-        out.indptr[i + 1] = static_cast<int32_t>(out.indices.size());
-    }
     return out;
 }
 
@@ -601,83 +507,11 @@ SearchGraph build_search_graph(const float* data, int64_t n, int64_t dim,
 
 namespace {
 
-// CPython heapq on (float32 distance, int32 index) tuples, replicated
-// operation-for-operation so tie handling and heap layout match numba's
-// heapq implementation.
-struct SeedItem {
-    float d;
-    int32_t idx;
-};
-
-inline bool seed_less(const SeedItem& a, const SeedItem& b) {
-    return a.d < b.d || (a.d == b.d && a.idx < b.idx);
-}
-
-void heapq_siftdown(std::vector<SeedItem>& heap, int64_t startpos,
-                    int64_t pos) {
-    SeedItem newitem = heap[pos];
-    while (pos > startpos) {
-        int64_t parentpos = (pos - 1) >> 1;
-        SeedItem parent = heap[parentpos];
-        if (seed_less(newitem, parent)) {
-            heap[pos] = parent;
-            pos = parentpos;
-            continue;
-        }
-        break;
-    }
-    heap[pos] = newitem;
-}
-
-void heapq_siftup(std::vector<SeedItem>& heap, int64_t pos) {
-    const int64_t endpos = static_cast<int64_t>(heap.size());
-    const int64_t startpos = pos;
-    SeedItem newitem = heap[pos];
-    int64_t childpos = 2 * pos + 1;
-    while (childpos < endpos) {
-        int64_t rightpos = childpos + 1;
-        if (rightpos < endpos &&
-            !seed_less(heap[childpos], heap[rightpos]))
-            childpos = rightpos;
-        heap[pos] = heap[childpos];
-        pos = childpos;
-        childpos = 2 * pos + 1;
-    }
-    heap[pos] = newitem;
-    heapq_siftdown(heap, startpos, pos);
-}
-
-void heapq_push(std::vector<SeedItem>& heap, SeedItem item) {
-    heap.push_back(item);
-    heapq_siftdown(heap, 0, static_cast<int64_t>(heap.size()) - 1);
-}
-
-SeedItem heapq_pop(std::vector<SeedItem>& heap) {
-    SeedItem lastelt = heap.back();
-    heap.pop_back();
-    if (!heap.empty()) {
-        SeedItem returnitem = heap[0];
-        heap[0] = lastelt;
-        heapq_siftup(heap, 0);
-        return returnitem;
-    }
-    return lastelt;
-}
-
-// utils.py::mark_visited / check_and_mark_visited (bitset over uint8 table).
-inline void mark_visited(std::vector<uint8_t>& table, int32_t candidate) {
-    table[candidate >> 3] |=
-        static_cast<uint8_t>(1u << (candidate & 7));
-}
-
-inline uint8_t check_and_mark_visited(std::vector<uint8_t>& table,
-                                      int32_t candidate) {
-    int32_t loc = candidate >> 3;
-    uint8_t mask = static_cast<uint8_t>(1u << (candidate & 7));
-    uint8_t was_visited = table[loc] & mask;
-    table[loc] |= mask;
-    return was_visited;
-}
+using detail::SeedItem;
+using detail::heapq_pop;
+using detail::heapq_push;
+using detail::mark_visited;
+using detail::check_and_mark_visited;
 
 }  // namespace
 
@@ -776,22 +610,8 @@ PreparedIndex PreparedIndex::build(const float* data, int64_t n, int64_t dim,
                     data + static_cast<int64_t>(idx.vertex_order_[i]) * dim,
                     sizeof(float) * static_cast<size_t>(dim));
 
-    idx.search_graph_.min_distance = sg.min_distance;
-    idx.search_graph_.indptr.assign(static_cast<size_t>(n + 1), 0);
-    idx.search_graph_.indices.clear();
-    idx.search_graph_.indices.reserve(sg.indices.size());
-    std::vector<int32_t> row_buf;
-    for (int64_t i = 0; i < n; ++i) {
-        int32_t old_row = idx.vertex_order_[i];
-        row_buf.clear();
-        for (int32_t p = sg.indptr[old_row]; p < sg.indptr[old_row + 1]; ++p)
-            row_buf.push_back(inv[sg.indices[p]]);
-        std::sort(row_buf.begin(), row_buf.end());  // csr sort_indices
-        idx.search_graph_.indices.insert(idx.search_graph_.indices.end(),
-                                         row_buf.begin(), row_buf.end());
-        idx.search_graph_.indptr[i + 1] =
-            static_cast<int32_t>(idx.search_graph_.indices.size());
-    }
+    idx.search_graph_ =
+        detail::reorder_search_graph(sg, n, idx.vertex_order_, inv);
 
     // resort_tree_indices: tree.indices[argsort(vertex_order)] == arange(n).
     for (int64_t i = 0; i < n; ++i) idx.tree_.indices[i] = static_cast<int32_t>(i);
