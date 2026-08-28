@@ -33,9 +33,12 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <random>
 #include <string>
 #include <vector>
+
+#include "umap/distances.hpp"  // MetricKwds / make_metric_f32 (generic hook)
 
 namespace umap {
 namespace nnd {
@@ -159,13 +162,19 @@ float alternative_cosine(const float* x, const float* y, int64_t dim);  // inter
 float true_euclidean(const float* x, const float* y, int64_t dim);
 float true_cosine(const float* x, const float* y, int64_t dim);
 
+// Distance callable used throughout NN-descent / prepare / query. A
+// std::function so parameterised metrics (metric_kwds) can be bound as
+// closures like pynndescent's `_partial_dist_func`; plain function pointers
+// convert implicitly for the fast built-in metrics.
+using DistFn = std::function<float(const float*, const float*, int64_t)>;
+
 struct MetricInfo {
     // distance used inside NN-descent (fast alternative when one exists)
-    float (*dist)(const float*, const float*, int64_t) = nullptr;
+    DistFn dist;
     // elementwise correction applied to final distances (nullptr = identity)
     float (*correction)(float) = nullptr;
     // the true metric (for brute-force kNN)
-    float (*true_dist)(const float*, const float*, int64_t) = nullptr;
+    DistFn true_dist;
     bool angular_trees = false;
 };
 
@@ -174,6 +183,23 @@ struct MetricInfo {
 // replicates pynndescent's metric list (umap's `angular` flag only matters for
 // callable metrics, which we do not support).
 MetricInfo resolve_metric(const std::string& name);
+
+// --- densmap additions ------------------------------------------------------
+// Kwds-aware overload: the fast built-in metrics above resolve as before
+// (their kwds are empty upstream); every other metric in umap's named
+// registry takes the *generic-metric hook*, replicating pynndescent's
+// no-fast-alternative branch: NN-descent runs directly on the metric
+// (correction = identity), with metric_kwds bound positionally like
+// `_partial_dist_func`. The float32 rows are evaluated via make_metric_f32
+// (f32-faithful for minkowski/seuclidean/manhattan, float64-widened adapter
+// otherwise); numba pushes the float64 kernel result onto the float32 heap,
+// so the rounding point matches. angular_trees mirrors pynndescent's angular
+// metric list (cosine/dot/correlation/dice/jaccard/hellinger/hamming/bit_*).
+// Deviation: pynndescent's fast alternatives for hellinger/jaccard are not
+// ported; those metrics run on the true kernel (same final distances,
+// candidate ordering may differ from Python's alternative-metric run).
+MetricInfo resolve_metric(const std::string& name, const MetricKwds& kwds);
+// ----------------------------------------------------------------------------
 
 // ------------------------------------------------------------------ RP trees
 
@@ -213,8 +239,6 @@ LeafArray make_forest_leaf_array(const float* data, int64_t n, int64_t dim,
                                  int64_t max_depth, NumpyRandomState& numpy_rs);
 
 // ---------------------------------------------------------------- NN-descent
-
-using DistFn = float (*)(const float*, const float*, int64_t);
 
 void init_rp_tree(const float* data, int64_t dim, DistFn dist, NNHeap& graph,
                   const LeafArray& leaf_array);
@@ -270,6 +294,16 @@ void nearest_neighbors(const float* data, int64_t n, int64_t dim,
                        bool angular, NumpyRandomState& numpy_rs,
                        int32_t* knn_indices, float* knn_dists,
                        bool verbose = false);
+
+// --- densmap additions ------------------------------------------------------
+// metric_kwds-aware overload (NNDescent(metric_kwds=...) routing; see the
+// kwds-aware resolve_metric above).
+void nearest_neighbors(const float* data, int64_t n, int64_t dim,
+                       int64_t n_neighbors, const std::string& metric,
+                       const MetricKwds& metric_kwds, bool angular,
+                       NumpyRandomState& numpy_rs, int32_t* knn_indices,
+                       float* knn_dists, bool verbose = false);
+// ----------------------------------------------------------------------------
 
 // Same, but with explicit tau-prng states (for tests / callers that extracted
 // states from Python): `rng_state` is NNDescent.rng_state and
@@ -355,6 +389,16 @@ class PreparedIndex {
                                int64_t n_neighbors, const std::string& metric,
                                NumpyRandomState& numpy_rs,
                                bool verbose = false);
+
+    // --- densmap additions --------------------------------------------------
+    // metric_kwds-aware overload (kwds bound into the distance closure like
+    // pynndescent's _partial_dist_func; see resolve_metric(name, kwds)).
+    static PreparedIndex build(const float* data, int64_t n, int64_t dim,
+                               int64_t n_neighbors, const std::string& metric,
+                               const MetricKwds& metric_kwds,
+                               NumpyRandomState& numpy_rs,
+                               bool verbose = false);
+    // ------------------------------------------------------------------------
 
     // NNDescent.query(query_data, k, epsilon). Outputs are (n_queries, k)
     // row-major; indices refer to the original data order. UMAP's transform

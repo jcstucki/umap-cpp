@@ -144,6 +144,25 @@ struct UMAPParams {
     std::string transform_mode = "embedding";  // "embedding" | "graph"
     std::optional<PrecomputedKnn> precomputed_knn;
     // ------------------------------------------------------------------------
+    // --- densmap additions --------------------------------------------------
+    // metric_kwds: extra positional parameters of the input metric, bound like
+    // upstream's tuple(metric_kwds.values()) (see distances.hpp::MetricKwds).
+    // Threaded into both kNN branches (small-data pairwise + NN-descent) and
+    // the transform kNN.
+    MetricKwds metric_kwds;
+    // output_metric / output_metric_kwds: the embedding-space metric.
+    // "euclidean"/"l2" take the specialised euclidean SGD; other named
+    // metrics with gradients run optimize_layout_generic; "precomputed" and
+    // gradient-less metrics raise like upstream.
+    std::string output_metric = "euclidean";
+    MetricKwds output_metric_kwds;
+    // densMAP (density-augmented objective) + local-radii output.
+    bool densmap = false;
+    double dens_lambda = 2.0;
+    double dens_frac = 0.3;
+    double dens_var_shift = 0.1;
+    bool output_dens = false;
+    // ------------------------------------------------------------------------
 };
 
 class UMAP {
@@ -205,6 +224,15 @@ class UMAP {
     }
     // self._disconnection_distance after resolution (valid after fit).
     double disconnection_distance() const { return disconnection_distance_; }
+    // --- densmap additions --------------------------------------------------
+    // self.graph_dists_ (densmap or output_dens fits): max(D, D^T) of the kNN
+    // edge distances, as returned by fuzzy_simplicial_set(return_dists=True).
+    const SparseMatrix& graph_dists() const { return graph_dists_; }
+    // self.rad_orig_ / self.rad_emb_ (output_dens fits only): local radii in
+    // the original space and the embedding, inverse-expanded like embedding_.
+    const std::vector<float>& rad_orig() const { return rad_orig_; }
+    const std::vector<float>& rad_emb() const { return rad_emb_; }
+    // ------------------------------------------------------------------------
     // Disconnection bookkeeping from the last fit (raise_disconnected_warning
     // inputs): edges removed by the threshold and vertices of graph_ with an
     // all-zero row.
@@ -252,6 +280,11 @@ class UMAP {
     std::vector<int64_t> unique_inverse_;
     std::vector<std::vector<float>> embedding_list_;
     // ------------------------------------------------------------------------
+    // --- densmap additions --------------------------------------------------
+    SparseMatrix graph_dists_;   // graph_dists_ (densmap / output_dens fits)
+    std::vector<float> rad_orig_;
+    std::vector<float> rad_emb_;
+    // ------------------------------------------------------------------------
 };
 
 // Replication of the small-data branches' pairwise_distances(X, metric=
@@ -261,11 +294,17 @@ class UMAP {
 // accumulator, like the numba kernel); other named metrics evaluate the
 // double-precision registry in distances.hpp rounded to float32 (may differ
 // from numba's float32 kernels in the last ulp). Row-major nx x ny output.
+// metric_kwds are bound positionally like upstream (`pairwise_distances(X,
+// metric=_m, **self._metric_kwds)`); f32-faithful kernels exist for
+// euclidean/l2, manhattan, minkowski and seuclidean, other named metrics
+// evaluate the double-precision registry rounded to float32 (may differ from
+// numba's float32 kernels in the last ulp).
 std::vector<float> pairwise_distances_sklearn(const float* X, int64_t nx,
                                               const float* Y, int64_t ny,
                                               int64_t dim,
                                               const std::string& metric,
-                                              bool x_is_y);
+                                              bool x_is_y,
+                                              const MetricKwds& kwds = {});
 
 // utils.py::fast_knn_indices semantics: per row of the (n x m) distance
 // matrix, the n_neighbors smallest entries with stable (mergesort) tie-break

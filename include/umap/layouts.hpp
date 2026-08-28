@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "umap/layouts_generic.hpp"  // OutputMetricFn (generic-output SGD)
 #include "umap/sparse_matrix.hpp"
 
 namespace umap {
@@ -51,6 +52,22 @@ inline float rdist(const float* x, const float* y, int dim) {
 std::vector<double> make_epochs_per_sample(const float* weights,
                                            std::size_t n_weights, int n_epochs);
 
+// --- densmap additions ------------------------------------------------------
+// The densMAP auxiliary data optimize_layout_euclidean consumes (upstream's
+// densmap_kwds dict after simplicial_set_embedding fills in mu / mu_sum / R).
+// Scalar types mirror what the numba epoch kernel receives from the reference
+// environment (numpy 2.x / NEP 50): lambda / frac / var_shift are Python
+// floats (float64); mu (graph.data), mu_sum and R are float32 arrays.
+struct DensmapParams {
+    double lambda = 0.0;     // densmap_kwds["lambda"]
+    double frac = 0.0;       // densmap_kwds["frac"]
+    double var_shift = 0.1;  // densmap_kwds["var_shift"]
+    std::vector<float> mu;      // per-edge membership (filtered graph.data)
+    std::vector<float> mu_sum;  // per-vertex membership sums
+    std::vector<float> R;       // per-vertex standardised log radii
+};
+// ----------------------------------------------------------------------------
+
 // Improve an embedding using SGD to minimise the fuzzy set cross entropy
 // between the 1-skeletons of the high- and low-dimensional fuzzy simplicial
 // sets (layouts.py::optimize_layout_euclidean). Operates on head_embedding in
@@ -67,8 +84,18 @@ std::vector<double> make_epochs_per_sample(const float* weights,
 //                  racy embedding/rng updates, non-deterministic (numba
 //                  semantics). parallel=false is the sequential numba path and
 //                  is deterministic.
-//  densmap:        TODO: densMAP objective not yet ported; must be false
-//                  (parameters accepted for signature parity only).
+//  densmap:        enable the density-augmented densMAP objective; when true,
+//                  densmap_kwds must point at a populated DensmapParams.
+//                  Faithful port of _optimize_layout_euclidean_densmap_epoch_init
+//                  (mu_tot = f4 np.sum(mu_sum)/2, per-epoch re_sum/phi_sum
+//                  accumulation, f4 np.var/np.mean and the np.dot(re_sum, R)
+//                  BLAS sdot for re_std/re_mean/re_cov) plus the
+//                  grad_cor_coeff correction inside the epoch loop, gated by
+//                  lambda > 0 and (n+1)/n_epochs > 1 - frac exactly as
+//                  upstream. On Apple platforms np.dot is reproduced
+//                  bit-exactly via Accelerate's cblas_sdot (the BLAS numpy's
+//                  macOS wheels link); elsewhere a sequential f32 dot is used
+//                  (documented deviation).
 //  epochs_list / embedding_list: the "n_epochs is a list" variant. When
 //                  epochs_list is non-null, n_epochs is overridden with
 //                  max(*epochs_list) (as upstream does) and a copy of
@@ -86,12 +113,12 @@ void optimize_layout_euclidean(
     double initial_alpha = 1.0, double negative_sample_rate = 5.0,
     bool parallel = false, bool densmap = false, bool move_other = false,
     const std::vector<int>* epochs_list = nullptr,
-    std::vector<std::vector<float>>* embedding_list = nullptr);
+    std::vector<std::vector<float>>* embedding_list = nullptr,
+    const DensmapParams* densmap_kwds = nullptr);
 
-// The non-initialisation glue of umap_.py::simplicial_set_embedding for the
-// euclidean output metric, densmap off:
-//   - n_epochs default: 500 if n_samples <= 10000 else 200 (n_epochs < 0 means
-//     "None"/use default);
+// The non-initialisation glue of umap_.py::simplicial_set_embedding:
+//   - n_epochs default: 500 if n_samples <= 10000 else 200, +200 when densmap
+//     (n_epochs < 0 means "None"/use default);
 //   - weights below graph.data.max() / n_epochs (or / default_epochs when
 //     n_epochs <= 10) are zeroed and eliminated;
 //   - head/tail come from the COO form of the filtered graph;
@@ -110,6 +137,20 @@ void optimize_layout_euclidean(
 // variant; when epochs_list is set, n_epochs must be max(*epochs_list) (the
 // value the reference's `n_epochs_max` takes for filtering and
 // epochs-per-sample) and the snapshots land in *embedding_list.
+//
+// --- densmap additions ---
+// densmap_kwds non-null enables the densMAP objective (upstream densmap=True):
+// the euclidean SGD runs with the density correction; when the graph is not
+// prefiltered the epochs default gains upstream's +200 densMAP boost. mu /
+// mu_sum / R must already be populated (UMAP.fit computes them from
+// graph_dists_; see _densmap_original_densities).
+// output_metric non-null selects upstream's euclidean_output=False branch:
+// optimize_layout_generic(..., move_other=True) after the identical [0,10]
+// rescale and with the identical rng_state. Incompatible with densmap_kwds
+// (upstream validates "Non-Euclidean output metric not supported for
+// densMAP.") and with epochs_list (upstream's optimize_layout_generic cannot
+// take a list of epochs -- numba typing error; we throw std::invalid_argument
+// instead).
 std::vector<float> simplicial_set_embedding_from_init(
     const SparseMatrix& graph, const float* init_embedding, int n_components,
     double a, double b, const int64_t rng_state[3], int n_epochs = -1,
@@ -117,13 +158,16 @@ std::vector<float> simplicial_set_embedding_from_init(
     double negative_sample_rate = 5.0, bool parallel = false,
     bool graph_prefiltered = false,
     const std::vector<int>* epochs_list = nullptr,
-    std::vector<std::vector<float>>* embedding_list = nullptr);
+    std::vector<std::vector<float>>* embedding_list = nullptr,
+    const DensmapParams* densmap_kwds = nullptr,
+    const OutputMetricFn* output_metric = nullptr);
 
 // --- umap-class additions ---------------------------------------------------
 // The n_epochs-resolution + weight-filtering prologue of
 // umap_.py::simplicial_set_embedding, split out because UMAP.fit needs the
 // *filtered* graph before this point (spectral initialisation runs on it):
-//   - default_epochs = 500 if n_samples <= 10000 else 200; n_epochs < 0 means
+//   - default_epochs = 500 if n_samples <= 10000 else 200, plus
+//     default_epochs_boost (upstream adds 200 for densMAP); n_epochs < 0 means
 //     "None" and resolves to the default;
 //   - graph.data[graph.data < graph.data.max() / n_epochs] = 0.0 (the divisor
 //     is default_epochs when n_epochs <= 10), then eliminate_zeros().
@@ -131,7 +175,8 @@ std::vector<float> simplicial_set_embedding_from_init(
 // simplicial_set_embedding_from_init applies this internally unless
 // graph_prefiltered is true (in which case the caller must pass the resolved
 // n_epochs and an already-filtered graph).
-int resolve_epochs_and_filter_graph(SparseMatrix& graph, int n_epochs);
+int resolve_epochs_and_filter_graph(SparseMatrix& graph, int n_epochs,
+                                    int default_epochs_boost = 0);
 // ----------------------------------------------------------------------------
 
 }  // namespace umap

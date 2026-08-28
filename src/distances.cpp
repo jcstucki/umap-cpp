@@ -1420,4 +1420,80 @@ const std::unordered_map<std::string, DistanceFn>& named_distances() {
     return registry;
 }
 
+// --- densmap additions ------------------------------------------------------
+// float32-faithful numba-instantiation kernels (see header). Verified against
+// the reference environment: with float32 rows, numba computes the elementwise
+// difference (and its abs / square) in float32 and only promotes to float64
+// where a float64 operand enters the expression (the `result = 0.0`
+// accumulator, a Python-float exponent p, or a float64 sigma array).
+
+DistanceF32Fn make_metric_f32(const std::string& name, const MetricKwds& kwds,
+                              bool* f32_faithful) {
+    if (f32_faithful != nullptr) *f32_faithful = true;
+    if (name == "euclidean" || name == "l2") {
+        return [](const float* x, const float* y, std::size_t n) {
+            double result = 0.0;
+            for (std::size_t i = 0; i < n; ++i) {
+                const float d = x[i] - y[i];
+                const float sq = d * d;  // (x[i] - y[i]) ** 2 stays f4
+                result += static_cast<double>(sq);
+            }
+            return static_cast<float>(std::sqrt(result));
+        };
+    }
+    if (name == "manhattan" || name == "taxicab" || name == "l1" ||
+        name == "cityblock") {
+        return [](const float* x, const float* y, std::size_t n) {
+            double result = 0.0;
+            for (std::size_t i = 0; i < n; ++i) {
+                const float ad = std::fabs(x[i] - y[i]);  // f4 abs
+                result += static_cast<double>(ad);
+            }
+            return static_cast<float>(result);
+        };
+    }
+    if (name == "minkowski") {
+        const double p = kwds.p;
+        return [p](const float* x, const float* y, std::size_t n) {
+            double result = 0.0;
+            for (std::size_t i = 0; i < n; ++i) {
+                const float ad = std::fabs(x[i] - y[i]);  // f4 diff + abs
+                result += std::pow(static_cast<double>(ad), p);  // f4 ** f8
+            }
+            return static_cast<float>(std::pow(result, 1.0 / p));
+        };
+    }
+    if (name == "seuclidean" || name == "standardised_euclidean") {
+        const std::vector<double> sigma = kwds.v;
+        return [sigma](const float* x, const float* y, std::size_t n) {
+            if (!sigma.empty() && sigma.size() != n) {
+                throw std::invalid_argument(
+                    "make_metric_f32: sigma must have the row dimension");
+            }
+            double result = 0.0;
+            for (std::size_t i = 0; i < n; ++i) {
+                const float d = x[i] - y[i];
+                const float sq = d * d;  // (x[i] - y[i]) ** 2 stays f4
+                const double s = sigma.empty() ? 1.0 : sigma[i];
+                result += static_cast<double>(sq) / s;  // f8 divide/accumulate
+            }
+            return static_cast<float>(std::sqrt(result));
+        };
+    }
+    // Adapter: widen the float32 rows to float64 and evaluate the
+    // double-precision kernel (documented last-ulp deviation vs numba's f4
+    // instantiation, exactly like pairwise_distances_sklearn's registry path).
+    if (f32_faithful != nullptr) *f32_faithful = false;
+    DistanceFn fn = make_metric(name, kwds);
+    return [fn](const float* x, const float* y, std::size_t n) {
+        std::vector<double> xb(n), yb(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            xb[i] = static_cast<double>(x[i]);
+            yb[i] = static_cast<double>(y[i]);
+        }
+        return static_cast<float>(fn(xb.data(), yb.data(), n));
+    };
+}
+// ----------------------------------------------------------------------------
+
 }  // namespace umap

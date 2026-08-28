@@ -293,6 +293,34 @@ MetricInfo resolve_metric(const std::string& name) {
     return m;
 }
 
+// --- densmap additions ------------------------------------------------------
+MetricInfo resolve_metric(const std::string& name, const MetricKwds& kwds) {
+    // Fast built-in metrics (none of them takes kwds upstream).
+    if (name == "euclidean" || name == "l2" || name == "sqeuclidean" ||
+        name == "manhattan" || name == "taxicab" || name == "l1" ||
+        name == "cosine") {
+        return resolve_metric(name);
+    }
+    // Generic-metric hook: pynndescent's no-fast-alternative branch. The
+    // metric runs directly inside NN-descent (correction = identity) with the
+    // kwds bound positionally, like `_partial_dist_func`.
+    MetricInfo m;
+    DistanceF32Fn f = make_metric_f32(name, kwds);
+    DistFn wrapped = [f](const float* x, const float* y, int64_t dim) {
+        return f(x, y, static_cast<std::size_t>(dim));
+    };
+    m.dist = wrapped;
+    m.true_dist = wrapped;
+    m.correction = nullptr;
+    // pynndescent NNDescent.__init__ angular-trees metric list.
+    m.angular_trees =
+        (name == "cosine" || name == "dot" || name == "correlation" ||
+         name == "dice" || name == "jaccard" || name == "hellinger" ||
+         name == "hamming" || name == "bit_hamming" || name == "bit_jaccard");
+    return m;
+}
+// ----------------------------------------------------------------------------
+
 // ------------------------------------------------------------------ RP trees
 
 void euclidean_random_projection_split(
@@ -864,11 +892,10 @@ void brute_force_knn(const float* data, int64_t n, int64_t dim,
 namespace {
 
 void run_nearest_neighbors(const float* data, int64_t n, int64_t dim,
-                           int64_t n_neighbors, const std::string& metric,
+                           int64_t n_neighbors, const MetricInfo& m,
                            int64_t rng_state[3], const LeafArray& leaf_array,
                            int64_t n_iters, int32_t* knn_indices,
                            float* knn_dists, bool verbose) {
-    MetricInfo m = resolve_metric(metric);
     const int64_t max_candidates = 60;  // umap_.py::nearest_neighbors
     const double delta = 0.001;         // NNDescent default
 
@@ -898,8 +925,18 @@ void nearest_neighbors(const float* data, int64_t n, int64_t dim,
                        int64_t n_neighbors, const std::string& metric,
                        bool angular, NumpyRandomState& numpy_rs,
                        int32_t* knn_indices, float* knn_dists, bool verbose) {
+    nearest_neighbors(data, n, dim, n_neighbors, metric, MetricKwds{}, angular,
+                      numpy_rs, knn_indices, knn_dists, verbose);
+}
+
+// --- densmap additions ------------------------------------------------------
+void nearest_neighbors(const float* data, int64_t n, int64_t dim,
+                       int64_t n_neighbors, const std::string& metric,
+                       const MetricKwds& metric_kwds, bool angular,
+                       NumpyRandomState& numpy_rs, int32_t* knn_indices,
+                       float* knn_dists, bool verbose) {
     (void)angular;  // only affects callable metrics in pynndescent
-    MetricInfo m = resolve_metric(metric);
+    MetricInfo m = resolve_metric(metric, metric_kwds);
 
     // umap_.py::nearest_neighbors "hacked values"
     const int64_t n_trees = std::min<int64_t>(
@@ -919,9 +956,10 @@ void nearest_neighbors(const float* data, int64_t n, int64_t dim,
         /*max_depth=*/200, numpy_rs);
 
     int64_t rng_state[3] = {rng_state_arr[0], rng_state_arr[1], rng_state_arr[2]};
-    run_nearest_neighbors(data, n, dim, n_neighbors, metric, rng_state,
+    run_nearest_neighbors(data, n, dim, n_neighbors, m, rng_state,
                           leaf_array, n_iters, knn_indices, knn_dists, verbose);
 }
+// ----------------------------------------------------------------------------
 
 void nearest_neighbors_with_state(
     const float* data, int64_t n, int64_t dim, int64_t n_neighbors,
@@ -939,7 +977,7 @@ void nearest_neighbors_with_state(
         /*max_depth=*/200, tree_rng_states);
 
     int64_t rng_state[3] = {rng_state_in[0], rng_state_in[1], rng_state_in[2]};
-    run_nearest_neighbors(data, n, dim, n_neighbors, metric, rng_state,
+    run_nearest_neighbors(data, n, dim, n_neighbors, m, rng_state,
                           leaf_array, n_iters, knn_indices, knn_dists, verbose);
 }
 

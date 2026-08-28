@@ -65,6 +65,14 @@ target_include_directories(umapcpp SYSTEM PUBLIC
 target_sources(umapcpp PRIVATE src/umap.cpp)
 # ----------------------------------------------------------------------------
 
+# --- densmap additions ------------------------------------------------------
+# densMAP replicates np.dot(float32, float32) via the same BLAS numpy's macOS
+# wheels link (Accelerate); off Apple platforms a sequential f32 dot is used.
+if(APPLE)
+    target_link_libraries(umapcpp PUBLIC "-framework Accelerate")
+endif()
+# ----------------------------------------------------------------------------
+
 # --- metal-gpu additions ----------------------------------------------------
 # Apple Metal GPU kernels (brute-force kNN + SGD layout). Gated so CPU-only
 # builds (and non-Apple platforms) keep working: -DUMAP_ENABLE_METAL=OFF.
@@ -163,6 +171,10 @@ target_sources(umap_tests PRIVATE tests/test_umap.cpp)
 
 # --- feature-bundle additions ------------------------------------------------
 target_sources(umap_tests PRIVATE tests/test_umap_features.cpp)
+# ----------------------------------------------------------------------------
+
+# --- densmap additions ------------------------------------------------------
+target_sources(umap_tests PRIVATE tests/test_densmap.cpp)
 # ----------------------------------------------------------------------------
 
 # --- metal-gpu additions ----------------------------------------------------

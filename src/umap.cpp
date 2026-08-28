@@ -47,7 +47,8 @@ std::vector<float> pairwise_distances_sklearn(const float* X, int64_t nx,
                                               const float* Y, int64_t ny,
                                               int64_t dim,
                                               const std::string& metric,
-                                              bool x_is_y) {
+                                              bool x_is_y,
+                                              const MetricKwds& kwds) {
     // Upstream's small-data branch calls sklearn's pairwise_distances with
     // metric = self._input_distance_func, a *callable* (umap's numba kernel),
     // which routes to sklearn's _pairwise_callable: a float32 output matrix
@@ -70,25 +71,28 @@ std::vector<float> pairwise_distances_sklearn(const float* X, int64_t nx,
         return out;
     }
 
-    // Other named metrics: umap's distance kernels via the double-precision
-    // registry in distances.hpp (documented: matches the numba float32 kernels
-    // only to float32 rounding of the double result).
-    const auto& registry = named_distances();
-    auto it = registry.find(metric);
-    if (it == registry.end()) {
+    // Other named metrics: numba-f4-faithful kernels where available
+    // (manhattan / minkowski / seuclidean), otherwise umap's distance kernels
+    // via the double-precision registry in distances.hpp (documented: matches
+    // the numba float32 kernels only to float32 rounding of the double
+    // result). metric_kwds are bound positionally like upstream.
+    DistanceF32Fn fn;
+    try {
+        fn = make_metric_f32(metric, kwds);
+    } catch (const std::invalid_argument&) {
         throw std::invalid_argument(
             "pairwise_distances_sklearn: unsupported metric '" + metric + "'");
     }
-    const DistanceFn& fn = it->second;
-    std::vector<double> xbuf(dim), ybuf(dim);
     for (int64_t i = 0; i < nx; ++i) {
-        for (int64_t k = 0; k < dim; ++k)
-            xbuf[k] = static_cast<double>(X[i * dim + k]);
-        for (int64_t j = 0; j < ny; ++j) {
-            for (int64_t k = 0; k < dim; ++k)
-                ybuf[k] = static_cast<double>(Y[j * dim + k]);
-            out[static_cast<std::size_t>(i) * ny + j] = static_cast<float>(
-                fn(xbuf.data(), ybuf.data(), static_cast<std::size_t>(dim)));
+        const float* xi = X + i * dim;
+        const int64_t j0 = x_is_y ? i : 0;
+        for (int64_t j = j0; j < ny; ++j) {
+            const float d =
+                (x_is_y && i == j)
+                    ? fn(xi, xi, static_cast<std::size_t>(dim))
+                    : fn(xi, Y + j * dim, static_cast<std::size_t>(dim));
+            out[static_cast<std::size_t>(i) * ny + j] = d;
+            if (x_is_y && i != j) out[static_cast<std::size_t>(j) * ny + i] = d;
         }
     }
     return out;
@@ -148,6 +152,81 @@ float numpy_add_reduce_segment(const float* a, int64_t n) {
     if (n <= 0) return 0.0f;
     return a[0] + numpy_pairwise_sum_f32(a + 1, n - 1);
 }
+
+// --- densmap additions ------------------------------------------------------
+// np.mean / np.std on float32 arrays (numpy _methods._mean/_std: plain
+// pairwise summation over the whole array -- unlike np.add.reduceat above --
+// then all-float32 division/sqrt; verified against the reference numpy).
+float numpy_mean_f32(const float* a, int64_t n) {
+    return numpy_pairwise_sum_f32(a, n) / static_cast<float>(n);
+}
+
+float numpy_std_f32(const float* a, int64_t n) {
+    const float mean = numpy_mean_f32(a, n);
+    std::vector<float> x(static_cast<std::size_t>(n));
+    for (int64_t i = 0; i < n; ++i) {
+        const float d = a[i] - mean;
+        x[static_cast<std::size_t>(i)] = d * d;
+    }
+    return std::sqrt(numpy_pairwise_sum_f32(x.data(), n) /
+                     static_cast<float>(n));
+}
+
+// umap_.py::_densmap_original_densities (square=true: D = d_val * d_val) and
+// _densmap_embedding_densities (square=false: weighted = mu * d_val), fused:
+// both walk the graph edges in COO order (row-major over our canonical CSR),
+// look the edge distance up in the dists CSR row of the head vertex (d_val
+// stays 0.0 when absent) and accumulate float32 r / mu_sum. numba typing:
+// d_val is float64 (initialised 0.0), mu float32; `r[j] += mu * D` promotes
+// to float64 and rounds back to float32 on store; mu_sum stays float32.
+// The caller applies the Python-level `np.log(epsilon + (r / mu_sum))`
+// (float32 under NEP 50 -- unlike the float64 log inside the numba epoch
+// init) via densmap_log_radii below.
+void densmap_densities(const SparseMatrix& graph, const SparseMatrix& dists,
+                       bool square, std::vector<float>& r,
+                       std::vector<float>& mu_sum) {
+    const std::size_t nv = static_cast<std::size_t>(graph.n_cols);
+    r.assign(nv, 0.0f);
+    mu_sum.assign(nv, 0.0f);
+    for (int32_t row = 0; row < graph.n_rows; ++row) {
+        for (int32_t idx = graph.indptr[row]; idx < graph.indptr[row + 1];
+             ++idx) {
+            const int32_t j = row;
+            const int32_t k = graph.indices[idx];
+            double d_val = 0.0;
+            for (int32_t p = dists.indptr[j]; p < dists.indptr[j + 1]; ++p) {
+                if (dists.indices[p] == k) {
+                    d_val = static_cast<double>(dists.data[p]);
+                    break;
+                }
+            }
+            const double contrib =
+                square ? d_val * d_val : d_val;  // D vs plain distance
+            const float mu = graph.data[idx];
+            r[static_cast<std::size_t>(j)] = static_cast<float>(
+                r[static_cast<std::size_t>(j)] +
+                static_cast<double>(mu) * contrib);
+            r[static_cast<std::size_t>(k)] = static_cast<float>(
+                r[static_cast<std::size_t>(k)] +
+                static_cast<double>(mu) * contrib);
+            mu_sum[static_cast<std::size_t>(j)] += mu;
+            mu_sum[static_cast<std::size_t>(k)] += mu;
+        }
+    }
+}
+
+// ro = np.log(epsilon + (ro / mu_sum)) at the Python level: NEP 50 keeps the
+// whole expression float32 (the weak Python-float epsilon casts to float32).
+// np.log on float32 arrays matches the float32 rounding of the float64 log
+// (verified empirically over 2e5 samples in the reference environment).
+void densmap_log_radii(std::vector<float>& r,
+                       const std::vector<float>& mu_sum) {
+    for (std::size_t i = 0; i < r.size(); ++i) {
+        const float arg = 1e-8f + (r[i] / mu_sum[i]);
+        r[i] = static_cast<float>(std::log(static_cast<double>(arg)));
+    }
+}
+// ----------------------------------------------------------------------------
 
 }  // namespace
 
@@ -278,9 +357,10 @@ double numpy_pairwise_sum_f64(const double* a, int64_t n) {
 }
 
 double numpy_mean_f64(const double* a, int64_t n) {
+    // np.mean = plain pairwise sum over the whole array / n (the seed-first
+    // form only applies to np.add.reduceat; verified vs the reference numpy).
     if (n <= 0) return 0.0;
-    return (a[0] + numpy_pairwise_sum_f64(a + 1, n - 1)) /
-           static_cast<double>(n);
+    return numpy_pairwise_sum_f64(a, n) / static_cast<double>(n);
 }
 
 // warn() / verbose prints go to stderr (no warnings module in C++).
@@ -436,6 +516,31 @@ void UMAP::validate_parameters() const {
         warn_msg(
             "using precomputed metric; inverse_transform will be unavailable");
     }
+    // --- densmap additions --------------------------------------------------
+    // set output distance metric (upstream's elif chain; callable output
+    // metrics are out of C++ scope). Note the reference's "cannnot" typo.
+    if (p.output_metric == "precomputed") {
+        throw std::invalid_argument("output_metric cannnot be 'precomputed'");
+    } else if (named_distances_with_gradients().count(p.output_metric) > 0) {
+        // ok -- resolved at embedding time via make_output_metric
+    } else if (named_distances().count(p.output_metric) > 0) {
+        throw std::invalid_argument(
+            "gradient function is not yet implemented for " + p.output_metric +
+            ".");
+    } else {
+        throw std::invalid_argument(
+            "output_metric is neither callable nor a recognised string");
+    }
+    if (p.dens_lambda < 0.0)
+        throw std::invalid_argument("dens_lambda cannot be negative");
+    if (p.dens_frac < 0.0 || p.dens_frac > 1.0)
+        throw std::invalid_argument("dens_frac must be between 0.0 and 1.0");
+    if (p.dens_var_shift < 0.0)
+        throw std::invalid_argument("dens_var_shift cannot be negative");
+    if (p.densmap && p.output_metric != "euclidean" && p.output_metric != "l2")
+        throw std::invalid_argument(
+            "Non-Euclidean output metric not supported for densMAP.");
+    // ------------------------------------------------------------------------
     if (p.precomputed_knn.has_value()) {
         const PrecomputedKnn& k = *p.precomputed_knn;
         if (p.unique)
@@ -602,6 +707,17 @@ UMAP& UMAP::fit(const float* X, int64_t n_samples, int64_t n_features) {
     unique_inverse_.clear();
     edges_removed_ = 0;
     vertices_disconnected_ = 0;
+    // --- densmap additions --------------------------------------------------
+    graph_dists_ = SparseMatrix();
+    rad_orig_.clear();
+    rad_emb_.clear();
+    // return_dists for fuzzy_simplicial_set (upstream passes
+    // self.densmap or self.output_dens in all fit branches).
+    const bool want_graph_dists = params_.densmap || params_.output_dens;
+    // _densmap_kwds["n_neighbors"] = self.n_neighbors (overridden to
+    // _n_neighbors below only when truncation happens AND densmap is on).
+    int dens_n_neighbors = params_.n_neighbors;
+    // ------------------------------------------------------------------------
 
     // Handle all the optional arguments, setting default.
     if (params_.a.has_value() && params_.b.has_value()) {
@@ -707,6 +823,8 @@ UMAP& UMAP::fit(const float* X, int64_t n_samples, int64_t n_features) {
                      "n_neighbors is larger than the dataset size; truncating "
                      "to X.shape[0] - 1\n");
         n_neighbors_ = static_cast<int>(n_index - 1);
+        // if self.densmap: self._densmap_kwds["n_neighbors"] = _n_neighbors
+        if (params_.densmap) dens_n_neighbors = n_neighbors_;
     } else {
         n_neighbors_ = params_.n_neighbors;
     }
@@ -731,7 +849,8 @@ UMAP& UMAP::fit(const float* X, int64_t n_samples, int64_t n_features) {
         } else {
             dmat = pairwise_distances_sklearn(X_indexed, n_index, X_indexed,
                                               n_index, n_features,
-                                              params_.metric, /*x_is_y=*/true);
+                                              params_.metric, /*x_is_y=*/true,
+                                              params_.metric_kwds);
         }
         // dmat[dmat >= self._disconnection_distance] = np.inf (skipped for
         // the default +inf threshold, where the mask is all-False).
@@ -759,7 +878,7 @@ UMAP& UMAP::fit(const float* X, int64_t n_samples, int64_t n_features) {
             static_cast<int>(n_index), knn_indices_.data(), knn_dists_.data(),
             n_neighbors_, params_.set_op_mix_ratio, params_.local_connectivity,
             /*apply_set_operations=*/true,
-            /*return_dists=*/false);
+            /*return_dists=*/want_graph_dists);
     } else {
         // Standard case.
         small_data_ = false;
@@ -808,7 +927,8 @@ UMAP& UMAP::fit(const float* X, int64_t n_samples, int64_t n_features) {
             // prepared search index kept for transform().
             knn_index_ = std::make_shared<nnd::PreparedIndex>(
                 nnd::PreparedIndex::build(X_indexed, n_index, n_features,
-                                          n_neighbors_, params_.metric, rs,
+                                          n_neighbors_, params_.metric,
+                                          params_.metric_kwds, rs,
                                           params_.verbose));
             knn_indices_ = knn_index_->knn_indices();
             knn_dists_ = knn_index_->knn_dists();
@@ -830,11 +950,13 @@ UMAP& UMAP::fit(const float* X, int64_t n_samples, int64_t n_features) {
             static_cast<int>(n_index), knn_indices_.data(), knn_dists_.data(),
             params_.n_neighbors, params_.set_op_mix_ratio,
             params_.local_connectivity, /*apply_set_operations=*/true,
-            /*return_dists=*/false, static_cast<int>(knn_cols_));
+            /*return_dists=*/want_graph_dists, static_cast<int>(knn_cols_));
     }
     graph_ = fuzzy.graph;
     sigmas_ = std::move(fuzzy.sigmas);
     rhos_ = std::move(fuzzy.rhos);
+    // self.graph_dists_ (and self._densmap_kwds["graph_dists"]).
+    if (fuzzy.has_dists) graph_dists_ = std::move(fuzzy.dists);
 
     // Report the number of vertices with degree 0 in our graph_ (they were
     // properly disconnected) and mirror raise_disconnected_warning.
@@ -869,12 +991,49 @@ UMAP& UMAP::fit(const float* X, int64_t n_samples, int64_t n_features) {
             requested_epochs = *std::max_element(epochs_list->begin(),
                                                  epochs_list->end());
         }
-        const int n_epochs = resolve_epochs_and_filter_graph(g,
-                                                             requested_epochs);
+        // Use more epochs for densMAP (upstream: default_epochs += 200).
+        const int n_epochs = resolve_epochs_and_filter_graph(
+            g, requested_epochs, params_.densmap ? 200 : 0);
         fit_init_ = make_fit_init(X_indexed, n_index, g, rs);
         const std::vector<float>& init_emb = fit_init_;
         const auto r3 = rs.rng_state3();
         const int64_t rng_state[3] = {r3[0], r3[1], r3[2]};
+
+        // --- densmap additions ----------------------------------------------
+        // simplicial_set_embedding's `if densmap or output_dens:` block:
+        // original densities from the *filtered* graph + graph_dists_, then
+        // ro = log(eps + ro/mu_sum) (float32); R standardises ro for densmap.
+        DensmapParams dens_kwds;
+        std::vector<float> ro;
+        if (params_.densmap || params_.output_dens) {
+            std::vector<float> mu_sum;
+            densmap_densities(g, graph_dists_, /*square=*/true, ro, mu_sum);
+            densmap_log_radii(ro, mu_sum);
+            if (params_.densmap) {
+                // R = (ro - np.mean(ro)) / np.std(ro), all float32.
+                const int64_t nv = static_cast<int64_t>(ro.size());
+                const float mean = numpy_mean_f32(ro.data(), nv);
+                const float sd = numpy_std_f32(ro.data(), nv);
+                dens_kwds.R.resize(ro.size());
+                for (std::size_t i = 0; i < ro.size(); ++i)
+                    dens_kwds.R[i] = (ro[i] - mean) / sd;
+                dens_kwds.mu = g.data;  // filtered graph.data
+                dens_kwds.mu_sum = std::move(mu_sum);
+                // _densmap_kwds: lambda/frac only non-zero when densmap.
+                dens_kwds.lambda = params_.dens_lambda;
+                dens_kwds.frac = params_.dens_frac;
+                dens_kwds.var_shift = params_.dens_var_shift;
+            }
+        }
+        // euclidean_output = self.output_metric in ("euclidean", "l2").
+        const bool euclidean_output = (params_.output_metric == "euclidean" ||
+                                       params_.output_metric == "l2");
+        OutputMetricFn out_metric;
+        if (!euclidean_output)
+            out_metric = make_output_metric(params_.output_metric,
+                                            params_.output_metric_kwds);
+        // --------------------------------------------------------------------
+
         std::vector<std::vector<float>> emb_list;
         embedding_ = simplicial_set_embedding_from_init(
             g, init_emb.data(), params_.n_components, a_, b_, rng_state,
@@ -882,7 +1041,42 @@ UMAP& UMAP::fit(const float* X, int64_t n_samples, int64_t n_features) {
             static_cast<double>(params_.negative_sample_rate),
             /*parallel=*/!params_.random_state.has_value(),
             /*graph_prefiltered=*/true, epochs_list,
-            epochs_list != nullptr ? &emb_list : nullptr);
+            epochs_list != nullptr ? &emb_list : nullptr,
+            params_.densmap ? &dens_kwds : nullptr,
+            euclidean_output ? nullptr : &out_metric);
+
+        // --- densmap additions ----------------------------------------------
+        // simplicial_set_embedding's `if output_dens:` epilogue (runs on the
+        // optimised embedding *before* the disconnected-NaN masking, and
+        // continues the same numpy RandomState through nearest_neighbors).
+        if (params_.output_dens) {
+            rad_orig_ = ro;
+            const int64_t k = dens_n_neighbors;
+            const int64_t n_emb = g.n_rows;
+            std::vector<int32_t> emb_knn_i(static_cast<std::size_t>(n_emb) *
+                                           k);
+            std::vector<float> emb_knn_d(static_cast<std::size_t>(n_emb) * k);
+            nnd::nearest_neighbors(embedding_.data(), n_emb,
+                                   params_.n_components, k, "euclidean",
+                                   MetricKwds{}, /*angular=*/false, rs,
+                                   emb_knn_i.data(), emb_knn_d.data(),
+                                   params_.verbose);
+            // fuzzy_simplicial_set(embedding, k, rs, "euclidean", {}, knn...,
+            // return_dists=True) -- upstream's *default* set_op_mix_ratio=1.0
+            // and local_connectivity=1.0, not self's parameters.
+            FuzzySimplicialSetResult emb_fuzzy = fuzzy_simplicial_set(
+                static_cast<int>(n_emb), emb_knn_i.data(), emb_knn_d.data(),
+                static_cast<int>(k), /*set_op_mix_ratio=*/1.0,
+                /*local_connectivity=*/1.0, /*apply_set_operations=*/true,
+                /*return_dists=*/true);
+            SparseMatrix emb_graph = emb_fuzzy.graph;
+            emb_graph.eliminate_zeros();
+            std::vector<float> emb_mu_sum;
+            densmap_densities(emb_graph, emb_fuzzy.dists, /*square=*/false,
+                              rad_emb_, emb_mu_sum);
+            densmap_log_radii(rad_emb_, emb_mu_sum);
+        }
+        // --------------------------------------------------------------------
 
         // self.embedding_list_ = [e[inverse] for e in aux["embedding_list"]]
         // (snapshots are inverse-expanded but *not* NaN-masked upstream).
@@ -924,6 +1118,22 @@ UMAP& UMAP::fit(const float* X, int64_t n_samples, int64_t n_features) {
                             static_cast<std::size_t>(dim_out) * sizeof(float));
             }
             embedding_ = std::move(expanded);
+            // self.rad_orig_ = aux_data["rad_orig"][inverse] (and rad_emb_;
+            // the radii are inverse-expanded but never NaN-masked upstream).
+            if (params_.output_dens) {
+                std::vector<float> rad_o(static_cast<std::size_t>(n_samples));
+                std::vector<float> rad_e(static_cast<std::size_t>(n_samples));
+                for (int64_t i = 0; i < n_samples; ++i) {
+                    rad_o[static_cast<std::size_t>(i)] =
+                        rad_orig_[static_cast<std::size_t>(
+                            inverse[static_cast<std::size_t>(i)])];
+                    rad_e[static_cast<std::size_t>(i)] =
+                        rad_emb_[static_cast<std::size_t>(
+                            inverse[static_cast<std::size_t>(i)])];
+                }
+                rad_orig_ = std::move(rad_o);
+                rad_emb_ = std::move(rad_e);
+            }
         }
     } else {
         // transform_mode != "embedding": the reference skips the embedding
@@ -1009,7 +1219,7 @@ MembershipStrengths UMAP::transform_membership(const float* X_new,
         cols = n_neighbors_;
         const std::vector<float> dmat = pairwise_distances_sklearn(
             X_new, n_queries, raw_data_.data(), n_, dim_, params_.metric,
-            /*x_is_y=*/false);
+            /*x_is_y=*/false, params_.metric_kwds);
         indices.resize(static_cast<std::size_t>(n_queries) * cols);
         dists.resize(static_cast<std::size_t>(n_queries) * cols);
         // argpartition + argsort: k smallest per row, sorted by distance
@@ -1018,8 +1228,14 @@ MembershipStrengths UMAP::transform_membership(const float* X_new,
                            dists.data());
     } else {
         cols = params_.n_neighbors;
+        // epsilon = 0.24 if self._knn_search_index._angular_trees else 0.12
+        // (the kwds-aware resolve_metric mirrors the flag the index was
+        // built with, including the generic-metric hook's angular list).
         const double epsilon =
-            nnd::resolve_metric(params_.metric).angular_trees ? 0.24 : 0.12;
+            nnd::resolve_metric(params_.metric, params_.metric_kwds)
+                    .angular_trees
+                ? 0.24
+                : 0.12;
         indices.resize(static_cast<std::size_t>(n_queries) * cols);
         dists.resize(static_cast<std::size_t>(n_queries) * cols);
         knn_index_->query(X_new, n_queries, cols, epsilon, indices.data(),
@@ -1063,6 +1279,13 @@ SparseMatrix UMAP::transform_graph(const float* X_new,
                     raw_data_.size() * sizeof(float)) == 0) {
         return graph_;
     }
+    // --- densmap additions --------------------------------------------------
+    // Raised after the hash shortcut, exactly like upstream's transform().
+    if (params_.densmap)
+        throw std::runtime_error(
+            "Transforming data into an existing embedding not supported "
+            "for densMAP.");
+    // ------------------------------------------------------------------------
     const MembershipStrengths ms = transform_membership(X_new, n_queries);
     // The reference returns the raw COO matrix (explicit zeros retained; our
     // CSR keeps them too since eliminate_zeros() is not called).
@@ -1092,6 +1315,14 @@ std::vector<float> UMAP::transform(const float* X_new,
                     raw_data_.size() * sizeof(float)) == 0) {
         return embedding_;
     }
+    // --- densmap additions --------------------------------------------------
+    // NotImplementedError raised *after* the hash shortcut (transforming the
+    // training data itself still returns embedding_ for densMAP models).
+    if (params_.densmap)
+        throw std::runtime_error(
+            "Transforming data into an existing embedding not supported "
+            "for densMAP.");
+    // ------------------------------------------------------------------------
     if (params_.n_epochs_list.has_value()) {
         // Upstream: self.n_epochs is the list and `self.n_epochs // 3.0`
         // raises a TypeError inside transform.
@@ -1147,16 +1378,33 @@ std::vector<float> UMAP::transform(const float* X_new,
         make_epochs_per_sample(weights.data(), weights.size(), n_epochs);
 
     // optimize_layout_euclidean(head=new points, tail=training embedding
-    // (float32 copy, fixes #179 & #217), move_other=False, alpha/4).
+    // (float32 copy, fixes #179 & #217), move_other=False, alpha/4); the
+    // non-euclidean output metrics take optimize_layout_generic (upstream's
+    // `if self.output_metric == "euclidean"` -- note: "l2" takes the generic
+    // branch here, unlike fit's euclidean_output test).
     std::vector<float> tail_embedding = embedding_;
-    optimize_layout_euclidean(
-        embedding.data(), static_cast<int>(n_queries), tail_embedding.data(),
-        dim_out, head, tail, n_epochs, static_cast<int>(n_),
-        epochs_per_sample, a_, b_, rng_state, params_.repulsion_strength,
-        initial_alpha_ / 4.0,
-        static_cast<double>(params_.negative_sample_rate),
-        /*parallel=*/!params_.random_state.has_value(), /*densmap=*/false,
-        /*move_other=*/false);
+    if (params_.output_metric == "euclidean") {
+        optimize_layout_euclidean(
+            embedding.data(), static_cast<int>(n_queries),
+            tail_embedding.data(), dim_out, head, tail, n_epochs,
+            static_cast<int>(n_), epochs_per_sample, a_, b_, rng_state,
+            params_.repulsion_strength, initial_alpha_ / 4.0,
+            static_cast<double>(params_.negative_sample_rate),
+            /*parallel=*/!params_.random_state.has_value(), /*densmap=*/false,
+            /*move_other=*/false);
+    } else {
+        // --- densmap additions ----------------------------------------------
+        const OutputMetricFn out_metric = make_output_metric(
+            params_.output_metric, params_.output_metric_kwds);
+        optimize_layout_generic(
+            embedding.data(), static_cast<int>(n_queries),
+            tail_embedding.data(), dim_out, head, tail, n_epochs,
+            static_cast<int>(n_), epochs_per_sample, a_, b_, rng_state,
+            out_metric, params_.repulsion_strength, initial_alpha_ / 4.0,
+            static_cast<double>(params_.negative_sample_rate),
+            /*move_other=*/false);
+        // --------------------------------------------------------------------
+    }
     return embedding;
 }
 

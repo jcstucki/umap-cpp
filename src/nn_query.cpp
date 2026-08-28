@@ -693,11 +693,23 @@ PreparedIndex PreparedIndex::build(const float* data, int64_t n, int64_t dim,
                                    int64_t n_neighbors,
                                    const std::string& metric,
                                    NumpyRandomState& numpy_rs, bool verbose) {
+    return build(data, n, dim, n_neighbors, metric, MetricKwds{}, numpy_rs,
+                 verbose);
+}
+
+// --- densmap additions ------------------------------------------------------
+// metric_kwds-aware build (generic-metric hook; see nn_descent.hpp).
+PreparedIndex PreparedIndex::build(const float* data, int64_t n, int64_t dim,
+                                   int64_t n_neighbors,
+                                   const std::string& metric,
+                                   const MetricKwds& metric_kwds,
+                                   NumpyRandomState& numpy_rs, bool verbose) {
+    // ------------------------------------------------------------------------
     PreparedIndex idx;
     idx.n_ = n;
     idx.dim_ = dim;
     idx.n_neighbors_ = n_neighbors;
-    idx.metric_ = resolve_metric(metric);
+    idx.metric_ = resolve_metric(metric, metric_kwds);
     idx.normalize_query_ = (metric == "cosine" || metric == "dot");
 
     // umap_.py::nearest_neighbors "hacked values"

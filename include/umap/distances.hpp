@@ -186,4 +186,27 @@ named_distances_with_gradients();
 // upstream default p=2.
 const std::unordered_map<std::string, DistanceFn>& named_distances();
 
+// --- densmap additions ------------------------------------------------------
+// float32-input metric evaluation, as the numba kernels see it when sklearn's
+// _pairwise_callable / pynndescent hand them float32 rows. For a subset of
+// metrics the exact numba f4-instantiation arithmetic is replicated
+// (verified against the reference environment):
+//   * euclidean/l2:  f4 diff, f4 square, f8 accumulate, f8 sqrt;
+//   * manhattan/taxicab/l1: f4 diff, f4 abs, f8 accumulate;
+//   * minkowski:     f4 diff, f4 abs, f8 pow/accumulate/root;
+//   * seuclidean/standardised_euclidean: f4 diff, f4 square, f8 divide by the
+//     (float64 kwds) sigma, f8 accumulate, f8 sqrt.
+// Every other named metric goes through a documented adapter that widens the
+// float32 rows to float64 and evaluates the double-precision registry kernel
+// (last-ulp deviations possible vs numba's f4 instantiations).
+// `f32_faithful`, when non-null, reports which case was taken. The returned
+// value is the float32 rounding of the kernel's (float64) result, matching
+// numba results stored into float32 arrays.
+using DistanceF32Fn =
+    std::function<float(const float* x, const float* y, std::size_t n)>;
+DistanceF32Fn make_metric_f32(const std::string& name,
+                              const MetricKwds& kwds = {},
+                              bool* f32_faithful = nullptr);
+// ----------------------------------------------------------------------------
+
 }  // namespace umap
