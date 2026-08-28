@@ -634,21 +634,22 @@ nnd::SearchGraph build_sparse_search_graph(
 SparsePreparedIndex SparsePreparedIndex::build(
     const int32_t* indptr, const int32_t* indices, const float* data,
     int64_t n, int64_t dim, int64_t n_neighbors, const std::string& metric,
-    uint32_t random_seed, bool verbose) {
+    uint32_t random_seed, bool verbose, const spdist::SparseMetricKwds& kwds) {
     NumpyRandomState numpy_rs(random_seed);
     return build(indptr, indices, data, n, dim, n_neighbors, metric, numpy_rs,
-                 verbose);
+                 verbose, kwds);
 }
 
 SparsePreparedIndex SparsePreparedIndex::build(
     const int32_t* indptr, const int32_t* indices, const float* data,
     int64_t n, int64_t dim, int64_t n_neighbors, const std::string& metric,
-    NumpyRandomState& numpy_rs, bool verbose) {
+    NumpyRandomState& numpy_rs, bool verbose,
+    const spdist::SparseMetricKwds& kwds) {
     SparsePreparedIndex idx;
     idx.n_ = n;
     idx.dim_ = dim;
     idx.n_neighbors_ = n_neighbors;
-    idx.metric_ = spdist::resolve_sparse_metric(metric);
+    idx.metric_ = spdist::resolve_sparse_metric(metric, dim, kwds);
     CsrView X{indptr, indices, data, n, dim};
 
     // umap_.py::nearest_neighbors "hacked values"

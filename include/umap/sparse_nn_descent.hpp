@@ -8,10 +8,13 @@
 // Scope: CSR float32 data with sorted, duplicate-free column indices per row
 // (scipy sort_indices() semantics; NNDescent calls sort_indices() itself when
 // needed). The default UMAP fit path is covered: tree_init=True,
-// init_graph=None, no metric kwds. Metrics are the sparse registry in
-// umap/sparse_distances.hpp (euclidean/l2, sqeuclidean, manhattan/l1/taxicab,
-// cosine); anything else throws std::invalid_argument from
-// spdist::resolve_sparse_metric.
+// init_graph=None. Metrics are the full sparse registry in
+// umap/sparse_distances.hpp (pynndescent's sparse_named_distances incl. fast
+// alternatives/corrections and n_features binding, plus umap-only
+// ll_dirichlet); names absent upstream or unported (kantorovich family,
+// jensen-shannon, symmetric-kl, dot, yule, ...) throw std::invalid_argument
+// from spdist::resolve_sparse_metric. minkowski's p travels via the optional
+// SparseMetricKwds parameters below.
 //
 // Structure mirrors the dense port (umap/nn_descent.hpp) and *reuses* its
 // building blocks unchanged -- NNHeap, checked_flagged_heap_push,
@@ -107,7 +110,7 @@ struct CsrView {
     const int32_t* indices = nullptr;  // length indptr[n_rows]
     const float* data = nullptr;       // length indptr[n_rows]
     int64_t n_rows = 0;
-    int64_t n_cols = 0;  // informational only (no ported metric needs it)
+    int64_t n_cols = 0;  // bound as n_features for the metrics that need it
 
     const int32_t* row_ind(int64_t i) const { return indices + indptr[i]; }
     const float* row_data(int64_t i) const { return data + indptr[i]; }
@@ -173,13 +176,17 @@ NNHeap sparse_nn_descent(const CsrView& X, int64_t n_neighbors,
 // Exact kNN by full pairwise scan of the *true* sparse metric, ties broken by
 // ascending index like np.argsort(kind="stable") (fast_knn_indices). This is
 // what UMAP's small-data (< 4096) path reduces to; upstream computes the
-// distance matrix with sklearn pairwise_distances in float64 whereas this
-// uses the float32-faithful sparse kernels, so distances can differ in the
-// last ulps (indices agree except on sub-float32 ties). Each point's own
-// index appears first at distance 0. Outputs are (n, n_neighbors) row-major.
-void sparse_brute_force_knn(const CsrView& X, int64_t n_neighbors,
-                            const std::string& metric, int32_t* knn_indices,
-                            float* knn_dists);
+// distance matrix with sklearn pairwise_distances in float64 (falling back to
+// pairwise_special_metric on densified data for names sklearn rejects)
+// whereas this uses the float32-faithful sparse kernels, so distances can
+// differ in the last ulps (indices agree except on sub-float32 ties). Each
+// point's own index appears first at distance 0. Outputs are
+// (n, n_neighbors) row-major. n_features-requiring metrics bind X.n_cols;
+// `kwds` carries minkowski's p.
+void sparse_brute_force_knn(
+    const CsrView& X, int64_t n_neighbors, const std::string& metric,
+    int32_t* knn_indices, float* knn_dists,
+    const spdist::SparseMetricKwds& kwds = spdist::SparseMetricKwds());
 
 // Port of the umap_.py routing for sparse X, mirroring the dense
 // nnd::nearest_neighbors signature. Replicates UMAP.fit's dispatch:
@@ -190,16 +197,17 @@ void sparse_brute_force_knn(const CsrView& X, int64_t n_neighbors,
 //     alternative metric + final correction.
 // `random_seed` corresponds to np.random.RandomState(random_seed) as UMAP's
 // random_state. `angular` mirrors umap's angular_rp_forest parameter; as in
-// pynndescent it only matters for callable metrics, so tree flavour is
-// decided by the metric name. Outputs are (n, n_neighbors) row-major;
-// unfilled slots (if any) are index -1 / distance +inf.
-void nearest_neighbors_sparse(const int32_t* indptr, const int32_t* indices,
-                              const float* data, int64_t n, int64_t dim,
-                              int64_t n_neighbors, const std::string& metric,
-                              bool angular, uint32_t random_seed,
-                              int32_t* knn_indices, float* knn_dists,
-                              bool force_approximation = false,
-                              bool verbose = false);
+// pynndescent it only matters for callable metrics -- here that is
+// "ll_dirichlet", which upstream NN-descent receives as a callable (all other
+// tree flavours are decided by the metric name). `kwds` carries minkowski's
+// p; n_features-requiring metrics bind `dim`. Outputs are (n, n_neighbors)
+// row-major; unfilled slots (if any) are index -1 / distance +inf.
+void nearest_neighbors_sparse(
+    const int32_t* indptr, const int32_t* indices, const float* data,
+    int64_t n, int64_t dim, int64_t n_neighbors, const std::string& metric,
+    bool angular, uint32_t random_seed, int32_t* knn_indices, float* knn_dists,
+    bool force_approximation = false, bool verbose = false,
+    const spdist::SparseMetricKwds& kwds = spdist::SparseMetricKwds());
 
 // Same, but always the NN-descent path with explicit tau-prng states (for
 // tests / callers that extracted states from Python): `rng_state` is
@@ -210,7 +218,8 @@ void nearest_neighbors_sparse_with_state(
     int64_t n, int64_t dim, int64_t n_neighbors, const std::string& metric,
     bool angular, const int64_t rng_state[3],
     const std::vector<std::array<int64_t, 3>>& tree_rng_states,
-    int32_t* knn_indices, float* knn_dists, bool verbose = false);
+    int32_t* knn_indices, float* knn_dists, bool verbose = false,
+    const spdist::SparseMetricKwds& kwds = spdist::SparseMetricKwds());
 
 // --------------------------------------------------- query path (transform)
 // Faithful port of NNDescent.prepare() + query() for the *sparse* path
@@ -286,25 +295,24 @@ class SparsePreparedIndex {
     // NNDescent(csr_matrix, n_neighbors, metric, random_state=seed,
     //           n_trees/n_iters = umap "hacked values", max_candidates=60,
     //           low_memory=True, compressed=False) followed by .prepare().
-    static SparsePreparedIndex build(const int32_t* indptr,
-                                     const int32_t* indices, const float* data,
-                                     int64_t n, int64_t dim,
-                                     int64_t n_neighbors,
-                                     const std::string& metric,
-                                     uint32_t random_seed,
-                                     bool verbose = false);
+    // `kwds` carries minkowski's p; n_features-requiring metrics bind `dim`.
+    // NB "ll_dirichlet" builds euclidean trees here (== upstream's
+    // angular_rp_forest default False for the callable-metric branch).
+    static SparsePreparedIndex build(
+        const int32_t* indptr, const int32_t* indices, const float* data,
+        int64_t n, int64_t dim, int64_t n_neighbors, const std::string& metric,
+        uint32_t random_seed, bool verbose = false,
+        const spdist::SparseMetricKwds& kwds = spdist::SparseMetricKwds());
 
     // Overload continuing an existing numpy RandomState stream (for the UMAP
     // class, so init/SGD seeding after NN search stays stream-parallel with
     // Python). Draw order and count are identical to NNDescent.__init__
     // (prepare() draws nothing from the RandomState).
-    static SparsePreparedIndex build(const int32_t* indptr,
-                                     const int32_t* indices, const float* data,
-                                     int64_t n, int64_t dim,
-                                     int64_t n_neighbors,
-                                     const std::string& metric,
-                                     NumpyRandomState& numpy_rs,
-                                     bool verbose = false);
+    static SparsePreparedIndex build(
+        const int32_t* indptr, const int32_t* indices, const float* data,
+        int64_t n, int64_t dim, int64_t n_neighbors, const std::string& metric,
+        NumpyRandomState& numpy_rs, bool verbose = false,
+        const spdist::SparseMetricKwds& kwds = spdist::SparseMetricKwds());
 
     // NNDescent.query(query_data, k, epsilon) for CSR query rows (sorted,
     // duplicate-free column indices; float32 values). Outputs are
