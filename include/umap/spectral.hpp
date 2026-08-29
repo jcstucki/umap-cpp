@@ -43,6 +43,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "umap/sparse_matrix.hpp"
@@ -63,9 +64,13 @@ int32_t connected_components(const SparseMatrix& graph,
 // arbitrary sign. Returns false if the solver fails to converge.
 // Requires k < n (throws std::invalid_argument otherwise, mirroring the
 // upstream uncaught scipy error for tiny graphs).
+// maxiter = 0 keeps the historical default max(1000, 5n); a positive value
+// caps the Spectra iterations like upstream's eigsh maxiter (tswspectral
+// threads its `maxiter or graph.shape[0] * 5` through here).
 bool normalized_laplacian_eigs(const SparseMatrix& graph, int k,
                                std::vector<double>& eigenvalues,
-                               std::vector<double>& eigenvectors);
+                               std::vector<double>& eigenvectors,
+                               int64_t maxiter = 0);
 
 // Port of spectral.component_layout for metric="euclidean" (or data == nullptr).
 // data: row-major (n_samples x n_features) or nullptr; component_labels: size
@@ -98,6 +103,105 @@ inline std::vector<float> spectral_layout(const SparseMatrix& graph, int dim,
     return spectral_layout(nullptr, 0, graph, dim, rng_state);
 }
 
+// --- tswspectral additions --------------------------------------------------
+// Port of spectral.tswspectral_layout, i.e. _spectral_layout(init="tsvd"):
+// the same normalized-Laplacian eigenvectors as spectral_layout, but the
+// eigensolver is "warmed" with a truncated-SVD guess of the eigenvectors.
+// What the reference actually does (current upstream source):
+//   * disconnected graphs route to multi_component_layout BEFORE anything
+//     tsvd-related, exactly like spectral_layout;
+//   * method=None resolves to "eigsh" when n < 2,000,000 else "lobpcg"
+//     (any other string raises ValueError "Method should either be None,
+//     'eigsh' or 'lobpcg'" -- we throw std::invalid_argument);
+//   * the warm start X = TruncatedSVD(n_components=k, random_state).
+//     fit_transform(L) (sklearn randomized SVD: k + 10 oversampled Gaussian
+//     block, 5 normalizer-stabilized power iterations; k = dim + 1), with
+//     X[:, 0] overwritten by the exact first eigenvector
+//     sqrt_deg / ||sqrt_deg||;
+//   * the "eigsh" branch then DISCARDS X entirely (upstream passes
+//     v0=np.ones(n), tol=tol or 1e-4, ncv=max(2k+1, sqrt(n)),
+//     maxiter=maxiter or 5n) -- so with the default method the eigen-solve
+//     is identical to spectral_layout and only the RNG consumption differs;
+//   * the "lobpcg" branch runs scipy.sparse.linalg.lobpcg(L, X,
+//     largest=False, tol=tol or 1e-4, maxiter=maxiter or 5n) with the
+//     "not reaching the requested tolerance" UserWarning escalated to an
+//     error, i.e. NON-CONVERGENCE FALLS BACK TO RANDOM;
+//   * order = np.argsort(eigenvalues)[1:k]; return eigenvectors[:, order];
+//   * on ArpackError/UserWarning: warn "Spectral initialisation failed!..."
+//     and return gen.uniform(-10, 10, (n, dim)).
+// Deviations (same contract as spectral_layout): tau_prng replaces the numpy
+// Generator/RandomState draws (tsvd Gaussian block, random fallback);
+// the eigsh path solves via Spectra shift-invert at tol 1e-10 (tighter than
+// upstream's 1e-4 -- ARPACK regular-mode "SM" at loose tol misconverges in
+// scipy >= 1.15, which is why upstream skips its tsw test there; we always
+// converge to the true eigenspace like the scipy in [1.10, 1.15) window),
+// so `tol` only affects the lobpcg method; the randomized-SVD power
+// iterations use thin-QR normalization instead of sklearn's LU (same
+// subspace quality); metric/metric_kwds are euclidean-only via
+// component_layout, as for spectral_layout. `maxiter` caps both solvers.
+// `used_random_fallback` (optional) reports whether the random fallback
+// fired -- the C++ seam for upstream's pytest.warns(UserWarning) assertion.
+//
+// UMAP-class wiring for init="tswspectral" (documented here because
+// umap.hpp / umap.cpp are owned by another workstream; do the following
+// there once this branch merges):
+//   1. _validate_parameters: the string-init set becomes
+//      ("pca", "spectral", "random", "tswspectral") with the upstream error
+//      text 'string init values must be one of: "pca", "tswspectral",
+//      "spectral" or "random"'.
+//   2. simplicial_set_embedding dispatch (umap_.py:1172): the branch is
+//      identical to init == "spectral" but calls
+//      tswspectral_layout(data, graph, n_components, random_state,
+//      metric=metric, metric_kwds=metric_kwds) -- method/tol/maxiter stay
+//      at their defaults -- followed by the same
+//      noisy_scale_coords(embedding, random_state, max_coord=10,
+//      noise=0.0001). (initialize_embedding below already dispatches
+//      EmbeddingInit::TSWSpectral this way.)
+//   3. numpy RandomState stream parity (the class replicates draws itself,
+//      as its init="spectral" branch does): on a CONNECTED graph,
+//      _spectral_layout(init="tsvd") consumes exactly n * (k + 10) rk_gauss
+//      draws where k = n_components + 1 -- sklearn
+//      TruncatedSVD(algorithm="randomized") -> randomized_range_finder draws
+//      random_state.normal(size=(n, k + n_oversamples)) with
+//      n_oversamples=10, and nothing else touches the stream (verified
+//      against sklearn 1.9). So the class consumes n * (dim + 11) rs.gauss()
+//      values (instead of the n * (dim + 1) discarded normals of
+//      init="spectral") and then calls normalized_laplacian_eigs exactly as
+//      for init="spectral" (method=None resolves to "eigsh" below 2e6 rows,
+//      and upstream's eigsh branch discards the warm start). The failure
+//      fallback draw is gen.uniform(-10, 10, (n, dim)) from the same stream.
+//      Disconnected graphs route to multi_component_layout before any tsvd
+//      draw, exactly as for init="spectral".
+std::vector<float> tswspectral_layout(const float* data, int64_t n_features,
+                                      const SparseMatrix& graph, int dim,
+                                      int64_t rng_state[3],
+                                      const std::string& method = std::string(),
+                                      double tol = 0.0, int64_t maxiter = 0,
+                                      bool* used_random_fallback = nullptr);
+
+// Convenience overload without source data (data=None upstream).
+inline std::vector<float> tswspectral_layout(
+    const SparseMatrix& graph, int dim, int64_t rng_state[3],
+    const std::string& method = std::string(), double tol = 0.0,
+    int64_t maxiter = 0, bool* used_random_fallback = nullptr) {
+    return tswspectral_layout(nullptr, 0, graph, dim, rng_state, method, tol,
+                              maxiter, used_random_fallback);
+}
+
+// scipy.sparse.linalg.lobpcg(L, X0, largest=False, tol, maxiter) on the
+// normalized Laplacian L of `graph`, exposed for tests. X0 is the row-major
+// (n x m) initial block; on success (all residual 2-norms <= tol within
+// maxiter iterations, scipy's criterion) returns true with `eigenvalues`
+// ascending (size m) and `eigenvectors` row-major (n x m, orthonormal
+// columns). Returns false when the tolerance was not reached (upstream
+// escalates scipy's warning and falls back to random). Mirrors scipy's
+// small-problem branch: n < 5 * m solves densely and always "converges".
+bool normalized_laplacian_lobpcg(const SparseMatrix& graph, const double* X0,
+                                 int m, double tol, int64_t maxiter,
+                                 std::vector<double>& eigenvalues,
+                                 std::vector<double>& eigenvectors);
+// ----------------------------------------------------------------------------
+
 // Port of umap_.noisy_scale_coords: scale so the largest |coordinate| equals
 // max_coord (computed in float32 like upstream), then add centered Gaussian
 // noise with standard deviation `noise`. Gaussian parity with numpy is NOT
@@ -112,6 +216,8 @@ enum class EmbeddingInit {
     Random,    // uniform in [-10, 10]
     Spectral,  // spectral_layout + noisy_scale_coords(max_coord=10, noise=1e-4)
     PCA,       // TODO: not implemented (throws)
+    // --- tswspectral additions ---
+    TSWSpectral,  // tswspectral_layout + noisy_scale_coords(10, 1e-4)
 };
 
 // Initial embedding for `graph` (n x dim row-major float32).

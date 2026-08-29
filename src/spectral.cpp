@@ -69,6 +69,50 @@ std::vector<double> random_fallback_layout(int64_t n, int dim,
     return out;
 }
 
+// Upstream's warn(...) on eigensolver failure (shared by spectral_layout and
+// tswspectral_layout; extracted as part of the tswspectral additions).
+void warn_spectral_failure() {
+    std::fprintf(stderr,
+                 "Spectral initialisation failed! The eigenvector solver\n"
+                 "failed. This is likely due to too small an eigengap. "
+                 "Consider\nadding some noise or jitter to your data.\n\n"
+                 "Falling back to random initialisation!\n");
+}
+
+// sqrt_deg = np.sqrt(graph.sum(axis=0)) and the normalized Laplacian
+// L = I - D^{-1/2} A D^{-1/2} exactly as _spectral_layout builds them.
+// (Extracted from normalized_laplacian_eigs so the tswspectral LOBPCG path
+// shares the identical construction.)
+void build_normalized_laplacian(const SparseMatrix& graph,
+                                Eigen::SparseMatrix<double>& L,
+                                std::vector<double>& sqrt_deg) {
+    const int64_t n = graph.n_rows;
+
+    // sqrt_deg = sqrt(graph.sum(axis=0))  (column sums)
+    sqrt_deg.assign(static_cast<std::size_t>(n), 0.0);
+    for (int32_t i = 0; i < graph.n_rows; ++i)
+        for (int32_t p = graph.indptr[i]; p < graph.indptr[i + 1]; ++p)
+            sqrt_deg[static_cast<std::size_t>(graph.indices[p])] +=
+                static_cast<double>(graph.data[p]);
+    for (auto& d : sqrt_deg) d = std::sqrt(d);
+
+    // L = I - D^{-1/2} A D^{-1/2}
+    std::vector<Eigen::Triplet<double>> trips;
+    trips.reserve(graph.nnz() + static_cast<std::size_t>(n));
+    for (int64_t i = 0; i < n; ++i) trips.emplace_back(i, i, 1.0);
+    for (int32_t i = 0; i < graph.n_rows; ++i)
+        for (int32_t p = graph.indptr[i]; p < graph.indptr[i + 1]; ++p) {
+            const int32_t j = graph.indices[p];
+            trips.emplace_back(
+                i, j,
+                -static_cast<double>(graph.data[p]) /
+                    (sqrt_deg[static_cast<std::size_t>(i)] *
+                     sqrt_deg[static_cast<std::size_t>(j)]));
+        }
+    L.resize(n, n);
+    L.setFromTriplets(trips.begin(), trips.end());
+}
+
 // _spectral_layout for the general case, returning float64 like upstream
 // (n x dim row-major). Forward declaration for the multi-component recursion.
 std::vector<double> spectral_layout_f64(const float* data, int64_t n_features,
@@ -111,7 +155,8 @@ int32_t connected_components(const SparseMatrix& graph,
 
 bool normalized_laplacian_eigs(const SparseMatrix& graph, int k,
                                std::vector<double>& eigenvalues,
-                               std::vector<double>& eigenvectors) {
+                               std::vector<double>& eigenvectors,
+                               int64_t maxiter) {
     const int64_t n = graph.n_rows;
     if (k >= n) {
         // Upstream: scipy warns "k >= N ... attempting eigh" then raises an
@@ -121,29 +166,9 @@ bool normalized_laplacian_eigs(const SparseMatrix& graph, int k,
             "for k >= N)");
     }
 
-    // sqrt_deg = sqrt(graph.sum(axis=0))  (column sums)
-    std::vector<double> sqrt_deg(static_cast<std::size_t>(n), 0.0);
-    for (int32_t i = 0; i < graph.n_rows; ++i)
-        for (int32_t p = graph.indptr[i]; p < graph.indptr[i + 1]; ++p)
-            sqrt_deg[static_cast<std::size_t>(graph.indices[p])] +=
-                static_cast<double>(graph.data[p]);
-    for (auto& d : sqrt_deg) d = std::sqrt(d);
-
-    // L = I - D^{-1/2} A D^{-1/2}
-    std::vector<Eigen::Triplet<double>> trips;
-    trips.reserve(graph.nnz() + static_cast<std::size_t>(n));
-    for (int64_t i = 0; i < n; ++i) trips.emplace_back(i, i, 1.0);
-    for (int32_t i = 0; i < graph.n_rows; ++i)
-        for (int32_t p = graph.indptr[i]; p < graph.indptr[i + 1]; ++p) {
-            const int32_t j = graph.indices[p];
-            trips.emplace_back(
-                i, j,
-                -static_cast<double>(graph.data[p]) /
-                    (sqrt_deg[static_cast<std::size_t>(i)] *
-                     sqrt_deg[static_cast<std::size_t>(j)]));
-        }
-    Eigen::SparseMatrix<double> L(n, n);
-    L.setFromTriplets(trips.begin(), trips.end());
+    Eigen::SparseMatrix<double> L;
+    std::vector<double> sqrt_deg;
+    build_normalized_laplacian(graph, L, sqrt_deg);
 
     // Upstream eigsh selection: k smallest ("SM", equal to smallest algebraic
     // for the PSD Laplacian), ncv = max(2k + 1, sqrt(n)) (scipy clamps to n),
@@ -156,7 +181,10 @@ bool normalized_laplacian_eigs(const SparseMatrix& graph, int k,
                                  static_cast<double>(n)))));
     const int ncv = static_cast<int>(ncv64);
     const int maxit =
-        std::max<int>(1000, static_cast<int>(std::min<int64_t>(5 * n, 1 << 30)));
+        maxiter > 0
+            ? static_cast<int>(std::min<int64_t>(maxiter, 1 << 30))
+            : std::max<int>(1000,
+                            static_cast<int>(std::min<int64_t>(5 * n, 1 << 30)));
 
     try {
         Spectra::SparseSymShiftSolve<double> op(L);
@@ -390,11 +418,7 @@ std::vector<double> spectral_layout_f64(const float* data, int64_t n_features,
     std::vector<double> eigenvalues;
     std::vector<double> eigenvectors;  // n x k row-major, ascending eigenvalue
     if (!normalized_laplacian_eigs(graph, k, eigenvalues, eigenvectors)) {
-        std::fprintf(stderr,
-                     "Spectral initialisation failed! The eigenvector solver\n"
-                     "failed. This is likely due to too small an eigengap. "
-                     "Consider\nadding some noise or jitter to your data.\n\n"
-                     "Falling back to random initialisation!\n");
+        warn_spectral_failure();
         return random_fallback_layout(graph.n_rows, dim, rng_state);
     }
     // return eigenvectors[:, order] with order = argsort(eigenvalues)[1:k]
@@ -452,6 +476,15 @@ std::vector<float> initialize_embedding(const float* data, int64_t n_features,
             return noisy_scale_coords(std::move(emb), rng_state,
                                       /*max_coord=*/10.0f, /*noise=*/0.0001f);
         }
+        // --- tswspectral additions ---
+        case EmbeddingInit::TSWSpectral: {
+            // umap_.py:1172: identical to the "spectral" branch but through
+            // tswspectral_layout (method/tol/maxiter at their defaults).
+            std::vector<float> emb =
+                tswspectral_layout(data, n_features, graph, dim, rng_state);
+            return noisy_scale_coords(std::move(emb), rng_state,
+                                      /*max_coord=*/10.0f, /*noise=*/0.0001f);
+        }
         case EmbeddingInit::PCA:
         default:
             // TODO(port): PCA (dense input) / TruncatedSVD (sparse input) of
@@ -461,5 +494,296 @@ std::vector<float> initialize_embedding(const float* data, int64_t n_features,
                 "initialize_embedding: init='pca' is not implemented yet");
     }
 }
+
+// --- tswspectral additions --------------------------------------------------
+// Port of spectral.tswspectral_layout (_spectral_layout(init="tsvd")) plus a
+// scipy-semantics LOBPCG on Eigen sparse. See the header for the port notes.
+
+namespace {
+
+// Thin orthonormal basis of the columns of M (HouseholderQR).
+Eigen::MatrixXd thin_q(const Eigen::MatrixXd& M) {
+    Eigen::HouseholderQR<Eigen::MatrixXd> qr(M);
+    return qr.householderQ() * Eigen::MatrixXd::Identity(M.rows(), M.cols());
+}
+
+// Orthonormal basis of span(M) after projecting out the (orthonormal) blocks
+// O1 / O2; numerically-dependent directions are dropped via an SVD rank cut
+// (the stabilized equivalent of scipy lobpcg's B-orthonormalization with its
+// restart-on-Cholesky-breakdown handling).
+Eigen::MatrixXd ortho_against(Eigen::MatrixXd M, const Eigen::MatrixXd* O1,
+                              const Eigen::MatrixXd* O2 = nullptr) {
+    if (M.cols() == 0) return M;
+    for (int pass = 0; pass < 2; ++pass) {  // twice-is-enough reorthogonalization
+        if (O1 != nullptr && O1->cols() > 0)
+            M -= (*O1) * (O1->transpose() * M);
+        if (O2 != nullptr && O2->cols() > 0)
+            M -= (*O2) * (O2->transpose() * M);
+    }
+    Eigen::BDCSVD<Eigen::MatrixXd> svd(M, Eigen::ComputeThinU);
+    const Eigen::VectorXd& sv = svd.singularValues();
+    const double thresh = sv.size() > 0 ? sv(0) * 1e-12 : 0.0;
+    int rank = 0;
+    while (rank < sv.size() && sv(rank) > thresh && sv(rank) > 0.0) ++rank;
+    return svd.matrixU().leftCols(rank);
+}
+
+// scipy.sparse.linalg.lobpcg(A, X, largest=False, tol=tol, maxiter=maxiter)
+// semantics (no B / M / Y constraints): block Rayleigh-Ritz over
+// span[X, R, P] with scipy's monotone soft-locking active mask and its
+// convergence criterion (all residual 2-norms <= tol; strictly-greater stays
+// active). Returns true iff the tolerance was reached -- scipy otherwise
+// warns "...not reaching the requested tolerance", which upstream escalates
+// to the random fallback. X / lam hold the final block either way,
+// eigenvalues ascending. Mirrors scipy's small-problem branch: n < 5 * m is
+// solved densely and always counts as converged (that warning is not
+// escalated upstream).
+bool lobpcg_smallest(const Eigen::SparseMatrix<double>& A, Eigen::MatrixXd& X,
+                     Eigen::VectorXd& lam, double tol, int64_t maxiter) {
+    const int64_t n = A.rows();
+    const int m = static_cast<int>(X.cols());
+    if (n < 5 * static_cast<int64_t>(m)) {
+        Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es{Eigen::MatrixXd(A)};
+        X = es.eigenvectors().leftCols(m);
+        lam = es.eigenvalues().head(m);
+        return true;
+    }
+
+    X = thin_q(X);
+    Eigen::MatrixXd AX = A * X;
+    {
+        // Initial Rayleigh-Ritz on span(X), like scipy's pre-loop step.
+        Eigen::MatrixXd G = X.transpose() * AX;
+        G = 0.5 * (G + G.transpose().eval());
+        Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(G);
+        X = X * es.eigenvectors();
+        AX = AX * es.eigenvectors();
+        lam = es.eigenvalues();
+    }
+
+    Eigen::MatrixXd P(n, 0);
+    std::vector<bool> still_active(static_cast<std::size_t>(m), true);
+    bool converged = false;
+    // scipy runs maxiter + 1 residual-check/update passes
+    // (iterationNumber = 0..maxiter), then re-checks residuals for the
+    // final "not reaching the requested tolerance" verdict.
+    for (int64_t it = 0; it <= maxiter; ++it) {
+        const Eigen::MatrixXd R = AX - X * lam.asDiagonal();
+        std::vector<int> active;
+        for (int j = 0; j < m; ++j) {
+            if (R.col(j).norm() <= tol)
+                still_active[static_cast<std::size_t>(j)] = false;
+            if (still_active[static_cast<std::size_t>(j)]) active.push_back(j);
+        }
+        if (active.empty()) {
+            converged = true;
+            break;
+        }
+
+        const Eigen::Index na = static_cast<Eigen::Index>(active.size());
+        Eigen::MatrixXd W(n, na);
+        Eigen::MatrixXd Pa(n, P.cols() > 0 ? na : 0);
+        for (Eigen::Index t = 0; t < na; ++t) {
+            W.col(t) = R.col(active[static_cast<std::size_t>(t)]);
+            if (P.cols() > 0)
+                Pa.col(t) = P.col(active[static_cast<std::size_t>(t)]);
+        }
+        W = ortho_against(std::move(W), &X);
+        Pa = ortho_against(std::move(Pa), &X, &W);
+        if (W.cols() == 0 && Pa.cols() == 0) break;  // breakdown / stagnation
+
+        const Eigen::Index s = m + W.cols() + Pa.cols();
+        Eigen::MatrixXd S(n, s);
+        S.leftCols(m) = X;
+        S.middleCols(m, W.cols()) = W;
+        if (Pa.cols() > 0) S.rightCols(Pa.cols()) = Pa;
+        const Eigen::MatrixXd AS = A * S;
+        Eigen::MatrixXd G = S.transpose() * AS;
+        G = 0.5 * (G + G.transpose().eval());
+        Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(G);
+        const Eigen::MatrixXd C = es.eigenvectors().leftCols(m);  // largest=False
+        lam = es.eigenvalues().head(m);
+        // New P is the W/P part of the Ritz vectors; new X = X * Cx + P.
+        P = S.rightCols(s - m) * C.bottomRows(s - m);
+        X = X * C.topRows(m) + P;
+        AX = AS * C;
+    }
+    if (!converged) {
+        const Eigen::MatrixXd R = AX - X * lam.asDiagonal();
+        double worst = 0.0;
+        for (int j = 0; j < m; ++j) worst = std::max(worst, R.col(j).norm());
+        converged = worst <= tol;
+    }
+    return converged;
+}
+
+// sklearn TruncatedSVD(n_components=k, random_state=...).fit_transform(L):
+// randomized SVD (Halko et al.) with the sklearn defaults n_oversamples=10
+// and n_iter=5. Deviations (subspace-equivalent, documented in the header):
+// power iterations are thin-QR normalized (sklearn: LU), the Gaussian start
+// block comes from tau_prng in numpy's row-major fill order, and no
+// svd_flip sign convention is applied (X[:, 0] is overwritten by the caller
+// and LOBPCG orthonormalizes the block anyway). Returns U[:, :k] * s[:k]
+// exactly like fit_transform.
+Eigen::MatrixXd tsvd_warm_start(const Eigen::SparseMatrix<double>& L, int k,
+                                int64_t rng_state[3]) {
+    const int64_t n = L.rows();
+    const int size = static_cast<int>(
+        std::min<int64_t>(static_cast<int64_t>(k) + 10, n));
+    Eigen::MatrixXd Q(n, size);
+    for (int64_t i = 0; i < n; ++i)
+        for (int j = 0; j < size; ++j) Q(i, j) = std_normal(rng_state);
+    const int n_iter = 5;  // TruncatedSVD default
+    for (int i = 0; i < n_iter; ++i) {
+        Q = thin_q(L * Q);
+        Q = thin_q(L.transpose() * Q);  // L is symmetric; kept for structure
+    }
+    Q = thin_q(L * Q);
+    // B = Q^T L (size x n); L is symmetric so B = (L Q)^T.
+    const Eigen::MatrixXd B = (L * Q).transpose();
+    Eigen::BDCSVD<Eigen::MatrixXd> svd(B, Eigen::ComputeThinU);
+    const Eigen::MatrixXd U = Q * svd.matrixU();  // n x size, sing. values desc
+    Eigen::MatrixXd X(n, k);
+    for (int j = 0; j < k; ++j) X.col(j) = U.col(j) * svd.singularValues()(j);
+    return X;
+}
+
+}  // namespace
+
+std::vector<float> tswspectral_layout(const float* data, int64_t n_features,
+                                      const SparseMatrix& graph, int dim,
+                                      int64_t rng_state[3],
+                                      const std::string& method, double tol,
+                                      int64_t maxiter,
+                                      bool* used_random_fallback) {
+    if (used_random_fallback != nullptr) *used_random_fallback = false;
+
+    // The multi-component path runs before anything tsvd-related, exactly as
+    // in _spectral_layout (shared with spectral_layout, so given the same
+    // rng_state both produce bit-identical multi-component layouts).
+    std::vector<int32_t> labels;
+    const int32_t n_comp = connected_components(graph, labels);
+    if (n_comp > 1)
+        return multi_component_layout(data, n_features, graph, n_comp, labels,
+                                      dim, rng_state);
+
+    const int64_t n = graph.n_rows;
+    const int k = dim + 1;
+    if (k >= n) {
+        // Same guard as normalized_laplacian_eigs (upstream errors for tiny
+        // connected graphs on the eigsh path; see header).
+        throw std::invalid_argument(
+            "normalized_laplacian_eigs: k must be < n (upstream scipy raises "
+            "for k >= N)");
+    }
+
+    // if not method: method = "eigsh" if L.shape[0] < 2000000 else "lobpcg"
+    std::string resolved = method;
+    if (resolved.empty()) resolved = n < 2000000 ? "eigsh" : "lobpcg";
+
+    // init == "tsvd": TruncatedSVD warm start with the exact first
+    // eigenvector patched in (X[:, 0] = sqrt_deg / ||sqrt_deg||). Upstream
+    // computes this for BOTH methods (the eigsh branch then ignores it), so
+    // we do too -- the rng draws are consumed either way.
+    Eigen::SparseMatrix<double> L;
+    std::vector<double> sqrt_deg;
+    build_normalized_laplacian(graph, L, sqrt_deg);
+    Eigen::MatrixXd X = tsvd_warm_start(L, k, rng_state);
+    {
+        double norm = 0.0;
+        for (const double d : sqrt_deg) norm += d * d;
+        norm = std::sqrt(norm);
+        for (int64_t i = 0; i < n; ++i)
+            X(i, 0) = sqrt_deg[static_cast<std::size_t>(i)] / norm;
+    }
+
+    bool ok = false;
+    std::vector<double> evals;
+    std::vector<double> evecs;  // n x k row-major, ascending eigenvalue
+    if (resolved == "eigsh") {
+        // Upstream: eigsh(L, k, which="SM", ncv=max(2k+1, sqrt(n)),
+        // tol=tol or 1e-4, v0=np.ones(n), maxiter=maxiter or 5n) -- the warm
+        // start is DISCARDED on this branch. Spectra solves tighter than
+        // tol=1e-4 (documented deviation); maxiter threads through.
+        ok = normalized_laplacian_eigs(graph, k, evals, evecs, maxiter);
+    } else if (resolved == "lobpcg") {
+        // Upstream: lobpcg(L, X, largest=False, tol=tol or 1e-4,
+        // maxiter=maxiter or 5n) with the convergence UserWarning escalated.
+        Eigen::VectorXd lam;
+        const double eff_tol = tol != 0.0 ? tol : 1e-4;
+        const int64_t eff_maxiter = maxiter != 0 ? maxiter : 5 * n;
+        if (lobpcg_smallest(L, X, lam, eff_tol, eff_maxiter)) {
+            ok = true;
+            // order = np.argsort(eigenvalues) ascending (replicated even
+            // though the Rayleigh-Ritz values already come out ascending).
+            std::vector<int> order(static_cast<std::size_t>(k));
+            std::iota(order.begin(), order.end(), 0);
+            std::stable_sort(order.begin(), order.end(),
+                             [&](int a, int b) { return lam[a] < lam[b]; });
+            evals.resize(static_cast<std::size_t>(k));
+            evecs.assign(static_cast<std::size_t>(n) * k, 0.0);
+            for (int c = 0; c < k; ++c) {
+                evals[static_cast<std::size_t>(c)] = lam[order[c]];
+                for (int64_t i = 0; i < n; ++i)
+                    evecs[static_cast<std::size_t>(i) * k + c] =
+                        X(i, order[c]);
+            }
+        }
+    } else {
+        // Upstream raises ValueError from inside the try (uncaught by the
+        // ArpackError/UserWarning handler).
+        throw std::invalid_argument(
+            "Method should either be None, 'eigsh' or 'lobpcg'");
+    }
+
+    if (!ok) {
+        // except (ArpackError, UserWarning): warn + random fallback. The
+        // escalated lobpcg "not reaching the requested tolerance" warning
+        // lands here as a non-converged solve.
+        warn_spectral_failure();
+        if (used_random_fallback != nullptr) *used_random_fallback = true;
+        const std::vector<double> f64 =
+            random_fallback_layout(n, dim, rng_state);
+        return std::vector<float>(f64.begin(), f64.end());
+    }
+
+    // return eigenvectors[:, order] with order = argsort(eigenvalues)[1:k]
+    std::vector<float> out(static_cast<std::size_t>(n) * dim);
+    for (int64_t i = 0; i < n; ++i)
+        for (int j = 0; j < dim; ++j)
+            out[static_cast<std::size_t>(i) * dim + j] = static_cast<float>(
+                evecs[static_cast<std::size_t>(i) * k + (j + 1)]);
+    return out;
+}
+
+bool normalized_laplacian_lobpcg(const SparseMatrix& graph, const double* X0,
+                                 int m, double tol, int64_t maxiter,
+                                 std::vector<double>& eigenvalues,
+                                 std::vector<double>& eigenvectors) {
+    const int64_t n = graph.n_rows;
+    Eigen::SparseMatrix<double> L;
+    std::vector<double> sqrt_deg;
+    build_normalized_laplacian(graph, L, sqrt_deg);
+    Eigen::MatrixXd X(n, m);
+    for (int64_t i = 0; i < n; ++i)
+        for (int j = 0; j < m; ++j)
+            X(i, j) = X0[static_cast<std::size_t>(i) * m + j];
+    Eigen::VectorXd lam;
+    const bool converged = lobpcg_smallest(L, X, lam, tol, maxiter);
+    // Ascending argsort, matching what tswspectral_layout applies.
+    std::vector<int> order(static_cast<std::size_t>(m));
+    std::iota(order.begin(), order.end(), 0);
+    std::stable_sort(order.begin(), order.end(),
+                     [&](int a, int b) { return lam[a] < lam[b]; });
+    eigenvalues.resize(static_cast<std::size_t>(m));
+    eigenvectors.assign(static_cast<std::size_t>(n) * m, 0.0);
+    for (int c = 0; c < m; ++c) {
+        eigenvalues[static_cast<std::size_t>(c)] = lam[order[c]];
+        for (int64_t i = 0; i < n; ++i)
+            eigenvectors[static_cast<std::size_t>(i) * m + c] = X(i, order[c]);
+    }
+    return converged;
+}
+// ----------------------------------------------------------------------------
 
 }  // namespace umap

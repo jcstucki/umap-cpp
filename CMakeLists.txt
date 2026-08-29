@@ -181,6 +181,12 @@ target_sources(umap_tests PRIVATE tests/test_sparse_metrics_full.cpp)
 target_sources(umap_tests PRIVATE tests/test_spectral.cpp)
 # ----------------------------------------------------------------------------
 
+# --- tswspectral additions ---------------------------------------------------
+# Port of test_spectral.py (tswspectral_layout + LOBPCG); goldens from
+# scripts/gen_golden_tsw.py -> tests/golden_tsw.hpp.
+target_sources(umap_tests PRIVATE tests/test_tswspectral.cpp)
+# ----------------------------------------------------------------------------
+
 # --- umap-class additions ---------------------------------------------------
 target_sources(umap_tests PRIVATE tests/test_umap.cpp)
 # ----------------------------------------------------------------------------
