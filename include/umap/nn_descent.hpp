@@ -262,6 +262,25 @@ NNHeap nn_descent(const float* data, int64_t n, int64_t dim,
                   double delta, const LeafArray& leaf_array,
                   bool verbose = false);
 
+// --- inverse-update additions ------------------------------------------------
+// pynndescent_.py::init_from_neighbor_graph: flag-0 checked pushes of an
+// existing kNN graph (indices/distances, (n_rows, n_cols) row-major; the
+// distances are the *internal* metric values) into a heap.
+void init_from_neighbor_graph(NNHeap& heap, const int32_t* indices,
+                              const float* distances, int64_t n_rows,
+                              int64_t n_cols);
+
+// The nn_descent flow NNDescent.update() runs: `current_graph` was already
+// initialised by the caller (init_from_neighbor_graph + init_rp_tree over the
+// fresh forest; rp_tree_init=False and no init_random, unlike the empty-graph
+// path), so only the iterated candidate processing + deheap_sort remain.
+void nn_descent_with_init_graph(NNHeap& current_graph, const float* data,
+                                int64_t n, int64_t dim, int64_t n_neighbors,
+                                int64_t rng_state[3], int64_t max_candidates,
+                                DistFn dist, int64_t n_iters, double delta,
+                                bool verbose = false);
+// -----------------------------------------------------------------------------
+
 // ------------------------------------------------------------------ toplevel
 
 // Exact kNN by full pairwise scan of the true metric (each point's own index
@@ -408,6 +427,38 @@ class PreparedIndex {
     void query(const float* query_data, int64_t n_queries, int64_t k,
                double epsilon, int32_t* out_indices, float* out_dists) const;
 
+    // --- inverse-update additions --------------------------------------------
+    // pynndescent_.py::NNDescent.update(xs_fresh=new_data) followed by the
+    // prepare() re-run UMAP.update() triggers (the search graph existed, so
+    // pynndescent deletes it and prepares again). Steps, faithfully:
+    //   * restore the raw data to original order (raw[np.argsort(
+    //     _vertex_order)]) and append the fresh rows;
+    //   * numpy draws: randint(3) (the `rng_state` local pynndescent never
+    //     uses for dense data) then make_forest per-tree states, both from
+    //     `numpy_rs` -- which must be the same RandomState stream that seeded
+    //     build() (NNDescent keeps the instance; UMAP::update passes the
+    //     stream persisted after fit);
+    //   * self.n_trees = n_trees_after_update = max(2, round(n_trees / 3))
+    //     (computed once at build from the build-time n_trees);
+    //   * make_heap + init_from_neighbor_graph (internal distances) +
+    //     init_rp_tree over the fresh forest, then the candidate loop with
+    //     rp_tree_init=False, max_candidates = 60 (UMAP's hacked value),
+    //     n_iters unchanged from build, continuing the *persisted* tau
+    //     rng_state exactly where build()'s prepare left it;
+    //   * re-prepare: hub tree + diversify/degree-prune/reorder on the new
+    //     graph, continuing the same tau state. search_rng_state is *not*
+    //     re-warmed (the 10x warm-up lives in NNDescent.__init__ only).
+    // After the call n_points() includes the new rows; knn_indices()/
+    // knn_dists() are (n_total, n_neighbors) in original data order.
+    void update(const float* new_data, int64_t n_new, NumpyRandomState& numpy_rs,
+                bool verbose = false);
+
+    // The training data as the index stores it after prepare() -- reordered
+    // by vertex_order (row i is original row vertex_order()[i]). UMAP.update
+    // reads `self._knn_search_index._raw_data` at exactly this state.
+    const std::vector<float>& stored_data() const { return data_; }
+    // -------------------------------------------------------------------------
+
     // Fit-time kNN graph in original data order (NNDescent.neighbor_graph:
     // corrected distances), (n, n_neighbors) row-major.
     const std::vector<int32_t>& knn_indices() const { return knn_indices_; }
@@ -438,6 +489,16 @@ class PreparedIndex {
     std::array<int64_t, 3> search_rng_state_ = {0, 0, 0};  // post warm-up
     std::vector<int32_t> knn_indices_;
     std::vector<float> knn_dists_;
+    // --- inverse-update additions --------------------------------------------
+    // State NNDescent.update() consumes: the tau rng_state array as left by
+    // build()'s nn_descent + prepare (self.rng_state, mutated in place), the
+    // *internal* (uncorrected) kNN distances (self._neighbor_graph[1]), and
+    // the build-time tree bookkeeping.
+    std::array<int64_t, 3> rng_state_ = {0, 0, 0};
+    std::vector<float> knn_internal_dists_;
+    int64_t n_trees_after_update_ = 2;  // max(2, round(n_trees / 3))
+    int64_t n_iters_ = 5;               // unchanged across updates
+    // -------------------------------------------------------------------------
 };
 
 }  // namespace nnd

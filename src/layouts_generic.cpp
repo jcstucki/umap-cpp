@@ -78,6 +78,25 @@ OutputMetricFn make_output_metric(const std::string& name,
             return euclidean_output_grad(x, y, dim, grad);
         };
     }
+    // --- inverse-update additions ---------------------------------------
+    // numba f4 instantiation of distances.py::manhattan_grad (the metric
+    // gradient inverse_transform hands to optimize_layout_inverse for
+    // metric="manhattan"): the subtraction x[i] - y[i] and np.abs round
+    // through float32; the accumulator (result = 0.0) is float64, and
+    // grad = np.zeros(x.shape) is float64 holding np.sign of the f4 diff.
+    if (name == "manhattan" || name == "taxicab" || name == "l1") {
+        return [](float* x, float* y, int dim, double* grad) {
+            double result = 0.0;
+            for (int i = 0; i < dim; ++i) {
+                const float diff = x[i] - y[i];
+                result += static_cast<double>(std::fabs(diff));
+                grad[i] = static_cast<double>(
+                    diff > 0.0f ? 1.0f : (diff < 0.0f ? -1.0f : diff));
+            }
+            return result;
+        };
+    }
+    // ---------------------------------------------------------------------
     // Generic adapter: float32 rows widened to float64 (documented deviation:
     // in-place mutations by symmetric_kl / gaussian_energy modify the copy).
     GradientFn g = make_metric_grad(name, kwds);
@@ -239,10 +258,18 @@ void optimize_layout_generic(
     }
 }
 
-void optimize_layout_inverse(
+// --- inverse-update additions -----------------------------------------------
+// The epoch loops are shared between the float32-weight instantiation (the
+// original port, matching numba's f4 weight typing) and the float64-weight
+// instantiation that UMAP.inverse_transform produces (graph.data is float64
+// there, so numba types w_l as f8 and w_l * sigmas[k] promotes to float64
+// instead of being a float32 product).
+namespace {
+template <typename WeightT>
+void optimize_layout_inverse_impl(
     float* head_embedding, int n_head_vertices, float* tail_embedding, int dim,
     const std::vector<int32_t>& head, const std::vector<int32_t>& tail,
-    const float* weight, const float* sigmas, const float* rhos, int n_epochs,
+    const WeightT* weight, const float* sigmas, const float* rhos, int n_epochs,
     int n_vertices, const std::vector<double>& epochs_per_sample, double a,
     double b, int64_t rng_state[3], const OutputMetricFn& output_metric,
     double gamma, double initial_alpha, double negative_sample_rate,
@@ -280,10 +307,11 @@ void optimize_layout_inverse(
                     output_metric(current, other, dim, grad_dist_output.data());
 
                 // w_l = weight[i]; grad_coeff = -(1 / (w_l * sigmas[k] +
-                // 1e-6)). numba types literals as float64, so only the
-                // w_l * sigmas[k] product is float32; the + 1e-6 and the
-                // reciprocal are float64 (verified against numba 0.67).
-                const float w_l = weight[i];
+                // 1e-6)). numba types literals as float64, so for float32
+                // weights only the w_l * sigmas[k] product is float32; the
+                // + 1e-6 and the reciprocal are float64 (verified against
+                // numba 0.67). For float64 weights the product promotes.
+                const WeightT w_l = weight[i];
                 double grad_coeff =
                     -(1.0 /
                       (static_cast<double>(w_l * sigmas[k]) + 1e-6));
@@ -350,5 +378,38 @@ void optimize_layout_inverse(
                 (1.0 - (static_cast<double>(n) / static_cast<double>(n_epochs)));
     }
 }
+
+}  // namespace
+
+void optimize_layout_inverse(
+    float* head_embedding, int n_head_vertices, float* tail_embedding, int dim,
+    const std::vector<int32_t>& head, const std::vector<int32_t>& tail,
+    const float* weight, const float* sigmas, const float* rhos, int n_epochs,
+    int n_vertices, const std::vector<double>& epochs_per_sample, double a,
+    double b, int64_t rng_state[3], const OutputMetricFn& output_metric,
+    double gamma, double initial_alpha, double negative_sample_rate,
+    bool move_other) {
+    optimize_layout_inverse_impl<float>(
+        head_embedding, n_head_vertices, tail_embedding, dim, head, tail,
+        weight, sigmas, rhos, n_epochs, n_vertices, epochs_per_sample, a, b,
+        rng_state, output_metric, gamma, initial_alpha, negative_sample_rate,
+        move_other);
+}
+
+void optimize_layout_inverse(
+    float* head_embedding, int n_head_vertices, float* tail_embedding, int dim,
+    const std::vector<int32_t>& head, const std::vector<int32_t>& tail,
+    const double* weight, const float* sigmas, const float* rhos, int n_epochs,
+    int n_vertices, const std::vector<double>& epochs_per_sample, double a,
+    double b, int64_t rng_state[3], const OutputMetricFn& output_metric,
+    double gamma, double initial_alpha, double negative_sample_rate,
+    bool move_other) {
+    optimize_layout_inverse_impl<double>(
+        head_embedding, n_head_vertices, tail_embedding, dim, head, tail,
+        weight, sigmas, rhos, n_epochs, n_vertices, epochs_per_sample, a, b,
+        rng_state, output_metric, gamma, initial_alpha, negative_sample_rate,
+        move_other);
+}
+// ----------------------------------------------------------------------------
 
 }  // namespace umap

@@ -582,6 +582,16 @@ PreparedIndex PreparedIndex::build(const float* data, int64_t n, int64_t dim,
         idx.knn_dists_[i] = idx.metric_.correction
                                 ? idx.metric_.correction(graph.dist[i])
                                 : graph.dist[i];
+    // --- inverse-update additions -------------------------------------------
+    // State NNDescent.update() consumes later: the *internal* (uncorrected)
+    // self._neighbor_graph[1], n_trees_after_update = max(2, round(n_trees/3))
+    // (np.round half-even), and the build-time n_iters.
+    idx.knn_internal_dists_.assign(graph.dist.begin(), graph.dist.end());
+    idx.n_trees_after_update_ = std::max<int64_t>(
+        2, static_cast<int64_t>(
+               std::nearbyint(static_cast<double>(n_trees) / 3.0)));
+    idx.n_iters_ = n_iters;
+    // ------------------------------------------------------------------------
 
     // ---- prepare() / _init_search_graph -----------------------------------
     // Hub search tree first (search_leaf_size=30 when leaf_size is None,
@@ -616,8 +626,108 @@ PreparedIndex PreparedIndex::build(const float* data, int64_t n, int64_t dim,
     // resort_tree_indices: tree.indices[argsort(vertex_order)] == arange(n).
     for (int64_t i = 0; i < n; ++i) idx.tree_.indices[i] = static_cast<int32_t>(i);
 
+    // --- inverse-update additions -------------------------------------------
+    // Persist the tau rng_state exactly where nn_descent + prepare left it
+    // (Python: self.rng_state, mutated in place; update() continues it).
+    idx.rng_state_ = {rng_state[0], rng_state[1], rng_state[2]};
+    // ------------------------------------------------------------------------
+
     return idx;
 }
+
+// --- inverse-update additions ------------------------------------------------
+// pynndescent_.py::NNDescent.update(xs_fresh) for dense data, followed by the
+// prepare() re-run (UMAP.update() always triggers it: the search graph exists,
+// so pynndescent deletes it and prepares again). See nn_descent.hpp for the
+// step-by-step notes.
+void PreparedIndex::update(const float* new_data, int64_t n_new,
+                           NumpyRandomState& numpy_rs, bool verbose) {
+    const int64_t n_old = n_;
+    const int64_t n_total = n_old + n_new;
+
+    // rng_state = current_random_state.randint(INT32_MIN, INT32_MAX, 3):
+    // drawn from the persisted numpy stream, unused on the dense path
+    // (make_forest draws its own per-tree states below).
+    (void)numpy_rs.rng_state3();
+
+    // self._raw_data = self._raw_data[np.argsort(self._vertex_order)] --
+    // restore original order -- then vstack the fresh rows.
+    std::vector<float> full(static_cast<size_t>(n_total) * dim_);
+    for (int64_t i = 0; i < n_old; ++i)
+        std::memcpy(full.data() +
+                        static_cast<int64_t>(vertex_order_[i]) * dim_,
+                    data_.data() + i * dim_,
+                    sizeof(float) * static_cast<size_t>(dim_));
+    std::memcpy(full.data() + n_old * dim_, new_data,
+                sizeof(float) * static_cast<size_t>(n_new * dim_));
+
+    // self.n_trees = self.n_trees_after_update; make_forest(...) draws the
+    // per-tree states from the numpy stream; leaf_size=None resolves to
+    // max(60, min(256, 5 * n_neighbors)) inside (leaf_size=-1 here).
+    LeafArray leaf_array = make_forest_leaf_array(
+        full.data(), n_total, dim_, n_neighbors_, n_trees_after_update_,
+        /*leaf_size=*/-1, metric_.angular_trees, /*max_depth=*/200, numpy_rs);
+
+    // make_heap + init_from_neighbor_graph (internal distances of the old
+    // graph) + init_rp_tree over the fresh forest.
+    NNHeap current_graph = NNHeap::make(n_total, n_neighbors_);
+    init_from_neighbor_graph(current_graph, knn_indices_.data(),
+                             knn_internal_dists_.data(), n_old, n_neighbors_);
+    init_rp_tree(full.data(), dim_, metric_.dist, current_graph, leaf_array);
+
+    // nn_descent(init_graph=current_graph, rp_tree_init=False,
+    // max_candidates=60 (UMAP passes it explicitly), n_iters/delta unchanged),
+    // continuing the persisted tau rng_state.
+    int64_t rng_state[3] = {rng_state_[0], rng_state_[1], rng_state_[2]};
+    nn_descent_with_init_graph(current_graph, full.data(), n_total, dim_,
+                               n_neighbors_, rng_state, /*max_candidates=*/60,
+                               metric_.dist, n_iters_, /*delta=*/0.001,
+                               verbose);
+
+    // self._neighbor_graph (internal dists) + the corrected neighbor_graph.
+    knn_indices_.assign(current_graph.ind.begin(), current_graph.ind.end());
+    knn_internal_dists_.assign(current_graph.dist.begin(),
+                               current_graph.dist.end());
+    knn_dists_.resize(knn_internal_dists_.size());
+    for (size_t i = 0; i < knn_internal_dists_.size(); ++i)
+        knn_dists_[i] = metric_.correction
+                            ? metric_.correction(knn_internal_dists_[i])
+                            : knn_internal_dists_[i];
+
+    // del self._search_graph / _search_forest / _search_function;
+    // self.prepare() -- the same _init_search_graph pipeline as build(),
+    // continuing the same tau state. search_rng_state_ is *not* re-warmed
+    // (the 10x warm-up lives in NNDescent.__init__ only).
+    n_ = n_total;
+    tree_ = nnd::make_hub_tree(full.data(), n_total, dim_,
+                               current_graph.ind.data(), n_neighbors_,
+                               rng_state, /*leaf_size=*/30,
+                               metric_.angular_trees, /*max_depth=*/200);
+    SearchGraph sg = build_search_graph(
+        full.data(), n_total, dim_, current_graph.ind.data(),
+        current_graph.dist.data(), n_neighbors_, metric_.dist, rng_state,
+        /*diversify_prob=*/1.0, /*pruning_degree_multiplier=*/1.5);
+
+    vertex_order_ = tree_.indices;
+    std::vector<int32_t> inv(static_cast<size_t>(n_total));
+    for (int64_t i = 0; i < n_total; ++i)
+        inv[vertex_order_[i]] = static_cast<int32_t>(i);
+
+    data_.resize(static_cast<size_t>(n_total * dim_));
+    for (int64_t i = 0; i < n_total; ++i)
+        std::memcpy(data_.data() + i * dim_,
+                    full.data() +
+                        static_cast<int64_t>(vertex_order_[i]) * dim_,
+                    sizeof(float) * static_cast<size_t>(dim_));
+
+    search_graph_ = detail::reorder_search_graph(sg, n_total, vertex_order_,
+                                                 inv);
+    for (int64_t i = 0; i < n_total; ++i)
+        tree_.indices[i] = static_cast<int32_t>(i);
+
+    rng_state_ = {rng_state[0], rng_state[1], rng_state[2]};
+}
+// -----------------------------------------------------------------------------
 
 void PreparedIndex::query(const float* query_data, int64_t n_queries,
                           int64_t k, double epsilon, int32_t* out_indices,

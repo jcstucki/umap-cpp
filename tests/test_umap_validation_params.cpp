@@ -195,8 +195,36 @@ TEST_CASE("test_umap_bad_hellinger_data") {
     CHECK_THROWS_AS(u.fit(neg.data(), kNnN, kNnDim), std::invalid_argument);
 }
 
-// update() is not ported.
-TEST_CASE("test_umap_update_bad_params" * doctest::skip()) {}
+// --- inverse-update additions ------------------------------------------------
+TEST_CASE("test_umap_update_bad_params") {
+    // dmat = pairwise_distances(nn_data[:100]); precomputed update raises.
+    {
+        const std::vector<float> dmat = umap::pairwise_distances_sklearn(
+            nn_data_f32().data(), 100, nn_data_f32().data(), 100, kNnDim,
+            "euclidean", true);
+        UMAPParams p;
+        p.metric = "precomputed";
+        p.n_epochs = 11;
+        UMAP u(p);
+        u.fit(dmat.data(), 100, 100);
+        CHECK_THROWS_AS(u.update(dmat.data(), 100, 100),
+                        std::invalid_argument);
+    }
+    // supervised fit: y = np.repeat(np.arange(5), 20); update raises.
+    {
+        UMAPParams p;
+        p.n_epochs = 11;
+        UMAP u(p);
+        std::vector<float> y(100);
+        for (int i = 0; i < 100; ++i)
+            y[static_cast<std::size_t>(i)] = static_cast<float>(i / 20);
+        u.fit(nn_data_f32().data(), 100, kNnDim, y.data());
+        CHECK_THROWS_AS(
+            u.update(nn_data_f32().data() + 100 * kNnDim, 100, kNnDim),
+            std::invalid_argument);
+    }
+}
+// -----------------------------------------------------------------------------
 // fit(X, y) length validation belongs to the unported supervised surface.
 TEST_CASE("test_umap_fit_data_and_targets_compliant" * doctest::skip()) {}
 
@@ -214,7 +242,39 @@ TEST_CASE("test_umap_fit_instance_returned") {
     CHECK(&res == &u);
 }
 
-// inverse_transform() is not ported.
-TEST_CASE("test_umap_inverse_transform_fails_expectedly" * doctest::skip()) {}
+// --- inverse-update additions ------------------------------------------------
+TEST_CASE("test_umap_inverse_transform_fails_expectedly") {
+    // u.fit(sparse_spatial_data[:100]) -- the fixture has fewer rows, so the
+    // slice keeps them all (upstream too); sparse fit -> inverse raises.
+    {
+        const std::vector<float> dense = testutil::to_f32(
+            updata::sparse_spatial_dense,
+            sizeof(updata::sparse_spatial_dense) /
+                sizeof(updata::sparse_spatial_dense[0]));
+        const int64_t dim = 20;
+        const int64_t n = static_cast<int64_t>(dense.size()) / dim;
+        const testutil::Csr sp = testutil::dense_to_csr(dense.data(), n, dim);
+        UMAPParams p;
+        p.n_epochs = 11;
+        p.init = "random";  // spectral would raise for n <= n_components + 1
+        UMAP u(p);
+        u.fit(sp.indptr.data(), sp.indices.data(), sp.data.data(), n, dim);
+        std::vector<float> q(static_cast<std::size_t>(n) * 2, 0.0f);
+        CHECK_THROWS_AS((void)u.inverse_transform(q.data(), n),
+                        std::invalid_argument);
+    }
+    // metric="dice" (no gradient) -> inverse raises.
+    {
+        UMAPParams p;
+        p.metric = "dice";
+        p.n_epochs = 11;
+        UMAP u(p);
+        u.fit(nn_data_f32().data(), 100, kNnDim);
+        CHECK_THROWS_AS(
+            (void)u.inverse_transform(u.embedding().data(), 10),
+            std::invalid_argument);
+    }
+}
+// -----------------------------------------------------------------------------
 
 }  // TEST_SUITE

@@ -78,4 +78,20 @@ void optimize_layout_inverse(
     double gamma = 1.0, double initial_alpha = 1.0,
     double negative_sample_rate = 5.0, bool move_other = false);
 
+// --- inverse-update additions -----------------------------------------------
+// Float64-weight overload: UMAP.inverse_transform builds graph.data in
+// float64 (`weights = 1 / (1 + a * distances ** (2 * b))` over np.array
+// triplets), so the numba kernel is instantiated with an f8 weight array and
+// w_l * sigmas[k] promotes to float64 (the f4-weight instantiation above
+// keeps that product in float32).
+void optimize_layout_inverse(
+    float* head_embedding, int n_head_vertices, float* tail_embedding, int dim,
+    const std::vector<int32_t>& head, const std::vector<int32_t>& tail,
+    const double* weight, const float* sigmas, const float* rhos, int n_epochs,
+    int n_vertices, const std::vector<double>& epochs_per_sample, double a,
+    double b, int64_t rng_state[3], const OutputMetricFn& output_metric,
+    double gamma = 1.0, double initial_alpha = 1.0,
+    double negative_sample_rate = 5.0, bool move_other = false);
+// ----------------------------------------------------------------------------
+
 }  // namespace umap

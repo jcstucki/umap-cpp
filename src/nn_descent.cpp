@@ -964,6 +964,37 @@ NNHeap nn_descent(const float* data, int64_t n, int64_t dim,
     return current_graph;
 }
 
+// --- inverse-update additions ------------------------------------------------
+
+void init_from_neighbor_graph(NNHeap& heap, const int32_t* indices,
+                              const float* distances, int64_t n_rows,
+                              int64_t n_cols) {
+    // pynndescent_.py::init_from_neighbor_graph: flag-0 pushes in (p, k)
+    // order.
+    for (int64_t p = 0; p < n_rows; ++p) {
+        for (int64_t k = 0; k < n_cols; ++k) {
+            const int32_t q = indices[p * n_cols + k];
+            const float d = distances[p * n_cols + k];
+            checked_flagged_heap_push(heap.dist_row(p), heap.ind_row(p),
+                                      heap.flag_row(p), heap.size, d, q, 0);
+        }
+    }
+}
+
+void nn_descent_with_init_graph(NNHeap& current_graph, const float* data,
+                                int64_t n, int64_t dim, int64_t n_neighbors,
+                                int64_t rng_state[3], int64_t max_candidates,
+                                DistFn dist, int64_t n_iters, double delta,
+                                bool verbose) {
+    // nn_descent with init_graph=current_graph (rp_tree_init handled by the
+    // caller): straight to the candidate loop, then deheap_sort.
+    nn_descent_internal(data, n, dim, current_graph, n_neighbors, rng_state,
+                        max_candidates, dist, n_iters, delta, verbose);
+    deheap_sort(current_graph.ind.data(), current_graph.dist.data(), n,
+                n_neighbors);
+}
+// -----------------------------------------------------------------------------
+
 // ------------------------------------------------------------------ toplevel
 
 void brute_force_knn(const float* data, int64_t n, int64_t dim,

@@ -37,6 +37,29 @@ std::vector<double> make_epochs_per_sample(const float* weights,
     return result;
 }
 
+// --- inverse-update additions -----------------------------------------------
+std::vector<double> make_epochs_per_sample(const double* weights,
+                                           std::size_t n_weights,
+                                           int n_epochs) {
+    // Same routine instantiated on float64 weights (inverse_transform):
+    // n_samples = n_epochs * (weights / weights.max()) is all-float64.
+    std::vector<double> result(n_weights, -1.0);
+    if (n_weights == 0) return result;
+    double w_max = weights[0];
+    for (std::size_t i = 1; i < n_weights; ++i) {
+        if (weights[i] > w_max) w_max = weights[i];
+    }
+    for (std::size_t i = 0; i < n_weights; ++i) {
+        const double n_samples =
+            static_cast<double>(n_epochs) * (weights[i] / w_max);
+        if (n_samples > 0.0) {
+            result[i] = static_cast<double>(n_epochs) / n_samples;
+        }
+    }
+    return result;
+}
+// ----------------------------------------------------------------------------
+
 // --- densmap additions ------------------------------------------------------
 #if defined(__APPLE__)
 // numpy's macOS wheels (>= 2.0) link Accelerate; np.dot(f32, f32) is

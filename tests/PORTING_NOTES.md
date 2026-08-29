@@ -38,8 +38,9 @@ Venv used: scipy 1.18.1, sklearn 1.9.0, numpy 2.5.2, numba 0.67.0.
 ### test_umap_on_iris.cpp
 - Skips: sphere iris (output_metric not wired into the class), modified_dtype
   (no dtype to modify in C++), sparse transform + sparse precomputed
-  transform (sparse class glue not ported), supervised clusterability,
-  inverse_transform.
+  transform (sparse class glue not ported), supervised clusterability.
+- `test_umap_inverse_transform_on_iris`: active; sklearn KDTree queries
+  ported as exact brute-force kNN.
 - `test_precomputed_knn_on_iris`: pytest.warns bookkeeping replaced by
   behavioural checks (identical embeddings, transform raising with
   "search index" in the message); the C++ port prints the same warning texts
@@ -62,9 +63,10 @@ Venv used: scipy 1.18.1, sklearn 1.9.0, numpy 2.5.2, numba 0.67.0.
   mahalanobis grad golden; 3 for sparse hellinger — n/a).
 
 ### test_umap_ops.cpp
-- Skips: update()/update_large (update not ported), component_layout_options
-  (precomputed-metric + linkage component_layout not ported), the sparse=True
-  leg of disconnected_data_precomputed.
+- Skips: component_layout_options (precomputed-metric + linkage
+  component_layout not ported), the sparse=True leg of
+  disconnected_data_precomputed. update()/update_large are active (the
+  upstream vstack/hstack graph rearrangement is computed densely).
 - `test_disconnected_data`: warning-count assertions replaced by the model's
   `vertices_disconnected()` bookkeeping (same event, warnings go to stderr).
 - `test_fast_knn_indices_matches_argsort` draws its (distinct-valued) random
@@ -94,8 +96,9 @@ Venv used: scipy 1.18.1, sklearn 1.9.0, numpy 2.5.2, numba 0.67.0.
   hellinger negative data, fit-returns-self).
 - Skips: values unrepresentable in the typed surface (float/str n_components,
   numeric metric/init objects), unported features (output_metric,
-  target_n_neighbors, densmap knobs, n_jobs, callable metrics, update,
-  inverse_transform, fit(X, y) length checks).
+  target_n_neighbors, densmap knobs, n_jobs, callable metrics, fit(X, y)
+  length checks). test_umap_update_bad_params and
+  test_umap_inverse_transform_fails_expectedly are active.
 - `test_umap_fit_instance_returned` uses n_epochs=11/init="random" for
   runtime; the assertion (fit returns the instance) is unaffected.
 

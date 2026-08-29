@@ -52,6 +52,15 @@ inline float rdist(const float* x, const float* y, int dim) {
 std::vector<double> make_epochs_per_sample(const float* weights,
                                            std::size_t n_weights, int n_epochs);
 
+// --- inverse-update additions -----------------------------------------------
+// Float64-weight overload: UMAP.inverse_transform builds graph.data in float64
+// (`weights = 1 / (1 + a * distances ** (2 * b))` over np.array triplets), so
+// numba instantiates make_epochs_per_sample with f8 weights and n_samples is
+// computed in float64.
+std::vector<double> make_epochs_per_sample(const double* weights,
+                                           std::size_t n_weights, int n_epochs);
+// ----------------------------------------------------------------------------
+
 // --- densmap additions ------------------------------------------------------
 // The densMAP auxiliary data optimize_layout_euclidean consumes (upstream's
 // densmap_kwds dict after simplicial_set_embedding fills in mu / mu_sum / R).

@@ -133,6 +133,38 @@ if(UMAP_ENABLE_METAL)
 endif()
 # ----------------------------------------------------------------------------
 
+# --- inverse-update additions -----------------------------------------------
+# scipy.spatial.Delaunay port for inverse_transform: the exact qhull sources
+# scipy 1.18.1 vendors (qhull_r 8.0.2 reentrant, subprojects/qhull_r with
+# scipy's poly2rc.patch pre-applied) as a static C library, plus the
+# _qhull.pyx port in src/delaunay.cpp. CPU-only builds are unaffected (pure C,
+# no external dependencies).
+enable_language(C)
+add_library(qhull_r STATIC
+    third_party/qhull_r/libqhull_r/geom2_r.c
+    third_party/qhull_r/libqhull_r/geom_r.c
+    third_party/qhull_r/libqhull_r/global_r.c
+    third_party/qhull_r/libqhull_r/io_r.c
+    third_party/qhull_r/libqhull_r/libqhull_r.c
+    third_party/qhull_r/libqhull_r/mem_r.c
+    third_party/qhull_r/libqhull_r/merge_r.c
+    third_party/qhull_r/libqhull_r/poly2_r.c
+    third_party/qhull_r/libqhull_r/poly_r.c
+    third_party/qhull_r/libqhull_r/qset_r.c
+    third_party/qhull_r/libqhull_r/random_r.c
+    third_party/qhull_r/libqhull_r/rboxlib_r.c
+    third_party/qhull_r/libqhull_r/stat_r.c
+    third_party/qhull_r/libqhull_r/user_r.c
+    third_party/qhull_r/libqhull_r/usermem_r.c
+    third_party/qhull_r/libqhull_r/userprintf_r.c
+    third_party/qhull_r/libqhull_r/userprintf_rbox_r.c)
+target_include_directories(qhull_r PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/qhull_r)
+target_compile_options(qhull_r PRIVATE -O2 -w)  # vendored code: warnings off
+target_sources(umapcpp PRIVATE src/delaunay.cpp)
+target_link_libraries(umapcpp PUBLIC qhull_r)
+# ----------------------------------------------------------------------------
+
 enable_testing()
 
 add_executable(umap_tests
@@ -197,6 +229,12 @@ target_sources(umap_tests PRIVATE tests/test_densmap.cpp)
 target_sources(umap_tests PRIVATE
     tests/test_supervised.cpp
     tests/test_sparse_class.cpp)
+# ----------------------------------------------------------------------------
+
+# --- inverse-update additions ------------------------------------------------
+target_sources(umap_tests PRIVATE
+    tests/test_inverse.cpp
+    tests/test_update.cpp)
 # ----------------------------------------------------------------------------
 
 # --- metal-gpu additions ----------------------------------------------------

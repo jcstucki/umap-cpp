@@ -12,18 +12,21 @@
 //   * test_umap_sparse_transform_on_iris / test_precomputed_sparse_transform_
 //     on_iris -- sparse input / sparse precomputed not wired into the class.
 //   * test_umap_clusterability_on_supervised_iris -- supervised fit (y).
-//   * test_umap_inverse_transform_on_iris -- inverse_transform not ported.
 // Adaptation:
+//   * test_umap_inverse_transform_on_iris: sklearn KDTree queries are ported
+//     as exact brute-force kNN (the tree is exact too).
 //   * test_precomputed_knn_on_iris: the pytest.warns bookkeeping is replaced
 //     by behavioural checks (the C++ port emits the same warnings on stderr);
 //     the NotImplementedError match "search index" maps to the C++
 //     std::invalid_argument whose message contains "search index".
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "doctest.h"
@@ -211,7 +214,58 @@ TEST_CASE("test_precomputed_transform_on_iris") {
 
 TEST_CASE("test_precomputed_sparse_transform_on_iris" * doctest::skip()) {}
 TEST_CASE("test_umap_clusterability_on_supervised_iris" * doctest::skip()) {}
-TEST_CASE("test_umap_inverse_transform_on_iris" * doctest::skip()) {}
+
+// --- inverse-update additions ------------------------------------------------
+TEST_CASE("test_umap_inverse_transform_on_iris") {
+    UMAP& fitter = iris_model();
+    const std::vector<float>& emb = fitter.embedding();
+    // KDTree queries ported as exact brute-force kNN (stable tie order).
+    const auto knn = [](const float* data, int64_t n, int64_t dim,
+                        const float* q, int k) {
+        std::vector<std::pair<double, int64_t>> d(
+            static_cast<std::size_t>(n));
+        for (int64_t j = 0; j < n; ++j) {
+            double acc = 0.0;
+            for (int64_t c = 0; c < dim; ++c) {
+                const double diff = static_cast<double>(q[c]) -
+                                    static_cast<double>(data[j * dim + c]);
+                acc += diff * diff;
+            }
+            d[static_cast<std::size_t>(j)] = {acc, j};
+        }
+        std::stable_sort(d.begin(), d.end());
+        std::vector<int64_t> out(static_cast<std::size_t>(k));
+        for (int j = 0; j < k; ++j)
+            out[static_cast<std::size_t>(j)] =
+                d[static_cast<std::size_t>(j)].second;
+        return out;
+    };
+    for (int i = 1; i < 150; i += 20) {
+        const float* query_point =
+            emb.data() + static_cast<std::size_t>(i) * 2;
+        const std::vector<int64_t> near_points =
+            knn(emb.data(), kIrisN, 2, query_point, 5);
+        // centroid = np.mean(embedding_[near_points], axis=0) (float32).
+        float centroid[2] = {0.0f, 0.0f};
+        for (int64_t np_i : near_points) {
+            centroid[0] += emb[static_cast<std::size_t>(np_i) * 2 + 0];
+            centroid[1] += emb[static_cast<std::size_t>(np_i) * 2 + 1];
+        }
+        centroid[0] /= 5.0f;
+        centroid[1] /= 5.0f;
+        const std::vector<float> highd_centroid =
+            fitter.inverse_transform(centroid, 1);
+        const std::vector<int64_t> highd_near_points = knn(
+            iris_f32().data(), kIrisN, kIrisDim, highd_centroid.data(), 10);
+        int common = 0;
+        for (int64_t a : near_points)
+            for (int64_t b : highd_near_points)
+                if (a == b) ++common;
+        CAPTURE(i);
+        CHECK(common >= 3);
+    }
+}
+// -----------------------------------------------------------------------------
 
 TEST_CASE("test_precomputed_knn_on_iris") {
     const int64_t n = subset_n();

@@ -5,7 +5,6 @@
 // tests/upstream_data.hpp).
 //
 // Skips (see tests/PORTING_NOTES.md):
-//   * test_umap_update / test_umap_update_large -- update() not ported.
 //   * test_component_layout_options -- component_layout with
 //     metric="precomputed" + linkage kwds is not ported (euclidean-only).
 //   * test_disconnected_data_precomputed[sparse=True] -- sparse precomputed
@@ -307,8 +306,76 @@ TEST_CASE("test_umap_transform_embedding_stability") {
     }
 }
 
-TEST_CASE("test_umap_update" * doctest::skip()) {}
-TEST_CASE("test_umap_update_large" * doctest::skip()) {}
+// --- inverse-update additions ------------------------------------------------
+// Shared body of test_umap_update / test_umap_update_large: update the subset
+// model with the held-out rows and compare its graph against the full-data
+// model's graph with rows/columns permuted so the subset rows come first.
+static void run_umap_update_test(bool force_approx, double threshold) {
+    const std::vector<float> iris = testutil::to_f32(updata::iris_data,
+                                                     150 * 4);
+    const std::vector<float> subset = testutil::select_rows(
+        iris.data(), 150, 4, updata::iris_selection, true);
+    const std::vector<float> rest = testutil::select_rows(
+        iris.data(), 150, 4, updata::iris_selection, false);
+    const int64_t n_sub = static_cast<int64_t>(subset.size() / 4);
+    const int64_t n_rest = static_cast<int64_t>(rest.size() / 4);
+
+    UMAPParams p;
+    p.n_neighbors = 10;
+    p.min_dist = 0.01;
+    p.random_state = 42;
+    p.force_approximation_algorithm = force_approx;
+
+    UMAP new_model(p);
+    new_model.fit(subset.data(), n_sub, 4);
+    new_model.update(rest.data(), n_rest, 4);
+
+    UMAP full_model(p);
+    full_model.fit(iris.data(), 150, 4);
+
+    // perm: subset row indices first, then the held-out rows (the upstream
+    // vstack/hstack rearrangement of iris_model.graph_).
+    std::vector<int64_t> perm;
+    for (int64_t i = 0; i < 150; ++i)
+        if (updata::iris_selection[i]) perm.push_back(i);
+    for (int64_t i = 0; i < 150; ++i)
+        if (!updata::iris_selection[i]) perm.push_back(i);
+
+    const auto to_dense = [](const umap::SparseMatrix& g) {
+        std::vector<double> d(static_cast<std::size_t>(g.n_rows) * g.n_cols,
+                              0.0);
+        for (int64_t i = 0; i < g.n_rows; ++i)
+            for (int32_t k = g.indptr[i]; k < g.indptr[i + 1]; ++k)
+                d[static_cast<std::size_t>(i * g.n_cols + g.indices[k])] =
+                    static_cast<double>(g.data[k]);
+        return d;
+    };
+    const std::vector<double> updated = to_dense(new_model.graph());
+    const std::vector<double> full = to_dense(full_model.graph());
+    REQUIRE(updated.size() == full.size());
+
+    // error = np.sum(np.abs((new_model.graph_ - comparison_graph).data))
+    double error = 0.0;
+    for (int64_t i = 0; i < 150; ++i) {
+        for (int64_t j = 0; j < 150; ++j) {
+            const std::size_t pi =
+                static_cast<std::size_t>(perm[static_cast<std::size_t>(i)]);
+            const std::size_t pj =
+                static_cast<std::size_t>(perm[static_cast<std::size_t>(j)]);
+            error += std::abs(updated[static_cast<std::size_t>(i * 150 + j)] -
+                              full[pi * 150 + pj]);
+        }
+    }
+    CAPTURE(error);
+    CHECK(error < threshold);
+}
+
+TEST_CASE("test_umap_update") { run_umap_update_test(false, 2.10); }
+TEST_CASE("test_umap_update_large") {
+    // Higher error tolerance based on approx nearest neighbors (upstream).
+    run_umap_update_test(true, 3.0);
+}
+// -----------------------------------------------------------------------------
 
 TEST_CASE("test_umap_graph_layout") {
     const std::vector<float> data =

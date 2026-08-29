@@ -263,6 +263,52 @@ class UMAP {
     // existing embedded space; returns n_queries x n_components.
     std::vector<float> transform(const float* X_new, int64_t n_queries) const;
 
+    // --- inverse-update additions -------------------------------------------
+    // umap_.py::inverse_transform(X): transform points of the embedded space
+    // back into the input data space. X is row-major n_queries x n_components
+    // float32; returns n_queries x n_features. Pipeline (ported exactly):
+    // scipy.spatial.Delaunay(embedding_, incremental=True, qhull_options="QJ")
+    // (see delaunay.hpp), find_simplex over X (a -1 result indexes the *last*
+    // simplex, numpy negative-index semantics), intra-simplex adjacency
+    // matrix, breadth_first_search neighborhoods of min(n_features, n_samples)
+    // vertices, output-metric distances + np.argsort truncation, 1/(1+a d^2b)
+    // float64 weights, l1-normalised weighted-mean init (init_transform), and
+    // optimize_layout_inverse against _raw_data with
+    // named_distances_with_gradients[metric] at initial_alpha / 4.
+    // Restrictions raise with upstream's messages (sparse input, gradient-less
+    // metric / precomputed, densMAP, transform_mode="graph"); n_components >=
+    // 8 warns. Deviations (documented): exact-distance argsort ties break by
+    // ascending index (numpy's introsort order is input-dependent), and
+    // unique=True models throw (upstream indexes sigmas out of bounds inside
+    // numba -- undefined behaviour).
+    std::vector<float> inverse_transform(const float* X_emb,
+                                         int64_t n_queries) const;
+
+    // umap_.py::update(X): incremental fit with new data appended to the
+    // model. Dense overload (row-major n_new x n_features float32). Paths:
+    //   * small-data fit staying < 4096 rows: pairwise recompute +
+    //     fuzzy_simplicial_set("precomputed"); knn_indices()/knn_dists() keep
+    //     the *fit-time* arrays like upstream;
+    //   * small-data fit growing past 4096: switches to the standard branch
+    //     (PreparedIndex::build on the combined data, continuing the
+    //     transform_seed RandomState -- which future updates then continue);
+    //   * standard fit: PreparedIndex::update (pynndescent NNDescent.update +
+    //     re-prepare) continuing the RandomState persisted from fit.
+    // Re-embeds with the previous embedding as init (init_update mean-of-
+    // original-neighbours quirk included: the mean is divided once more by
+    // n_components) and n_epochs = params.n_epochs or the 500/200 default.
+    // Raises like upstream for precomputed metrics and supervised models;
+    // densmap/output_dens models throw (upstream reads a stale
+    // _densmap_kwds["graph_dists"] of the old size -- undefined behaviour).
+    UMAP& update(const float* X_new, int64_t n_new, int64_t n_features);
+    // Sparse (CSR) overload: only a small-data sparse fit staying < 4096 rows
+    // is supported; the standard sparse path raises NotImplementedError
+    // upstream ("Sparse update not complete yet") and the small->large
+    // transition builds a sparse NN-descent index.
+    UMAP& update(const int32_t* indptr, const int32_t* indices,
+                 const float* data, int64_t n_new, int64_t n_features);
+    // ------------------------------------------------------------------------
+
     // --- feature-bundle additions -------------------------------------------
     // fit_transform for transform_mode="graph": returns self.graph_ (the CSR
     // fuzzy simplicial set) like the reference's fit_transform.
@@ -367,6 +413,13 @@ class UMAP {
     std::vector<float> transform_from_membership(const MembershipStrengths& ms,
                                                  int64_t n_queries) const;
     // ------------------------------------------------------------------------
+    // --- inverse-update additions -------------------------------------------
+    // The shared update() body (dense when X_new != nullptr, sparse CSR
+    // otherwise).
+    UMAP& update_impl(const float* X_new, const int32_t* new_indptr,
+                      const int32_t* new_indices, const float* new_values,
+                      int64_t n_new, int64_t n_features);
+    // ------------------------------------------------------------------------
 
     UMAPParams params_;
     double a_ = 0.0;
@@ -377,6 +430,20 @@ class UMAP {
     bool fitted_ = false;
     int64_t n_ = 0;
     int64_t dim_ = 0;
+    // --- inverse-update additions -------------------------------------------
+    // self._supervised (set by fit when y is given; update() raises on it).
+    bool supervised_ = false;
+    // The numpy RandomState stream the search index holds a reference to
+    // upstream (fit's random_state, or -- after a small->large update -- the
+    // transform_seed stream of that update). NNDescent.update() continues it.
+    std::optional<nnd::NumpyRandomState> index_rs_;
+    // self._input_hash: joblib.hash(fit X) equivalent (FNV-1a over the raw
+    // bytes + the row count). update() leaves it untouched like upstream, so
+    // transform() of the *original* fit data still shortcuts to embedding_
+    // (which then has more rows -- upstream quirk preserved).
+    uint64_t input_hash_ = 0;
+    int64_t input_hash_rows_ = -1;
+    // ------------------------------------------------------------------------
     std::vector<float> raw_data_;                    // training data copy
     std::shared_ptr<nnd::PreparedIndex> knn_index_;  // standard branch only
     // --- supervised-sparse additions ----------------------------------------

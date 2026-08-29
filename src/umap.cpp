@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <numeric>
 #include <random>
@@ -23,6 +24,9 @@
 #include "umap/sparse_distances.hpp"
 #include "umap/sparse_nn_descent.hpp"
 #include "umap/supervised.hpp"
+// ----------------------------------------------------------------------------
+// --- inverse-update additions -----------------------------------------------
+#include "umap/delaunay.hpp"
 // ----------------------------------------------------------------------------
 
 namespace umap {
@@ -736,6 +740,51 @@ void UMAP::validate_parameters() const {
     // ------------------------------------------------------------------------
 }
 
+// --- inverse-update additions -----------------------------------------------
+// The ndarray branch of simplicial_set_embedding's init dispatch (its final
+// `else`): duplicate rows trigger the KDTree jitter, otherwise the array
+// passes through unchanged. Shared between init_array fits and update()'s
+// embedding_-seeded init.
+namespace {
+std::vector<float> ndarray_init_with_jitter(std::vector<float> arr, int64_t n,
+                                            int dim,
+                                            nnd::NumpyRandomState& rs) {
+    // if np.unique(init_data, axis=0).shape[0] < init_data.shape[0]:
+    std::vector<int64_t> uidx, uinv;
+    unique_rows(arr.data(), n, dim, uidx, uinv);
+    if (static_cast<int64_t>(uidx.size()) == n) return arr;
+    // tree = KDTree(init_data); dist, ind = tree.query(init_data, k=2)
+    // nndist = np.mean(dist[:, 1])
+    // The second column of an exact self-query is the distance to the
+    // nearest *other* point (the self-match occupies column 0; exact
+    // duplicates make both 0). sklearn's KDTree computes in float64.
+    std::vector<double> d2(static_cast<std::size_t>(n));
+    for (int64_t i = 0; i < n; ++i) {
+        double best = std::numeric_limits<double>::infinity();
+        const float* ri = arr.data() + static_cast<std::size_t>(i) * dim;
+        for (int64_t j = 0; j < n; ++j) {
+            if (j == i) continue;
+            const float* rj = arr.data() + static_cast<std::size_t>(j) * dim;
+            double acc = 0.0;
+            for (int c = 0; c < dim; ++c) {
+                const double diff =
+                    static_cast<double>(ri[c]) - static_cast<double>(rj[c]);
+                acc += diff * diff;
+            }
+            best = std::min(best, acc);
+        }
+        d2[static_cast<std::size_t>(i)] = std::sqrt(best);
+    }
+    const double nndist = numpy_mean_f64(d2.data(), n);
+    // embedding = init_data + random_state.normal(
+    //     scale=0.001 * nndist, size=init_data.shape).astype(np.float32)
+    for (auto& v : arr)
+        v = v + static_cast<float>(rs.normal(0.0, 0.001 * nndist));
+    return arr;
+}
+}  // namespace
+// ----------------------------------------------------------------------------
+
 std::vector<float> UMAP::make_fit_init(const float* data, int64_t n_index,
                                        const SparseMatrix& filtered_graph,
                                        nnd::NumpyRandomState& rs) const {
@@ -753,42 +802,7 @@ std::vector<float> UMAP::make_fit_init(const float* data, int64_t n_index,
                 "UMAP: init_array must have shape "
                 "(n_samples[, unique], n_components)");
         }
-        // if np.unique(init_data, axis=0).shape[0] < init_data.shape[0]:
-        std::vector<int64_t> uidx, uinv;
-        unique_rows(arr.data(), n, dim, uidx, uinv);
-        if (static_cast<int64_t>(uidx.size()) == n) return arr;
-        // tree = KDTree(init_data); dist, ind = tree.query(init_data, k=2)
-        // nndist = np.mean(dist[:, 1])
-        // The second column of an exact self-query is the distance to the
-        // nearest *other* point (the self-match occupies column 0; exact
-        // duplicates make both 0). sklearn's KDTree computes in float64.
-        std::vector<double> d2(static_cast<std::size_t>(n));
-        for (int64_t i = 0; i < n; ++i) {
-            double best = std::numeric_limits<double>::infinity();
-            const float* ri = arr.data() + static_cast<std::size_t>(i) * dim;
-            for (int64_t j = 0; j < n; ++j) {
-                if (j == i) continue;
-                const float* rj =
-                    arr.data() + static_cast<std::size_t>(j) * dim;
-                double acc = 0.0;
-                for (int c = 0; c < dim; ++c) {
-                    const double diff = static_cast<double>(ri[c]) -
-                                        static_cast<double>(rj[c]);
-                    acc += diff * diff;
-                }
-                best = std::min(best, acc);
-            }
-            d2[static_cast<std::size_t>(i)] = std::sqrt(best);
-        }
-        const double nndist = numpy_mean_f64(d2.data(), n);
-        // embedding = init_data + random_state.normal(
-        //     scale=0.001 * nndist, size=init_data.shape).astype(np.float32)
-        std::vector<float> out(total);
-        for (std::size_t i = 0; i < total; ++i) {
-            out[i] = arr[i] +
-                     static_cast<float>(rs.normal(0.0, 0.001 * nndist));
-        }
-        return out;
+        return ndarray_init_with_jitter(arr, n, dim, rs);
     }
 
     if (params_.init == "random") {
@@ -896,6 +910,30 @@ void check_all_finite(const float* X, int64_t n, int64_t dim,
             throw std::invalid_argument("Input contains NaN.");
     }
 }
+
+// --- inverse-update additions -----------------------------------------------
+// self._input_hash equivalence: FNV-1a 64-bit over the raw bytes. joblib.hash
+// maps equal arrays to equal hashes; collisions between distinct arrays are
+// vanishingly unlikely for test-scale data.
+uint64_t fnv1a64(const void* data, std::size_t nbytes,
+                 uint64_t h = 1469598103934665603ULL) {
+    const unsigned char* p = static_cast<const unsigned char*>(data);
+    for (std::size_t i = 0; i < nbytes; ++i) {
+        h ^= static_cast<uint64_t>(p[i]);
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+uint64_t csr_fnv1a64(const int32_t* indptr, const int32_t* indices,
+                     const float* data, int64_t n_rows) {
+    const std::size_t nnz = static_cast<std::size_t>(indptr[n_rows]);
+    uint64_t h = fnv1a64(indptr, static_cast<std::size_t>(n_rows + 1) *
+                                     sizeof(int32_t));
+    h = fnv1a64(indices, nnz * sizeof(int32_t), h);
+    return fnv1a64(data, nnz * sizeof(float), h);
+}
+// ----------------------------------------------------------------------------
 }  // namespace
 // ----------------------------------------------------------------------------
 
@@ -999,6 +1037,21 @@ UMAP& UMAP::fit_impl(const float* X, int64_t n_samples, int64_t n_features,
         raw_data_.assign(X,
                          X + static_cast<std::size_t>(n_samples) * n_features);
     }
+    // --- inverse-update additions -------------------------------------------
+    // self._input_hash = joblib.hash(self._raw_data): computed once at fit;
+    // update() leaves it untouched (upstream quirk), so the transform shortcut
+    // keeps firing on the *fit-time* data.
+    if (sparse_data_) {
+        input_hash_ = csr_fnv1a64(raw_indptr_.data(), raw_indices_.data(),
+                                  raw_values_.data(), n_samples);
+    } else {
+        input_hash_ = fnv1a64(raw_data_.data(),
+                              raw_data_.size() * sizeof(float));
+    }
+    input_hash_rows_ = n_samples;
+    supervised_ = (y != nullptr);
+    index_rs_.reset();
+    // ------------------------------------------------------------------------
     embedding_list_.clear();
     unique_inverse_.clear();
     edges_removed_ = 0;
@@ -1510,6 +1563,14 @@ UMAP& UMAP::fit_impl(const float* X, int64_t n_samples, int64_t n_features,
         fit_init_.clear();
     }
 
+    // --- inverse-update additions -------------------------------------------
+    // Persist the numpy RandomState at its post-fit position: upstream's
+    // NNDescent keeps a reference to fit's random_state instance, and
+    // NNDescent.update() (via UMAP.update on the standard branch) continues
+    // that stream exactly where fit left it.
+    index_rs_ = rs;
+    // ------------------------------------------------------------------------
+
     fitted_ = true;
     return *this;
 }
@@ -1845,10 +1906,11 @@ SparseMatrix UMAP::transform_graph(const float* X_new,
             "UMAP: model was fit with sparse data; use the CSR "
             "transform_graph overload");
     // ------------------------------------------------------------------------
-    // Input-hash shortcut: upstream returns self.graph_.
-    if (n_queries == n_ &&
-        std::memcmp(X_new, raw_data_.data(),
-                    raw_data_.size() * sizeof(float)) == 0) {
+    // Input-hash shortcut: upstream returns self.graph_. The hash basis is
+    // the *fit-time* data (update() never refreshes _input_hash upstream).
+    if (n_queries == input_hash_rows_ &&
+        fnv1a64(X_new, static_cast<std::size_t>(n_queries) * dim_ *
+                           sizeof(float)) == input_hash_) {
         return graph_;
     }
     // --- densmap additions --------------------------------------------------
@@ -1892,9 +1954,12 @@ std::vector<float> UMAP::transform(const float* X_new,
     // ------------------------------------------------------------------------
 
     // Input-hash shortcut: transforming the training data returns embedding_.
-    if (n_queries == n_ &&
-        std::memcmp(X_new, raw_data_.data(),
-                    raw_data_.size() * sizeof(float)) == 0) {
+    // The hash basis is the *fit-time* data (update() never refreshes
+    // _input_hash upstream, so after update() the original fit data still
+    // shortcuts -- returning the now-larger embedding_, like the reference).
+    if (n_queries == input_hash_rows_ &&
+        fnv1a64(X_new, static_cast<std::size_t>(n_queries) * dim_ *
+                           sizeof(float)) == input_hash_) {
         return embedding_;
     }
     // --- densmap additions --------------------------------------------------
@@ -1994,6 +2059,644 @@ std::vector<float> UMAP::transform_from_membership(
     return embedding;
 }
 
+// --- inverse-update additions ------------------------------------------------
+
+namespace {
+
+// np.argsort (default quicksort) over float64 values. Deviation (documented):
+// exact ties break by ascending index; numpy's introsort tie order is
+// input-dependent. Distances between a query and distinct embedding points tie
+// only in degenerate configurations.
+std::vector<int64_t> plain_argsort_f64(const std::vector<double>& v) {
+    std::vector<int64_t> idx(v.size());
+    std::iota(idx.begin(), idx.end(), 0);
+    std::stable_sort(idx.begin(), idx.end(),
+                     [&](int64_t a, int64_t b) { return v[a] < v[b]; });
+    return idx;
+}
+
+// umap_.py::breadth_first_search over the intra-simplex adjacency matrix.
+// `adj` holds each vertex's sorted unique neighbour list -- exactly the CSR
+// row indices upstream reads (the int8 duplicate summing never changes the
+// structure). Levels are assigned in nondecreasing order along a BFS, so the
+// running maximum equals max(levels.values()).
+std::vector<int32_t> breadth_first_search_port(
+    const std::vector<std::vector<int32_t>>& adj, int32_t start,
+    int64_t min_vertices) {
+    std::vector<int32_t> explored;
+    std::deque<int32_t> queue;
+    queue.push_back(start);
+    std::vector<int32_t> levels(adj.size(), 0);
+    std::vector<uint8_t> visited(adj.size(), 0);
+    visited[static_cast<std::size_t>(start)] = 1;
+    double max_level = std::numeric_limits<double>::infinity();
+    int32_t max_assigned = 0;
+
+    while (!queue.empty()) {
+        const int32_t node = queue.front();
+        queue.pop_front();
+        explored.push_back(node);
+        if (std::isinf(max_level) &&
+            static_cast<int64_t>(explored.size()) > min_vertices)
+            max_level = static_cast<double>(max_assigned);
+
+        if (static_cast<double>(levels[static_cast<std::size_t>(node)] + 1) <
+            max_level) {
+            for (int32_t nb : adj[static_cast<std::size_t>(node)]) {
+                if (!visited[static_cast<std::size_t>(nb)]) {
+                    queue.push_back(nb);
+                    visited[static_cast<std::size_t>(nb)] = 1;
+                    levels[static_cast<std::size_t>(nb)] =
+                        levels[static_cast<std::size_t>(node)] + 1;
+                    if (levels[static_cast<std::size_t>(nb)] > max_assigned)
+                        max_assigned = levels[static_cast<std::size_t>(nb)];
+                }
+            }
+        }
+    }
+    return explored;
+}
+
+// dist_only_func = dist.named_distances[self.output_metric] evaluated on
+// float32 rows with the full float64 numba result. For euclidean/l2 the exact
+// f4 instantiation is replicated (f4 diff, f4 square, f8 accumulate, f8
+// sqrt); other named metrics widen the rows to float64 first (documented
+// last-ulp deviation vs numba's f4 instantiations).
+std::function<double(const float*, const float*, std::size_t)>
+make_inverse_output_dist(const std::string& name, const MetricKwds& kwds) {
+    if (name == "euclidean" || name == "l2") {
+        return [](const float* x, const float* y, std::size_t n) {
+            double acc = 0.0;
+            for (std::size_t i = 0; i < n; ++i) {
+                const float d = x[i] - y[i];
+                const float sq = d * d;
+                acc += static_cast<double>(sq);
+            }
+            return std::sqrt(acc);
+        };
+    }
+    DistanceFn f;
+    try {
+        f = make_metric(name, kwds);
+    } catch (const std::exception&) {
+        throw std::invalid_argument("Unrecognized output metric: " + name);
+    }
+    return [f](const float* x, const float* y, std::size_t n) {
+        std::vector<double> xd(x, x + n);
+        std::vector<double> yd(y, y + n);
+        return f(xd.data(), yd.data(), n);
+    };
+}
+
+// umap_.py::init_update (numba njit): mean-of-original-neighbour init for the
+// appended rows, including the quirks -- n counts (neighbour, component)
+// pairs, so the "mean" is additionally divided by n_components; the
+// f4 += f4 accumulation and the f4/int64 -> float64 division are typed like
+// numba; indices < n_original are consumed with numpy wraparound. When an
+// appended point has *no* original-data neighbours (n stays 0), numba raises
+// ZeroDivisionError -- replicated as std::runtime_error (verified against the
+// reference environment).
+void init_update_port(std::vector<float>& init, int64_t n_original,
+                      int64_t n_total, int dim,
+                      const std::vector<int64_t>& indices, int64_t cols) {
+    for (int64_t i = n_original; i < n_total; ++i) {
+        int64_t n = 0;
+        for (int64_t j = 0; j < cols; ++j) {
+            for (int d = 0; d < dim; ++d) {
+                const int64_t raw = indices[static_cast<std::size_t>(
+                    i * cols + j)];
+                if (raw < n_original) {
+                    ++n;
+                    const int64_t wrapped = raw < 0 ? raw + n_total : raw;
+                    init[static_cast<std::size_t>(i * dim + d)] =
+                        init[static_cast<std::size_t>(i * dim + d)] +
+                        init[static_cast<std::size_t>(wrapped * dim + d)];
+                }
+            }
+        }
+        if (n == 0) {
+            throw std::runtime_error(
+                "ZeroDivisionError: division by zero (init_update: an "
+                "appended point has no original-data neighbours among its "
+                "k nearest, upstream numba raises)");
+        }
+        for (int d = 0; d < dim; ++d) {
+            init[static_cast<std::size_t>(i * dim + d)] = static_cast<float>(
+                static_cast<double>(
+                    init[static_cast<std::size_t>(i * dim + d)]) /
+                static_cast<double>(n));
+        }
+    }
+}
+
+}  // namespace
+
+std::vector<float> UMAP::inverse_transform(const float* X_emb,
+                                           int64_t n_queries) const {
+    if (!fitted_)
+        throw std::runtime_error(
+            "UMAP: inverse_transform() called before fit()");
+
+    // The upstream restriction chain, in its elif order (so e.g. a
+    // transform_mode="graph" model with n_components >= 8 only warns).
+    const bool has_inverse =
+        params_.metric != "precomputed" &&
+        named_distances_with_gradients().count(params_.metric) > 0;
+    if (sparse_data_) {
+        throw std::invalid_argument(
+            "Inverse transform not available for sparse input.");
+    } else if (!has_inverse) {
+        throw std::invalid_argument(
+            "Inverse transform not available for given metric.");
+    } else if (params_.densmap) {
+        throw std::invalid_argument(
+            "Inverse transform not available for densMAP.");
+    } else if (params_.n_components >= 8) {
+        warn_msg(
+            "Inverse transform works best with low dimensional embeddings."
+            " Results may be poor, or this approach to inverse transform"
+            " may fail altogether! If you need a high dimensional latent"
+            " space and inverse transform operations consider using an"
+            " autoencoder.");
+    } else if (params_.transform_mode == "graph") {
+        throw std::invalid_argument(
+            "Inverse transform not available for transform_mode = 'graph'");
+    }
+
+    // X = check_array(X, dtype=np.float32, order="C") -- always finite-checked
+    // (inverse_transform takes no ensure_all_finite kwarg upstream).
+    const int d_emb = params_.n_components;
+    check_all_finite(X_emb, n_queries, d_emb, "true");
+
+    // A transform_mode="graph" model that *warned* above (n_components >= 8
+    // short-circuits the elif chain) has no embedding: upstream dies with
+    // AttributeError at the Delaunay construction.
+    if (embedding_.size() != static_cast<std::size_t>(n_) * d_emb) {
+        throw std::runtime_error(
+            "UMAP: inverse_transform() requires an embedding (upstream "
+            "raises AttributeError when the model has none)");
+    }
+    // Guard for a C++-only hazard: upstream indexes self._sigmas by training
+    // row inside numba without bounds checks; a unique=True fit leaves sigmas
+    // sized for the deduplicated rows (undefined behaviour upstream).
+    if (static_cast<int64_t>(sigmas_.size()) != n_) {
+        throw std::runtime_error(
+            "UMAP: inverse_transform() after a unique=True fit is not "
+            "supported (upstream indexes sigmas out of bounds)");
+    }
+
+    // random_state = check_random_state(self.transform_seed);
+    // rng_state = random_state.randint(INT32_MIN, INT32_MAX, 3)
+    nnd::NumpyRandomState rs(params_.transform_seed);
+    const auto r3 = rs.rng_state3();
+
+    // deltri = scipy.spatial.Delaunay(self.embedding_, incremental=True,
+    //                                 qhull_options="QJ")
+    std::vector<double> pts(embedding_.begin(), embedding_.end());
+    const Delaunay tri = delaunay_qj(pts.data(), n_, d_emb);
+
+    // neighbors = deltri.simplices[deltri.find_simplex(X)] -- only the first
+    // vertex of each row is consumed; find_simplex = -1 (outside the
+    // triangulation) indexes the *last* simplex, numpy negative-index
+    // semantics.
+    std::vector<double> xq(static_cast<std::size_t>(n_queries) * d_emb);
+    for (std::size_t i = 0; i < xq.size(); ++i)
+        xq[i] = static_cast<double>(X_emb[i]);
+    std::vector<int32_t> fs(static_cast<std::size_t>(n_queries));
+    tri.find_simplex(xq.data(), n_queries, fs.data());
+
+    const int k = d_emb + 1;  // simplices.shape[1]
+    const int64_t n_s = tri.nsimplex;
+    std::vector<int32_t> v0(static_cast<std::size_t>(n_queries));
+    for (int64_t i = 0; i < n_queries; ++i) {
+        int64_t s = fs[static_cast<std::size_t>(i)];
+        if (s < 0) s += n_s;  // numpy wraparound (find_simplex returns >= -1)
+        v0[static_cast<std::size_t>(i)] =
+            tri.simplices[static_cast<std::size_t>(s) * k];
+    }
+
+    // adjmat: 1 at every (vertex_a, vertex_b) pair within each simplex. Only
+    // the CSR structure feeds the BFS, so per-vertex sorted unique neighbour
+    // lists replicate adjmat[node].indices exactly.
+    std::vector<std::vector<int32_t>> adj(static_cast<std::size_t>(n_));
+    for (int64_t s = 0; s < n_s; ++s) {
+        for (int a = 0; a < k; ++a) {
+            const int32_t va = tri.simplices[static_cast<std::size_t>(s) * k +
+                                             a];
+            for (int b = 0; b < k; ++b) {
+                adj[static_cast<std::size_t>(va)].push_back(
+                    tri.simplices[static_cast<std::size_t>(s) * k + b]);
+            }
+        }
+    }
+    for (auto& row : adj) {
+        std::sort(row.begin(), row.end());
+        row.erase(std::unique(row.begin(), row.end()), row.end());
+    }
+
+    const int64_t min_vertices = std::min(dim_, n_);
+
+    const auto out_dist = make_inverse_output_dist(params_.output_metric,
+                                                   params_.output_metric_kwds);
+
+    // neighborhood -> output-space distances -> np.argsort truncation.
+    std::vector<int32_t> nb_indices(
+        static_cast<std::size_t>(n_queries * min_vertices));
+    std::vector<double> dists_output_space(
+        static_cast<std::size_t>(n_queries * min_vertices));
+    for (int64_t i = 0; i < n_queries; ++i) {
+        const std::vector<int32_t> hood = breadth_first_search_port(
+            adj, v0[static_cast<std::size_t>(i)], min_vertices);
+        if (static_cast<int64_t>(hood.size()) < min_vertices) {
+            // Upstream builds a ragged array here and numpy raises trying to
+            // stack it; the graph is connected in practice so this only
+            // triggers for degenerate models.
+            throw std::runtime_error(
+                "UMAP: inverse_transform BFS neighborhood smaller than "
+                "min_vertices (upstream fails constructing a ragged array)");
+        }
+        std::vector<double> e(hood.size());
+        for (std::size_t t = 0; t < hood.size(); ++t) {
+            e[t] = out_dist(
+                X_emb + static_cast<std::size_t>(i) * d_emb,
+                embedding_.data() +
+                    static_cast<std::size_t>(hood[t]) * d_emb,
+                static_cast<std::size_t>(d_emb));
+        }
+        const std::vector<int64_t> order = plain_argsort_f64(e);
+        for (int64_t j = 0; j < min_vertices; ++j) {
+            dists_output_space[static_cast<std::size_t>(i * min_vertices + j)] =
+                e[static_cast<std::size_t>(order[static_cast<std::size_t>(j)])];
+            nb_indices[static_cast<std::size_t>(i * min_vertices + j)] =
+                hood[static_cast<std::size_t>(
+                    order[static_cast<std::size_t>(j)])];
+        }
+    }
+
+    // weights = 1 / (1 + a * distances ** (2 * b)), float64; the COO triplets
+    // stay in generation order (row-major (i, j)) for the SGD edge order.
+    const std::size_t n_edges =
+        static_cast<std::size_t>(n_queries * min_vertices);
+    std::vector<int32_t> head(n_edges);
+    std::vector<int32_t> tail(n_edges);
+    std::vector<double> weight(n_edges);
+    for (int64_t i = 0; i < n_queries; ++i) {
+        for (int64_t j = 0; j < min_vertices; ++j) {
+            const std::size_t e = static_cast<std::size_t>(
+                i * min_vertices + j);
+            head[e] = static_cast<int32_t>(i);
+            tail[e] = nb_indices[e];
+            weight[e] =
+                1.0 / (1.0 + a_ * std::pow(dists_output_space[e], 2.0 * b_));
+        }
+    }
+
+    // csr_graph = normalize(graph.tocsr(), norm="l1") -- tocsr sorts each
+    // row's columns (they are unique, so duplicate summing never triggers);
+    // sklearn's inplace_csr_row_normalize_l1 divides by the absolute row sum
+    // (rows with sum 0 are left alone). init_transform then accumulates
+    // weights[i, j] * raw_data[inds[i, j]] with a float32 store per step.
+    std::vector<float> inv_transformed_points(
+        static_cast<std::size_t>(n_queries) * dim_, 0.0f);
+    std::vector<int64_t> csr_order(static_cast<std::size_t>(min_vertices));
+    for (int64_t i = 0; i < n_queries; ++i) {
+        std::iota(csr_order.begin(), csr_order.end(), 0);
+        std::sort(csr_order.begin(), csr_order.end(),
+                  [&](int64_t x, int64_t y) {
+                      return tail[static_cast<std::size_t>(
+                                 i * min_vertices + x)] <
+                             tail[static_cast<std::size_t>(
+                                 i * min_vertices + y)];
+                  });
+        double row_sum = 0.0;
+        for (int64_t j = 0; j < min_vertices; ++j)
+            row_sum += std::fabs(
+                weight[static_cast<std::size_t>(i * min_vertices + j)]);
+        for (int64_t j = 0; j < min_vertices; ++j) {
+            const std::size_t e = static_cast<std::size_t>(
+                i * min_vertices + csr_order[static_cast<std::size_t>(j)]);
+            const double w =
+                row_sum == 0.0 ? weight[e] : weight[e] / row_sum;
+            const float* src =
+                raw_data_.data() + static_cast<std::size_t>(tail[e]) * dim_;
+            float* dst = inv_transformed_points.data() +
+                         static_cast<std::size_t>(i) * dim_;
+            for (int64_t d = 0; d < dim_; ++d) {
+                dst[d] = static_cast<float>(
+                    static_cast<double>(dst[d]) +
+                    w * static_cast<double>(src[d]));
+            }
+        }
+    }
+
+    // The transform n_epochs rule (100 / 30 on the *query* count, or
+    // n_epochs // 3.0; a list n_epochs dies in the floor division upstream).
+    if (params_.n_epochs_list.has_value()) {
+        throw std::invalid_argument(
+            "inverse_transform: n_epochs as a list is not supported (the "
+            "reference raises a TypeError)");
+    }
+    int n_epochs;
+    if (params_.n_epochs.has_value()) {
+        n_epochs = static_cast<int>(
+            std::floor(static_cast<double>(*params_.n_epochs) / 3.0));
+    } else {
+        n_epochs = n_queries <= 10000 ? 100 : 30;
+    }
+
+    // No weight filtering (upstream has it commented out).
+    const std::vector<double> epochs_per_sample =
+        make_epochs_per_sample(weight.data(), weight.size(), n_epochs);
+
+    // optimize_layout_inverse against the raw data with
+    // named_distances_with_gradients[self.metric] at initial_alpha / 4.
+    std::vector<float> tail_data = raw_data_;  // move_other=False copy
+    const OutputMetricFn inverse_metric =
+        make_output_metric(params_.metric, params_.metric_kwds);
+    int64_t rng_state[3] = {r3[0], r3[1], r3[2]};
+    optimize_layout_inverse(
+        inv_transformed_points.data(), static_cast<int>(n_queries),
+        tail_data.data(), static_cast<int>(dim_), head, tail, weight.data(),
+        sigmas_.data(), rhos_.data(), n_epochs, static_cast<int>(n_),
+        epochs_per_sample, a_, b_, rng_state, inverse_metric,
+        params_.repulsion_strength, initial_alpha_ / 4.0,
+        static_cast<double>(params_.negative_sample_rate),
+        /*move_other=*/false);
+
+    return inv_transformed_points;
+}
+
+UMAP& UMAP::update(const float* X_new, int64_t n_new, int64_t n_features) {
+    if (!fitted_)
+        throw std::runtime_error("UMAP: update() called before fit()");
+    if (sparse_data_)
+        throw std::invalid_argument(
+            "UMAP: model was fit with sparse data; use the CSR update "
+            "overload");
+    // X = check_array(X, dtype=np.float32, ..., ensure_all_finite=...)
+    check_all_finite(X_new, n_new, n_features, params_.ensure_all_finite);
+    return update_impl(X_new, nullptr, nullptr, nullptr, n_new, n_features);
+}
+
+UMAP& UMAP::update(const int32_t* indptr, const int32_t* indices,
+                   const float* data, int64_t n_new, int64_t n_features) {
+    if (!fitted_)
+        throw std::runtime_error("UMAP: update() called before fit()");
+    if (!sparse_data_)
+        throw std::invalid_argument(
+            "UMAP: model was fit with dense data; use the dense update "
+            "overload");
+    check_all_finite(data, indptr[n_new], 1, params_.ensure_all_finite);
+    return update_impl(nullptr, indptr, indices, data, n_new, n_features);
+}
+
+UMAP& UMAP::update_impl(const float* X_new, const int32_t* new_indptr,
+                        const int32_t* new_indices, const float* new_values,
+                        int64_t n_new, int64_t n_features) {
+    // random_state = check_random_state(self.transform_seed);
+    // rng_state = random_state.randint(INT32_MIN, INT32_MAX, 3) -- three
+    // draws that update() never uses again (simplicial_set_embedding draws
+    // its own rng_state from the same stream later).
+    nnd::NumpyRandomState rs(params_.transform_seed);
+    (void)rs.rng_state3();
+
+    const int64_t original_size = n_;
+
+    if (params_.metric == "precomputed")
+        throw std::invalid_argument(
+            "Update does not currently support precomputed metrics");
+    if (supervised_)
+        throw std::invalid_argument(
+            "Updating supervised models is not currently supported");
+    // C++-only guards for paths that are undefined behaviour / uncaught
+    // errors upstream (documented deviations):
+    if (params_.densmap || params_.output_dens)
+        throw std::runtime_error(
+            "UMAP: update() with densmap/output_dens is not supported "
+            "(upstream reads a stale _densmap_kwds['graph_dists'] of the old "
+            "size inside numba -- undefined behaviour)");
+    if (params_.transform_mode != "embedding")
+        throw std::runtime_error(
+            "UMAP: update() requires an embedding (upstream raises "
+            "AttributeError for transform_mode='graph' models)");
+    if (!small_data_ && params_.unique)
+        throw std::runtime_error(
+            "UMAP: update() after a unique=True standard fit is not "
+            "supported (upstream raises a broadcast error)");
+    if (n_features != dim_)
+        throw std::invalid_argument(
+            "UMAP: update() data must have " + std::to_string(dim_) +
+            " features to match the fit data");
+
+    const int64_t n_total = original_size + n_new;
+    const int dim_out = params_.n_components;
+
+    FuzzySimplicialSetResult fuzzy;
+    std::vector<int64_t> init_knn;  // knn indices consumed by init_update
+    int64_t init_knn_cols = 0;
+    // When the small->large transition builds a fresh search index, that
+    // index holds *this* transform_seed stream from now on (upstream keeps
+    // the RandomState instance inside NNDescent).
+    bool index_stream_is_rs = false;
+
+    if (small_data_) {
+        // self._raw_data = np.vstack([self._raw_data, X])
+        if (sparse_data_) {
+            for (int64_t r = 0; r < n_new; ++r) {
+                for (int32_t p = new_indptr[r]; p < new_indptr[r + 1]; ++p) {
+                    raw_indices_.push_back(new_indices[p]);
+                    raw_values_.push_back(new_values[p]);
+                }
+                raw_indptr_.push_back(
+                    static_cast<int32_t>(raw_indices_.size()));
+            }
+        } else {
+            raw_data_.insert(raw_data_.end(), X_new,
+                             X_new + static_cast<std::size_t>(n_new) * dim_);
+        }
+        n_ = n_total;
+
+        if (n_total < 4096) {
+            // Still small data: full pairwise recompute +
+            // fuzzy_simplicial_set(dmat, self._n_neighbors, "precomputed").
+            std::vector<float> dmat;
+            if (sparse_data_) {
+                dmat = sparse_pairwise_distances_sklearn(
+                    raw_indptr_.data(), raw_indices_.data(),
+                    raw_values_.data(), n_total, raw_indptr_.data(),
+                    raw_indices_.data(), raw_values_.data(), n_total,
+                    params_.metric, /*x_is_y=*/true);
+            } else {
+                dmat = pairwise_distances_sklearn(
+                    raw_data_.data(), n_total, raw_data_.data(), n_total,
+                    dim_, params_.metric, /*x_is_y=*/true,
+                    params_.metric_kwds);
+            }
+            // No disconnection_distance masking and no inf -> -1 pruning in
+            // update() (unlike fit).
+            std::vector<int32_t> kidx(
+                static_cast<std::size_t>(n_total) * n_neighbors_);
+            std::vector<float> kdst(
+                static_cast<std::size_t>(n_total) * n_neighbors_);
+            fast_knn_from_dmat(dmat, n_total, n_total, n_neighbors_,
+                               kidx.data(), kdst.data());
+            fuzzy = fuzzy_simplicial_set(
+                static_cast<int>(n_total), kidx.data(), kdst.data(),
+                n_neighbors_, params_.set_op_mix_ratio,
+                params_.local_connectivity, /*apply_set_operations=*/true,
+                /*return_dists=*/false);
+            // knn_indices = np.argsort(dmat)[:, : self.n_neighbors] (note:
+            // self.n_neighbors, not _n_neighbors; plain argsort -- exact-tie
+            // order deviation documented). self._knn_indices/_knn_dists stay
+            // the *fit-time* arrays, exactly like upstream.
+            init_knn_cols =
+                std::min<int64_t>(params_.n_neighbors, n_total);
+            init_knn.resize(static_cast<std::size_t>(n_total) *
+                            init_knn_cols);
+            std::vector<int64_t> row_order(static_cast<std::size_t>(n_total));
+            for (int64_t i = 0; i < n_total; ++i) {
+                const float* row =
+                    dmat.data() + static_cast<std::size_t>(i) * n_total;
+                std::iota(row_order.begin(), row_order.end(), 0);
+                std::stable_sort(row_order.begin(), row_order.end(),
+                                 [&](int64_t a, int64_t b) {
+                                     return row[a] < row[b];
+                                 });
+                for (int64_t j = 0; j < init_knn_cols; ++j)
+                    init_knn[static_cast<std::size_t>(i * init_knn_cols + j)] =
+                        row_order[static_cast<std::size_t>(j)];
+            }
+        } else {
+            // Now large data: switch to the standard branch with a fresh
+            // search index continuing this (transform_seed) stream.
+            small_data_ = false;
+            if (sparse_data_) {
+                sparse_knn_index_ =
+                    std::make_shared<spnnd::SparsePreparedIndex>(
+                        spnnd::SparsePreparedIndex::build(
+                            raw_indptr_.data(), raw_indices_.data(),
+                            raw_values_.data(), n_total, dim_, n_neighbors_,
+                            params_.metric, rs, params_.verbose));
+                knn_indices_ = sparse_knn_index_->knn_indices();
+                knn_dists_ = sparse_knn_index_->knn_dists();
+            } else {
+                knn_index_ = std::make_shared<nnd::PreparedIndex>(
+                    nnd::PreparedIndex::build(
+                        raw_data_.data(), n_total, dim_, n_neighbors_,
+                        params_.metric, params_.metric_kwds, rs,
+                        params_.verbose));
+                knn_indices_ = knn_index_->knn_indices();
+                knn_dists_ = knn_index_->knn_dists();
+            }
+            knn_cols_ = n_neighbors_;
+            index_stream_is_rs = true;
+            fuzzy = fuzzy_simplicial_set(
+                static_cast<int>(n_total), knn_indices_.data(),
+                knn_dists_.data(), params_.n_neighbors,
+                params_.set_op_mix_ratio, params_.local_connectivity,
+                /*apply_set_operations=*/true, /*return_dists=*/false,
+                static_cast<int>(knn_cols_));
+            init_knn.assign(knn_indices_.begin(), knn_indices_.end());
+            init_knn_cols = knn_cols_;
+        }
+    } else {
+        // Standard branch: NNDescent.update on the persisted index.
+        if (sparse_data_) {
+            // pynndescent raises NotImplementedError for sparse updates.
+            throw std::runtime_error("Sparse update not complete yet");
+        }
+        if (!knn_index_) {
+            // metric="precomputed" is caught above; this is the
+            // precomputed_knn-without-search-index case (upstream:
+            // AttributeError on None.prepare()).
+            throw std::runtime_error(
+                "UMAP: update() requires a search index (the model was fit "
+                "with precomputed_knn without one)");
+        }
+        if (!index_rs_.has_value()) {
+            throw std::runtime_error(
+                "UMAP: update() search-index RandomState missing");
+        }
+        // self._knn_search_index.prepare() is a no-op (built indexes are
+        // always prepared here); .update(X) continues the persisted stream.
+        knn_index_->update(X_new, n_new, *index_rs_, params_.verbose);
+        // self._raw_data = self._knn_search_index._raw_data -- NOTE: the
+        // index has re-prepared, so this is the *vertex-order permuted* data
+        // (upstream quirk faithfully preserved; it scrambles _raw_data
+        // relative to embedding_ for later inverse_transform calls).
+        raw_data_ = knn_index_->stored_data();
+        n_ = n_total;
+        knn_indices_ = knn_index_->knn_indices();
+        knn_dists_ = knn_index_->knn_dists();
+        knn_cols_ = n_neighbors_;
+        fuzzy = fuzzy_simplicial_set(
+            static_cast<int>(n_total), knn_indices_.data(),
+            knn_dists_.data(), params_.n_neighbors, params_.set_op_mix_ratio,
+            params_.local_connectivity, /*apply_set_operations=*/true,
+            /*return_dists=*/false, static_cast<int>(knn_cols_));
+        init_knn.assign(knn_indices_.begin(), knn_indices_.end());
+        init_knn_cols = knn_cols_;
+    }
+
+    graph_ = fuzzy.graph;
+    sigmas_ = std::move(fuzzy.sigmas);
+    rhos_ = std::move(fuzzy.rhos);
+
+    // init = zeros((n_total, n_components)); init[:original_size] =
+    // self.embedding_; init_update(init, original_size, knn_indices).
+    std::vector<float> init(static_cast<std::size_t>(n_total) * dim_out,
+                            0.0f);
+    std::copy(embedding_.begin(), embedding_.end(), init.begin());
+    init_update_port(init, original_size, n_total, dim_out, init_knn,
+                     init_knn_cols);
+
+    // n_epochs = 0 if self.n_epochs is None else self.n_epochs, handed to
+    // simplicial_set_embedding (0 -> the 500/200 default); the epoch filter
+    // writes through into graph_ via the shared-buffer quirk, as in fit.
+    SparseMatrix g = graph_;
+    const std::vector<int>* epochs_list =
+        params_.n_epochs_list.has_value() ? &*params_.n_epochs_list : nullptr;
+    int requested_epochs = params_.n_epochs.value_or(-1);
+    if (epochs_list != nullptr) {
+        requested_epochs =
+            *std::max_element(epochs_list->begin(), epochs_list->end());
+    }
+    const int n_epochs =
+        resolve_epochs_and_filter_graph(g, requested_epochs, 0, &graph_);
+
+    // simplicial_set_embedding's ndarray-init branch (KDTree jitter when the
+    // init has duplicate rows), then the rescale + SGD.
+    fit_init_ = ndarray_init_with_jitter(std::move(init), n_total, dim_out,
+                                         rs);
+    const auto r3 = rs.rng_state3();
+    const int64_t rng_state[3] = {r3[0], r3[1], r3[2]};
+
+    const bool euclidean_output = (params_.output_metric == "euclidean" ||
+                                   params_.output_metric == "l2");
+    OutputMetricFn out_metric;
+    if (!euclidean_output)
+        out_metric = make_output_metric(params_.output_metric,
+                                        params_.output_metric_kwds);
+    std::vector<std::vector<float>> emb_list;
+    embedding_ = simplicial_set_embedding_from_init(
+        g, fit_init_.data(), dim_out, a_, b_, rng_state, n_epochs,
+        params_.repulsion_strength, initial_alpha_,
+        static_cast<double>(params_.negative_sample_rate),
+        /*parallel=*/!params_.random_state.has_value(),
+        /*graph_prefiltered=*/true, epochs_list,
+        epochs_list != nullptr ? &emb_list : nullptr,
+        /*densmap_kwds=*/nullptr,
+        euclidean_output ? nullptr : &out_metric);
+    // No disconnected-NaN masking, no unique inverse expansion and no
+    // embedding_list_ refresh in update() (aux embedding snapshots are
+    // discarded like upstream's unused aux_data).
+
+    if (index_stream_is_rs) index_rs_ = rs;
+    return *this;
+}
+
+// -----------------------------------------------------------------------------
+
 // --- supervised-sparse additions --------------------------------------------
 
 MembershipStrengths UMAP::transform_membership_sparse(
@@ -2048,26 +2751,8 @@ MembershipStrengths UMAP::transform_membership_sparse(
         /*return_dists=*/false, /*bipartite=*/true);
 }
 
-namespace {
-
-// The transform input-hash shortcut for sparse queries: same CSR content as
-// the training data.
-bool same_csr(const int32_t* q_indptr, const int32_t* q_indices,
-              const float* q_data, int64_t n_queries,
-              const std::vector<int32_t>& indptr,
-              const std::vector<int32_t>& indices,
-              const std::vector<float>& data) {
-    if (n_queries + 1 != static_cast<int64_t>(indptr.size())) return false;
-    for (int64_t i = 0; i <= n_queries; ++i) {
-        if (q_indptr[i] != indptr[static_cast<std::size_t>(i)]) return false;
-    }
-    const std::size_t nnz = indices.size();
-    return std::memcmp(q_indices, indices.data(), nnz * sizeof(int32_t)) ==
-               0 &&
-           std::memcmp(q_data, data.data(), nnz * sizeof(float)) == 0;
-}
-
-}  // namespace
+// The sparse transform input-hash shortcut compares against the *fit-time*
+// hash (update() never refreshes _input_hash upstream).
 
 std::vector<float> UMAP::transform(const int32_t* q_indptr,
                                    const int32_t* q_indices,
@@ -2090,8 +2775,8 @@ std::vector<float> UMAP::transform(const int32_t* q_indptr,
             "overload");
 
     // Input-hash shortcut: transforming the training data returns embedding_.
-    if (same_csr(q_indptr, q_indices, q_data, n_queries, raw_indptr_,
-                 raw_indices_, raw_values_)) {
+    if (n_queries == input_hash_rows_ &&
+        csr_fnv1a64(q_indptr, q_indices, q_data, n_queries) == input_hash_) {
         return embedding_;
     }
     if (params_.densmap)
@@ -2127,8 +2812,8 @@ SparseMatrix UMAP::transform_graph(const int32_t* q_indptr,
         throw std::invalid_argument(
             "UMAP: model was fit with dense data; use the dense "
             "transform_graph overload");
-    if (same_csr(q_indptr, q_indices, q_data, n_queries, raw_indptr_,
-                 raw_indices_, raw_values_)) {
+    if (n_queries == input_hash_rows_ &&
+        csr_fnv1a64(q_indptr, q_indices, q_data, n_queries) == input_hash_) {
         return graph_;
     }
     if (params_.densmap)
