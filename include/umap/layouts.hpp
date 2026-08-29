@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "umap/device.hpp"           // Device (phase4 GPU dispatch)
 #include "umap/layouts_generic.hpp"  // OutputMetricFn (generic-output SGD)
 #include "umap/sparse_matrix.hpp"
 
@@ -174,6 +175,15 @@ void optimize_layout_euclidean(
 // numpy_int64_epochs selects the composite operators' epochs-per-sample
 // flavour (make_epochs_per_sample_i64 above): they pass an np.int64 n_epochs
 // whose numpy promotion computes n_samples in float64.
+//
+// --- phase4 additions ---
+// device selects the SGD backend for the euclidean branch: Device::GPU routes
+// the epoch loop to metal::gpu_optimize_layout_euclidean (quality parity, not
+// bitwise; see include/umap/metal/gpu_layout.hpp) when the build has Metal
+// and a device exists, falling back to the CPU loop with a stderr note
+// otherwise. densmap / epochs_list / non-euclidean output requests always run
+// on the CPU regardless of device (the kernel does not cover them; UMAP::fit
+// warns before asking).
 std::vector<float> simplicial_set_embedding_from_init(
     const SparseMatrix& graph, const float* init_embedding, int n_components,
     double a, double b, const int64_t rng_state[3], int n_epochs = -1,
@@ -184,7 +194,7 @@ std::vector<float> simplicial_set_embedding_from_init(
     std::vector<std::vector<float>>* embedding_list = nullptr,
     const DensmapParams* densmap_kwds = nullptr,
     const OutputMetricFn* output_metric = nullptr,
-    bool numpy_int64_epochs = false);
+    bool numpy_int64_epochs = false, Device device = Device::CPU);
 
 // --- umap-class additions ---------------------------------------------------
 // The n_epochs-resolution + weight-filtering prologue of

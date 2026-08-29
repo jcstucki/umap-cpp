@@ -28,6 +28,11 @@
 // --- inverse-update additions -----------------------------------------------
 #include "umap/delaunay.hpp"
 // ----------------------------------------------------------------------------
+// --- phase4 additions --------------------------------------------------------
+#ifdef UMAP_ENABLE_METAL
+#include "umap/metal/gpu_knn.hpp"
+#endif
+// -----------------------------------------------------------------------------
 
 namespace umap {
 
@@ -1478,6 +1483,61 @@ UMAP& UMAP::fit_impl(const float* X, int64_t n_samples, int64_t n_features,
         small_data_ = true;
         knn_index_.reset();
         sparse_knn_index_.reset();
+        // --- phase4 additions ------------------------------------------------
+        // Device::GPU exact kNN: the Metal brute-force kernel replaces the
+        // sklearn pairwise replication for dense euclidean/l2/cosine with
+        // n_neighbors <= 64. GPU distances are float32 (the CPU replica is
+        // float64-accumulated) and exact ties resolve in device order, so a
+        // GPU fit is bitwise-different from the sklearn replication -- which
+        // is why this is gated behind the device flag (seeded-parity users
+        // stay on the CPU default). The disconnection mask is applied to the
+        // kNN rows afterwards (the CPU path masks the full distance matrix
+        // first): the surviving edges are identical, but edges_removed_ then
+        // counts only kNN entries rather than all n^2 pairs.
+        bool gpu_knn_done = false;
+        if (params_.device == Device::GPU) {
+            const bool gpu_metric_euclid =
+                params_.metric == "euclidean" || params_.metric == "l2";
+            const bool gpu_metric_cosine = params_.metric == "cosine";
+            if (!sparse_data_ && (gpu_metric_euclid || gpu_metric_cosine) &&
+                n_neighbors_ <= 64 && metal_available()) {
+#ifdef UMAP_ENABLE_METAL
+                knn_cols_ = n_neighbors_;
+                knn_indices_.assign(
+                    static_cast<std::size_t>(n_index) * n_neighbors_, -1);
+                knn_dists_.assign(
+                    static_cast<std::size_t>(n_index) * n_neighbors_, 0.0f);
+                gpu_knn_done = metal::gpu_brute_force_knn(
+                    X_indexed, static_cast<int>(n_index),
+                    static_cast<int>(n_features), X_indexed,
+                    static_cast<int>(n_index), static_cast<int>(n_neighbors_),
+                    gpu_metric_cosine ? metal::KnnMetric::cosine
+                                      : metal::KnnMetric::euclidean,
+                    knn_indices_.data(), knn_dists_.data());
+                if (gpu_knn_done && std::isfinite(disconnection_distance_)) {
+                    for (std::size_t i = 0; i < knn_dists_.size(); ++i) {
+                        if (knn_indices_[i] >= 0 &&
+                            static_cast<double>(knn_dists_[i]) >=
+                                disconnection_distance_) {
+                            ++edges_removed_;
+                            knn_indices_[i] = -1;
+                            knn_dists_[i] =
+                                std::numeric_limits<float>::infinity();
+                        }
+                    }
+                }
+#endif
+            }
+            if (!gpu_knn_done) {
+                warn_msg(
+                    "UMAP: device=GPU requested but the Metal exact-kNN "
+                    "kernel covers only dense euclidean/l2/cosine with "
+                    "n_neighbors <= 64 (and needs a Metal device); using the "
+                    "CPU pairwise path.");
+            }
+        }
+        if (!gpu_knn_done) {
+        // ---------------------------------------------------------------------
         std::vector<float> dmat;
         if (params_.metric == "precomputed") {
             // pairwise_distances(X, metric="precomputed") is a validated
@@ -1521,6 +1581,9 @@ UMAP& UMAP::fit_impl(const float* X, int64_t n_samples, int64_t n_features,
         for (std::size_t i = 0; i < knn_dists_.size(); ++i) {
             if (std::isinf(knn_dists_[i])) knn_indices_[i] = -1;
         }
+        // --- phase4 additions ------------------------------------------------
+        }  // if (!gpu_knn_done): end of the CPU pairwise/fast_knn path
+        // ---------------------------------------------------------------------
         fuzzy = fuzzy_simplicial_set(
             static_cast<int>(n_index), knn_indices_.data(), knn_dists_.data(),
             n_neighbors_, params_.set_op_mix_ratio, params_.local_connectivity,
@@ -1710,6 +1773,33 @@ UMAP& UMAP::fit_impl(const float* X, int64_t n_samples, int64_t n_features,
                                             params_.output_metric_kwds);
         // --------------------------------------------------------------------
 
+        // --- phase4 additions ------------------------------------------------
+        // Runtime device dispatch for the layout SGD. The Metal kernel covers
+        // exactly the standard euclidean-output fit; unsupported combinations
+        // fall back to the (bit-exact) CPU path with a stderr note. GPU runs
+        // are quality-level parity only -- seeded bitwise reproducibility
+        // requires Device::CPU (the default).
+        Device sgd_device = Device::CPU;
+        if (params_.device == Device::GPU) {
+            const char* cpu_reason = nullptr;
+            if (params_.densmap)
+                cpu_reason = "densmap is CPU-only";
+            else if (!euclidean_output)
+                cpu_reason = "non-euclidean output metrics are CPU-only";
+            else if (epochs_list != nullptr)
+                cpu_reason =
+                    "n_epochs lists (embedding snapshots) are CPU-only";
+            else if (!metal_available())
+                cpu_reason = "no Metal device/metallib available at runtime";
+            if (cpu_reason == nullptr) {
+                sgd_device = Device::GPU;
+            } else {
+                warn_msg(std::string("UMAP: device=GPU requested but ") +
+                         cpu_reason + "; running the layout SGD on the CPU.");
+            }
+        }
+        // ---------------------------------------------------------------------
+
         std::vector<std::vector<float>> emb_list;
         embedding_ = simplicial_set_embedding_from_init(
             g, init_emb.data(), params_.n_components, a_, b_, rng_state,
@@ -1719,7 +1809,8 @@ UMAP& UMAP::fit_impl(const float* X, int64_t n_samples, int64_t n_features,
             /*graph_prefiltered=*/true, epochs_list,
             epochs_list != nullptr ? &emb_list : nullptr,
             params_.densmap ? &dens_kwds : nullptr,
-            euclidean_output ? nullptr : &out_metric);
+            euclidean_output ? nullptr : &out_metric,
+            /*numpy_int64_epochs=*/false, sgd_device);
 
         // --- densmap additions ----------------------------------------------
         // simplicial_set_embedding's `if output_dens:` epilogue (runs on the
@@ -2095,15 +2186,49 @@ MembershipStrengths UMAP::transform_membership(const float* X_new,
         }
     } else if (small_data_) {
         cols = n_neighbors_;
+        indices.resize(static_cast<std::size_t>(n_queries) * cols);
+        dists.resize(static_cast<std::size_t>(n_queries) * cols);
+        // --- phase4 additions ------------------------------------------------
+        // Device::GPU exact kNN of the queries vs the training data (same
+        // scope and deviations as the fit-time small-data path; the
+        // disconnection pruning below applies to these arrays either way).
+        bool gpu_knn_done = false;
+        if (params_.device == Device::GPU) {
+            const bool gpu_metric_euclid =
+                params_.metric == "euclidean" || params_.metric == "l2";
+            const bool gpu_metric_cosine = params_.metric == "cosine";
+            if ((gpu_metric_euclid || gpu_metric_cosine) && cols <= 64 &&
+                metal_available()) {
+#ifdef UMAP_ENABLE_METAL
+                gpu_knn_done = metal::gpu_brute_force_knn(
+                    raw_data_.data(), static_cast<int>(n_),
+                    static_cast<int>(dim_), X_new, static_cast<int>(n_queries),
+                    static_cast<int>(cols),
+                    gpu_metric_cosine ? metal::KnnMetric::cosine
+                                      : metal::KnnMetric::euclidean,
+                    indices.data(), dists.data());
+#endif
+            }
+            if (!gpu_knn_done) {
+                warn_msg(
+                    "UMAP: device=GPU requested but the Metal exact-kNN "
+                    "kernel covers only dense euclidean/l2/cosine with "
+                    "n_neighbors <= 64 (and needs a Metal device); using the "
+                    "CPU pairwise path.");
+            }
+        }
+        if (!gpu_knn_done) {
+        // ---------------------------------------------------------------------
         const std::vector<float> dmat = pairwise_distances_sklearn(
             X_new, n_queries, raw_data_.data(), n_, dim_, params_.metric,
             /*x_is_y=*/false, params_.metric_kwds);
-        indices.resize(static_cast<std::size_t>(n_queries) * cols);
-        dists.resize(static_cast<std::size_t>(n_queries) * cols);
         // argpartition + argsort: k smallest per row, sorted by distance
         // (ties by ascending index).
         fast_knn_from_dmat(dmat, n_queries, n_, cols, indices.data(),
                            dists.data());
+        // --- phase4 additions ------------------------------------------------
+        }  // if (!gpu_knn_done)
+        // ---------------------------------------------------------------------
     } else {
         cols = params_.n_neighbors;
         // epsilon = 0.24 if self._knn_search_index._angular_trees else 0.12
@@ -2234,6 +2359,17 @@ std::vector<float> UMAP::transform(const float* X_new,
 
 std::vector<float> UMAP::transform_from_membership(
     const MembershipStrengths& ms, int64_t n_queries) const {
+    // --- phase4 additions ----------------------------------------------------
+    // transform's SGD (move_other=false against the frozen training
+    // embedding) is not routed to the Metal kernel: GPU quality parity was
+    // validated for the fit configuration only. Note once per call and run
+    // the CPU path.
+    if (params_.device == Device::GPU) {
+        warn_msg(
+            "UMAP: device=GPU covers fit's layout SGD only; transform's "
+            "optimization runs on the CPU.");
+    }
+    // -------------------------------------------------------------------------
     const int dim_out = params_.n_components;
     nnd::NumpyRandomState rs(params_.transform_seed);
     const auto r3 = rs.rng_state3();

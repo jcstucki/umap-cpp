@@ -34,7 +34,10 @@
 #include <cmath>
 #include <cstdint>
 #include <functional>
+#include <iosfwd>
 #include <random>
+#include <sstream>    // phase4: NumpyRandomState state (de)serialisation
+#include <stdexcept>  // phase4: from_state validation
 #include <string>
 #include <vector>
 
@@ -106,6 +109,29 @@ class NumpyRandomState {
 
     // RandomState.normal(loc, scale) for scalars (rk_normal).
     double normal(double loc, double scale) { return loc + scale * gauss(); }
+
+    // --- phase4 additions: model persistence --------------------------------
+    // Full generator state as text: std::mt19937's stream format followed by
+    // the rk_gauss cache (max_digits10 decimal digits -- exact double round
+    // trip). Consumed by the versioned model file (src/model_io.cpp).
+    std::string save_state() const {
+        std::ostringstream oss;
+        oss.precision(17);
+        oss << mt_ << ' ' << (has_gauss_ ? 1 : 0) << ' ' << gauss_;
+        return oss.str();
+    }
+    static NumpyRandomState from_state(const std::string& state) {
+        NumpyRandomState rs(0);
+        std::istringstream iss(state);
+        int hg = 0;
+        iss >> rs.mt_ >> hg >> rs.gauss_;
+        if (iss.fail())
+            throw std::invalid_argument(
+                "NumpyRandomState::from_state: malformed state string");
+        rs.has_gauss_ = hg != 0;
+        return rs;
+    }
+    // ------------------------------------------------------------------------
 
  private:
     std::mt19937 mt_;
@@ -457,6 +483,18 @@ class PreparedIndex {
     // by vertex_order (row i is original row vertex_order()[i]). UMAP.update
     // reads `self._knn_search_index._raw_data` at exactly this state.
     const std::vector<float>& stored_data() const { return data_; }
+    // -------------------------------------------------------------------------
+
+    // --- phase4 additions: model persistence ---------------------------------
+    // Raw binary dump / restore of the full prepared state (reordered data,
+    // search graph, flat tree, search_rng_state, kNN graph, update
+    // bookkeeping) for the versioned model file; the metric closure is
+    // reconstructed from the model's metric name + kwds at load. Format
+    // details in src/model_io.cpp.
+    void serialize(std::ostream& os) const;
+    static PreparedIndex deserialize(std::istream& is,
+                                     const std::string& metric,
+                                     const MetricKwds& metric_kwds);
     // -------------------------------------------------------------------------
 
     // Fit-time kNN graph in original data order (NNDescent.neighbor_graph:

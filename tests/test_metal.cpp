@@ -21,6 +21,10 @@
 #include "umap/metal/gpu_knn.hpp"
 #include "umap/metal/gpu_layout.hpp"
 #include "umap/sparse_matrix.hpp"
+// --- phase4 additions --------------------------------------------------------
+#include "trustworthiness.hpp"
+#include "umap/umap.hpp"
+// -----------------------------------------------------------------------------
 
 #define METAL_REQUIRED()                                        \
     do {                                                        \
@@ -415,3 +419,171 @@ TEST_CASE("gpu sgd timing on 5k points" * doctest::skip()) {
                                << " ms (" << n_epochs << " epochs)");
     for (float v : gpu_emb) CHECK(std::isfinite(v));
 }
+
+// --- phase4 additions --------------------------------------------------------
+// Runtime device dispatch through the UMAP class (UMAPParams::device).
+
+namespace {
+
+// n_per x len(centers) points, gaussian spread 1.0 around 6-d centers.
+std::vector<float> three_cluster_data(int n_per, uint64_t seed,
+                                      double separation = 30.0) {
+    TestRng rng(seed);
+    const int dim = 6;
+    std::vector<std::array<double, 6>> centers = {
+        {0, 0, 0, 0, 0, 0},
+        {separation, 0, 0, separation, 0, 0},
+        {0, separation, 0, 0, separation, 0}};
+    std::vector<float> X;
+    X.reserve(static_cast<std::size_t>(n_per) * centers.size() * dim);
+    for (const auto& c : centers) {
+        for (int i = 0; i < n_per; ++i) {
+            for (int d = 0; d < dim; ++d)
+                X.push_back(static_cast<float>(c[d] + rng.normal()));
+        }
+    }
+    return X;
+}
+
+}  // namespace
+
+TEST_CASE("phase4 dispatch: device=GPU fit reaches CPU-comparable "
+          "trustworthiness on 3 clusters") {
+    // The default device must be CPU (every bit-exact golden in the suite
+    // fits with UMAPParams{} and proves the CPU path is untouched).
+    CHECK(umap::UMAPParams{}.device == umap::Device::CPU);
+    METAL_REQUIRED();
+
+    const int n_per = 80, dim = 6, n = 3 * n_per;
+    const auto X = three_cluster_data(n_per, 20260828);
+
+    umap::UMAPParams p;
+    p.n_neighbors = 10;
+    p.init = "random";
+    p.random_state = 42;
+
+    umap::UMAP cpu_model(p);
+    cpu_model.fit(X.data(), n, dim);
+
+    p.device = umap::Device::GPU;
+    umap::UMAP gpu_model(p);
+    gpu_model.fit(X.data(), n, dim);
+
+    // Small-data exact kNN on the GPU: neighbour indices identical to the
+    // sklearn-replica CPU path (no exact ties in gaussian data), distances to
+    // float32-kernel precision.
+    REQUIRE(gpu_model.knn_indices().size() == cpu_model.knn_indices().size());
+    std::size_t idx_mismatches = 0;
+    float max_dist_diff = 0.0f;
+    for (std::size_t i = 0; i < cpu_model.knn_indices().size(); ++i) {
+        if (gpu_model.knn_indices()[i] != cpu_model.knn_indices()[i])
+            ++idx_mismatches;
+        max_dist_diff =
+            std::max(max_dist_diff, std::fabs(gpu_model.knn_dists()[i] -
+                                              cpu_model.knn_dists()[i]));
+    }
+    CHECK(idx_mismatches == 0);
+    CHECK(max_dist_diff <= 1e-3f);
+
+    for (float v : gpu_model.embedding()) CHECK(std::isfinite(v));
+    const double trust_cpu = testutil::trustworthiness(
+        X.data(), n, dim, cpu_model.embedding().data(), 2, 10);
+    const double trust_gpu = testutil::trustworthiness(
+        X.data(), n, dim, gpu_model.embedding().data(), 2, 10);
+    CAPTURE(trust_cpu);
+    CAPTURE(trust_gpu);
+    MESSAGE("trustworthiness — CPU: " << trust_cpu << ", GPU: " << trust_gpu);
+    CHECK(trust_gpu >= 0.90);
+    CHECK(trust_gpu >= trust_cpu - 0.05);
+
+    // transform with device=GPU (GPU kNN + CPU move_other=false SGD): every
+    // held-out query should land nearer its own cluster's embedded centroid
+    // than any other (allow a couple of stragglers).
+    const int nq_per = 10, nq = 3 * nq_per;
+    const auto Q = three_cluster_data(nq_per, 977001);
+    const auto q_emb = gpu_model.transform(Q.data(), nq);
+    REQUIRE(q_emb.size() == static_cast<std::size_t>(nq) * 2);
+    std::array<std::array<double, 2>, 3> cent{};
+    for (int c = 0; c < 3; ++c) {
+        for (int i = 0; i < n_per; ++i)
+            for (int d = 0; d < 2; ++d)
+                cent[c][d] +=
+                    gpu_model.embedding()[(c * n_per + i) * 2 + d] / n_per;
+    }
+    int correct = 0;
+    for (int c = 0; c < 3; ++c) {
+        for (int i = 0; i < nq_per; ++i) {
+            const float* e = q_emb.data() + (c * nq_per + i) * 2;
+            int best = -1;
+            double best_d = 1e300;
+            for (int cc = 0; cc < 3; ++cc) {
+                const double dx = e[0] - cent[cc][0], dy = e[1] - cent[cc][1];
+                const double d2 = dx * dx + dy * dy;
+                if (d2 < best_d) {
+                    best_d = d2;
+                    best = cc;
+                }
+            }
+            if (best == c) ++correct;
+        }
+    }
+    CAPTURE(correct);
+    CHECK(correct >= nq - 2);
+}
+
+TEST_CASE("phase4 dispatch: unsupported GPU combos fall back to the bit-exact "
+          "CPU path") {
+    METAL_REQUIRED();
+    const int n_per = 20, dim = 6, n = 3 * n_per;
+    const auto X = three_cluster_data(n_per, 5150);
+
+    umap::UMAPParams base;
+    base.n_neighbors = 8;
+    base.init = "random";
+    base.random_state = 7;
+    base.n_epochs = 60;
+    base.metric = "manhattan";  // small-data kNN not GPU-covered either
+
+    SUBCASE("densmap") {
+        umap::UMAPParams p = base;
+        p.densmap = true;
+        umap::UMAP cpu_model(p);
+        cpu_model.fit(X.data(), n, dim);
+        p.device = umap::Device::GPU;
+        umap::UMAP gpu_model(p);  // warns, then runs the CPU path
+        gpu_model.fit(X.data(), n, dim);
+        REQUIRE(gpu_model.embedding().size() == cpu_model.embedding().size());
+        for (std::size_t i = 0; i < cpu_model.embedding().size(); ++i)
+            CHECK(gpu_model.embedding()[i] == cpu_model.embedding()[i]);
+    }
+    SUBCASE("non-euclidean output metric") {
+        umap::UMAPParams p = base;
+        p.output_metric = "haversine";
+        umap::UMAP cpu_model(p);
+        cpu_model.fit(X.data(), n, dim);
+        p.device = umap::Device::GPU;
+        umap::UMAP gpu_model(p);
+        gpu_model.fit(X.data(), n, dim);
+        REQUIRE(gpu_model.embedding().size() == cpu_model.embedding().size());
+        for (std::size_t i = 0; i < cpu_model.embedding().size(); ++i)
+            CHECK(gpu_model.embedding()[i] == cpu_model.embedding()[i]);
+    }
+    SUBCASE("n_epochs list") {
+        umap::UMAPParams p = base;
+        p.n_epochs.reset();
+        p.n_epochs_list = std::vector<int>{20, 50};
+        umap::UMAP cpu_model(p);
+        cpu_model.fit(X.data(), n, dim);
+        p.device = umap::Device::GPU;
+        umap::UMAP gpu_model(p);
+        gpu_model.fit(X.data(), n, dim);
+        REQUIRE(gpu_model.embedding_list().size() ==
+                cpu_model.embedding_list().size());
+        for (std::size_t s = 0; s < cpu_model.embedding_list().size(); ++s)
+            for (std::size_t i = 0; i < cpu_model.embedding_list()[s].size();
+                 ++i)
+                CHECK(gpu_model.embedding_list()[s][i] ==
+                      cpu_model.embedding_list()[s][i]);
+    }
+}
+// -----------------------------------------------------------------------------

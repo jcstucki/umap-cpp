@@ -11,6 +11,11 @@
 #include <string>
 #include <unordered_map>
 
+// --- phase4 additions --------------------------------------------------------
+#include <dlfcn.h>   // dladdr: locate the module containing this code
+#include <unistd.h>  // access(): existence checks
+// -----------------------------------------------------------------------------
+
 #include "umap/device.hpp"
 
 #ifndef UMAP_DEFAULT_METALLIB
@@ -24,10 +29,41 @@ namespace {
 
 std::mutex g_mutex;
 
-const char* metallib_path() {
+// --- phase4 additions --------------------------------------------------------
+// Metallib search order:
+//   1. $UMAP_METALLIB_PATH (explicit override, kept from Phase 3);
+//   2. UMAP_DEFAULT_METALLIB -- the absolute build-tree path baked at compile
+//      time (works for in-tree builds and tests);
+//   3. install-tree resolution via dladdr on this function: for an executable
+//      linking the static library (e.g. <prefix>/bin/umap) try
+//      <exe dir>/umap_kernels.metallib and
+//      <exe dir>/../lib/umapcpp/umap_kernels.metallib -- the location
+//      `cmake --install` uses (${CMAKE_INSTALL_LIBDIR}/umapcpp).
+// The first existing path wins; if none exists the baked default is returned
+// (newLibrary then fails and metal_available() reports false).
+bool file_exists(const std::string& p) { return ::access(p.c_str(), R_OK) == 0; }
+
+std::string metallib_path() {
     const char* env = std::getenv("UMAP_METALLIB_PATH");
-    return (env && *env) ? env : UMAP_DEFAULT_METALLIB;
+    if (env && *env) return env;
+    const std::string baked = UMAP_DEFAULT_METALLIB;
+    if (file_exists(baked)) return baked;
+    Dl_info info;
+    if (dladdr(reinterpret_cast<void*>(&metallib_path), &info) != 0 &&
+        info.dli_fname != nullptr) {
+        std::string module_path(info.dli_fname);
+        const std::size_t slash = module_path.find_last_of('/');
+        const std::string dir =
+            slash == std::string::npos ? "." : module_path.substr(0, slash);
+        const std::string beside = dir + "/umap_kernels.metallib";
+        if (file_exists(beside)) return beside;
+        const std::string installed =
+            dir + "/../lib/umapcpp/umap_kernels.metallib";
+        if (file_exists(installed)) return installed;
+    }
+    return baked;
 }
+// -----------------------------------------------------------------------------
 
 MetalContext make_context() {
     MetalContext ctx;
@@ -36,7 +72,7 @@ MetalContext make_context() {
     ctx.queue = ctx.device->newCommandQueue();
 
     NS::Error* error = nullptr;
-    NS::String* path = NS::String::string(metallib_path(),
+    NS::String* path = NS::String::string(metallib_path().c_str(),
                                           NS::UTF8StringEncoding);
     ctx.library = ctx.device->newLibrary(path, &error);
     // ctx.ok() is false if the metallib could not be loaded.

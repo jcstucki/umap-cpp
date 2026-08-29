@@ -5,12 +5,19 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <stdexcept>
 #include <thread>
 
 #include "umap/rng.hpp"
+
+// --- phase4 additions --------------------------------------------------------
+#ifdef UMAP_ENABLE_METAL
+#include "umap/metal/gpu_layout.hpp"
+#endif
+// -----------------------------------------------------------------------------
 
 namespace umap {
 
@@ -599,7 +606,7 @@ std::vector<float> simplicial_set_embedding_from_init(
     bool graph_prefiltered, const std::vector<int>* epochs_list,
     std::vector<std::vector<float>>* embedding_list,
     const DensmapParams* densmap_kwds, const OutputMetricFn* output_metric,
-    bool numpy_int64_epochs) {
+    bool numpy_int64_epochs, Device device) {
     // --- densmap additions --------------------------------------------------
     if (densmap_kwds != nullptr && output_metric != nullptr) {
         throw std::invalid_argument(
@@ -682,12 +689,37 @@ std::vector<float> simplicial_set_embedding_from_init(
                                 *output_metric, gamma, initial_alpha,
                                 negative_sample_rate, /*move_other=*/true);
     } else {
-        optimize_layout_euclidean(
-            embedding.data(), n_samples, embedding.data(), n_components, head,
-            tail, n_epochs, n_vertices, epochs_per_sample, a, b, rng_state,
-            gamma, initial_alpha, negative_sample_rate, parallel,
-            /*densmap=*/densmap_kwds != nullptr, /*move_other=*/true,
-            epochs_list, embedding_list, densmap_kwds);
+        // --- phase4 additions ------------------------------------------------
+        // Device::GPU routes this euclidean epoch loop to the Metal hogwild
+        // kernel. The kernel covers exactly the plain euclidean SGD (no
+        // densmap correction, no snapshot list); UMAP::fit gates and warns
+        // for those combos before requesting GPU, so the checks here are a
+        // safety net. Quality-level parity only (see gpu_layout.hpp).
+        bool gpu_done = false;
+        if (device == Device::GPU && densmap_kwds == nullptr &&
+            epochs_list == nullptr) {
+#ifdef UMAP_ENABLE_METAL
+            gpu_done = metal::gpu_optimize_layout_euclidean(
+                embedding.data(), n_samples, embedding.data(), n_components,
+                head, tail, n_epochs, n_vertices, epochs_per_sample, a, b,
+                rng_state, gamma, initial_alpha, negative_sample_rate,
+                /*move_other=*/true);
+#endif
+            if (!gpu_done) {
+                std::fprintf(stderr,
+                             "UMAP: GPU layout SGD requested but the Metal "
+                             "kernel is unavailable; running on the CPU.\n");
+            }
+        }
+        if (!gpu_done) {
+            optimize_layout_euclidean(
+                embedding.data(), n_samples, embedding.data(), n_components,
+                head, tail, n_epochs, n_vertices, epochs_per_sample, a, b,
+                rng_state, gamma, initial_alpha, negative_sample_rate, parallel,
+                /*densmap=*/densmap_kwds != nullptr, /*move_other=*/true,
+                epochs_list, embedding_list, densmap_kwds);
+        }
+        // ---------------------------------------------------------------------
     }
     return embedding;
 }

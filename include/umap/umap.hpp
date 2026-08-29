@@ -124,6 +124,7 @@
 #include <string>
 #include <vector>
 
+#include "umap/device.hpp"
 #include "umap/fuzzy_simplicial_set.hpp"
 #include "umap/nn_descent.hpp"
 #include "umap/sparse_matrix.hpp"
@@ -229,6 +230,27 @@ struct UMAPParams {
     // the C++ port keeps it in the params struct. "true" -> NaN and inf
     // raise; "allow-nan" -> only inf raises; "false" -> no check.
     std::string ensure_all_finite = "true";
+    // ------------------------------------------------------------------------
+    // --- phase4 additions ---------------------------------------------------
+    // Compute device (runtime dispatch to the Apple Metal kernels of
+    // include/umap/metal/*.hpp). Device::GPU covers:
+    //   * fit's layout SGD for the standard euclidean-output path (Metal
+    //     hogwild kernel -- quality-level parity, NOT bitwise: float32 epoch
+    //     bookkeeping, per-(edge, epoch) device RNG, unsynchronised racy
+    //     updates like numba's parallel path);
+    //   * exact kNN via the Metal brute-force kernel where the small-data
+    //     branch (fit) and transform's brute-force path would replicate
+    //     sklearn pairwise distances, for dense euclidean/l2/cosine with
+    //     n_neighbors <= 64 (float32 distances vs the CPU float64 replica,
+    //     tie order device-defined -- downstream results are bitwise-
+    //     different from the sklearn replication).
+    // Unsupported combinations fall back to the CPU port with a stderr note:
+    // densmap, non-euclidean output metrics, n_epochs lists, transform's
+    // move_other=false SGD, sparse/precomputed kNN, n_neighbors > 64 kNN,
+    // update()/composite re-embeds -- and any request without a Metal build
+    // or device. Seeded-parity users should keep Device::CPU (the default):
+    // every bit-exact golden holds on the CPU path only.
+    Device device = Device::CPU;
     // ------------------------------------------------------------------------
 };
 
@@ -369,6 +391,26 @@ class UMAP {
     // transform for transform_mode="graph": the bipartite membership graph
     // (n_queries x n_train CSR) the reference's transform returns.
     SparseMatrix transform_graph(const float* X_new, int64_t n_queries) const;
+    // ------------------------------------------------------------------------
+
+    // --- phase4 additions: model persistence --------------------------------
+    // Versioned binary model format: magic "UMAPCPP1", little-endian,
+    // length-prefixed sections (params, fitted scalars, raw data, kNN arrays,
+    // graph CSR, embedding, PreparedIndex state, RandomState bookkeeping;
+    // layout in src/model_io.cpp). save() requires a fitted model; load()
+    // restores everything transform() / transform_graph() /
+    // inverse_transform() / update() need without refitting -- including the
+    // prepared search index and the persisted numpy RandomState stream.
+    // Not serialisable (throws): standard-branch *sparse* fits (the
+    // SparsePreparedIndex is not covered). Reloaded params drop
+    // precomputed_knn's input arrays (the derived kNN + search index are
+    // stored instead), and a model fit with an ndarray init keeps the init
+    // only as fit_init(). Composite-operator results round trip (no raw
+    // data, so transform/update raise exactly as before saving).
+    void save(std::ostream& os) const;
+    void save(const std::string& path) const;
+    static UMAP load(std::istream& is);
+    static UMAP load(const std::string& path);
     // ------------------------------------------------------------------------
 
     // --- tests-port additions -----------------------------------------------

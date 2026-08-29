@@ -1,0 +1,12 @@
+@PACKAGE_INIT@
+
+# umapcpp find_package() config (phase4). Exposes:
+#   umapcpp::umapcpp   the static library (C++17; also provides the C API)
+#   umapcpp::qhull_r   vendored qhull (linked automatically via umapcpp)
+#   umapcpp::umap      the CLI executable
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+
+include("${CMAKE_CURRENT_LIST_DIR}/umapcpp-targets.cmake")
+
+check_required_components(umapcpp)
