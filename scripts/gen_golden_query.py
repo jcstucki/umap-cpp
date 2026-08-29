@@ -9,7 +9,7 @@ _search_forest[0], _min_distance, warmed search_rng_state) and the query
 results, so the C++ PreparedIndex can be validated stage by stage.
 
 Usage:
-    NUMBA_NUM_THREADS=1 /tmp/umapref-venv/bin/python scripts/gen_golden_query.py > tests/golden_query.hpp
+    NUMBA_NUM_THREADS=1 "${UMAPREF_VENV:-$HOME/.venvs/umapref-venv}"/bin/python scripts/gen_golden_query.py > tests/golden_query.hpp
 """
 import os
 import sys

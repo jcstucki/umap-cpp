@@ -22,7 +22,7 @@ Cases:
   fixed 150x4 iris-like dataset for the trustworthiness test.
 
 Usage:
-    NUMBA_NUM_THREADS=1 /tmp/umapref-venv/bin/python scripts/gen_golden_umap.py > tests/golden_umap.hpp
+    NUMBA_NUM_THREADS=1 "${UMAPREF_VENV:-$HOME/.venvs/umapref-venv}"/bin/python scripts/gen_golden_umap.py > tests/golden_umap.hpp
 """
 import os
 import sys

@@ -6,7 +6,7 @@ Runs the *actual* reference implementation checked out at reference/umap
 (numba-jitted; requires numpy/scipy/scikit-learn/numba/pynndescent/tqdm).
 
 Usage:
-    NUMBA_NUM_THREADS=1 /tmp/umapref-venv/bin/python \
+    NUMBA_NUM_THREADS=1 "${UMAPREF_VENV:-$HOME/.venvs/umapref-venv}"/bin/python \
         scripts/gen_golden_metrics_full.py > tests/golden_metrics_full.hpp
 """
 import os

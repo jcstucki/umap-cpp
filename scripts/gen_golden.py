@@ -8,7 +8,7 @@ Usage:
     python3 scripts/gen_golden.py > tests/golden_data.hpp
 
 A prebuilt virtualenv works too, e.g.:
-    /tmp/umapref-venv/bin/python scripts/gen_golden.py > tests/golden_data.hpp
+    "${UMAPREF_VENV:-$HOME/.venvs/umapref-venv}"/bin/python scripts/gen_golden.py > tests/golden_data.hpp
 """
 import os
 import sys

@@ -30,7 +30,7 @@ port reproduces bit-exactly):
       again, exercising the RandomState-instance handoff.
 
 Usage:
-    NUMBA_NUM_THREADS=1 /tmp/umapref-venv/bin/python \
+    NUMBA_NUM_THREADS=1 "${UMAPREF_VENV:-$HOME/.venvs/umapref-venv}"/bin/python \
         scripts/gen_golden_update.py > tests/golden_update.hpp
 """
 import os

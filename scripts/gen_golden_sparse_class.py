@@ -16,7 +16,7 @@ Cases:
   p4) p3 with metric="cosine" (angular trees; transform epsilon 0.24)
 
 Usage:
-    NUMBA_NUM_THREADS=1 /tmp/umapref-venv/bin/python \
+    NUMBA_NUM_THREADS=1 "${UMAPREF_VENV:-$HOME/.venvs/umapref-venv}"/bin/python \
         scripts/gen_golden_sparse_class.py > tests/golden_sparse_class.hpp
 """
 import os

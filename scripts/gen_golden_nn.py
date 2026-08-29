@@ -9,7 +9,7 @@ tests instead (numba fastmath + parallel iteration order make bitwise
 end-to-end parity infeasible).
 
 Usage:
-    NUMBA_NUM_THREADS=1 /tmp/umapref-venv/bin/python scripts/gen_golden_nn.py > tests/golden_nn.hpp
+    NUMBA_NUM_THREADS=1 "${UMAPREF_VENV:-$HOME/.venvs/umapref-venv}"/bin/python scripts/gen_golden_nn.py > tests/golden_nn.hpp
 """
 import os
 import sys

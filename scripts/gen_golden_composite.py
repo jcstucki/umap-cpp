@@ -29,7 +29,7 @@ Cases:
     intersection and contrast (im1 - im2).
 
 Usage:
-    NUMBA_NUM_THREADS=1 /tmp/umapref-venv/bin/python \
+    NUMBA_NUM_THREADS=1 "${UMAPREF_VENV:-$HOME/.venvs/umapref-venv}"/bin/python \
         scripts/gen_golden_composite.py > tests/golden_composite.hpp
 """
 import os

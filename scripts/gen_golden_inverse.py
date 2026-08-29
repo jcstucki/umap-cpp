@@ -27,7 +27,7 @@ All models use the small-data branch + init="random" + explicit a/b, i.e. the
 fully deterministic path the C++ port reproduces bit-exactly.
 
 Usage:
-    NUMBA_NUM_THREADS=1 /tmp/umapref-venv/bin/python \
+    NUMBA_NUM_THREADS=1 "${UMAPREF_VENV:-$HOME/.venvs/umapref-venv}"/bin/python \
         scripts/gen_golden_inverse.py > tests/golden_inverse.hpp
 """
 import os

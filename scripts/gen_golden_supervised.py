@@ -23,7 +23,7 @@ Cases:
       support_size), integer y, target_weight=0.5
 
 Usage:
-    NUMBA_NUM_THREADS=1 /tmp/umapref-venv/bin/python \
+    NUMBA_NUM_THREADS=1 "${UMAPREF_VENV:-$HOME/.venvs/umapref-venv}"/bin/python \
         scripts/gen_golden_supervised.py > tests/golden_supervised.hpp
 """
 import os

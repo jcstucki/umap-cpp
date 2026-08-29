@@ -21,7 +21,7 @@ Outputs:
                                         for test_umap_grads
 
 Usage:
-    NUMBA_NUM_THREADS=1 /tmp/umapref-venv/bin/python scripts/gen_upstream_fixtures.py
+    NUMBA_NUM_THREADS=1 "${UMAPREF_VENV:-$HOME/.venvs/umapref-venv}"/bin/python scripts/gen_upstream_fixtures.py
 """
 import os
 import sys

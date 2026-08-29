@@ -11,7 +11,7 @@ reference/pynndescent, plus sklearn for the small-data brute-force path:
   * sklearn pairwise_distances + stable-argsort brute-force kNN goldens
 
 Usage:
-    NUMBA_NUM_THREADS=1 /tmp/umapref-venv/bin/python scripts/gen_golden_sparse.py \
+    NUMBA_NUM_THREADS=1 "${UMAPREF_VENV:-$HOME/.venvs/umapref-venv}"/bin/python scripts/gen_golden_sparse.py \
         > tests/golden_sparse.hpp
 """
 import os

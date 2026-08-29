@@ -5,7 +5,7 @@ Runs the *actual* reference implementation checked out at reference/umap
 (numba-jitted; requires numpy/scipy/scikit-learn/numba/pynndescent/tqdm).
 
 Usage:
-    /tmp/umapref-venv/bin/python scripts/gen_golden_layout.py > tests/golden_layout.hpp
+    "${UMAPREF_VENV:-$HOME/.venvs/umapref-venv}"/bin/python scripts/gen_golden_layout.py > tests/golden_layout.hpp
 """
 import os
 import sys

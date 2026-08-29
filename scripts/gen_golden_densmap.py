@@ -26,7 +26,7 @@ Cases:
       graph, fit embedding and transform (20 queries).
 
 Usage:
-    NUMBA_NUM_THREADS=1 /tmp/umapref-venv/bin/python \
+    NUMBA_NUM_THREADS=1 "${UMAPREF_VENV:-$HOME/.venvs/umapref-venv}"/bin/python \
         scripts/gen_golden_densmap.py > tests/golden_densmap.hpp
 """
 import os

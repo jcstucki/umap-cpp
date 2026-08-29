@@ -12,7 +12,7 @@ C++, except the PCA-init case which is validated at documented tolerance
 (sklearn runs float32 LAPACK, the port runs float64 Eigen).
 
 Usage:
-    NUMBA_NUM_THREADS=1 /tmp/umapref-venv/bin/python \
+    NUMBA_NUM_THREADS=1 "${UMAPREF_VENV:-$HOME/.venvs/umapref-venv}"/bin/python \
         scripts/gen_golden_features.py > tests/golden_features.hpp
 """
 import os

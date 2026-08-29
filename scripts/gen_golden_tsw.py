@@ -24,7 +24,7 @@ Fixtures reproduced here:
     values are emitted here (not 100k doubles).
 
 Usage:
-    /tmp/umapref-venv/bin/python scripts/gen_golden_tsw.py > tests/golden_tsw.hpp
+    "${UMAPREF_VENV:-$HOME/.venvs/umapref-venv}"/bin/python scripts/gen_golden_tsw.py > tests/golden_tsw.hpp
 """
 import os
 import sys

@@ -26,7 +26,7 @@ Captured per case:
           models).
 
 Usage:
-    NUMBA_NUM_THREADS=1 /tmp/umapref-venv/bin/python \
+    NUMBA_NUM_THREADS=1 "${UMAPREF_VENV:-$HOME/.venvs/umapref-venv}"/bin/python \
         scripts/gen_golden_aligned.py > tests/golden_aligned.hpp
 """
 import os

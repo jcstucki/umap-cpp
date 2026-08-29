@@ -3,7 +3,7 @@
 Python UMAP (reference/umap) + scipy/sklearn.
 
 Usage:
-    /tmp/umapref-venv/bin/python scripts/gen_golden_spectral.py > tests/golden_spectral.hpp
+    "${UMAPREF_VENV:-$HOME/.venvs/umapref-venv}"/bin/python scripts/gen_golden_spectral.py > tests/golden_spectral.hpp
 """
 import os
 import sys
