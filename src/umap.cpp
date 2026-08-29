@@ -103,22 +103,117 @@ std::vector<float> pairwise_distances_sklearn(const float* X, int64_t nx,
     return out;
 }
 
+// --- aligned-umap additions -------------------------------------------------
+// utils.py::fast_knn_indices runs *inside* numba, so np.argpartition is
+// numba's own implementation (arraymath.py::_partition_factory /
+// _select_factory with nan_aware_less_than), NOT numpy's C introselect: a
+// Hoare partition with median-of-3 {low, mid, high} pivoting and a plain
+// quickselect loop. The selected candidates are then sorted ascending and
+// stably argsorted by distance (np.argsort(r[candidates], kind="mergesort")).
+// For rows with exact distance ties across the n_neighbors boundary the
+// *partition* decides which tied index makes the cut (iris slices hit this),
+// so the selection algorithm must match numba swap-for-swap.
+namespace {
+
+template <typename T>
+inline bool numba_nan_aware_lt(T a, T b) {
+    // arraymath.py::nan_aware_less_than (NaNs sort to the end).
+    if (std::isnan(a)) return false;
+    if (std::isnan(b)) return true;
+    return a < b;
+}
+
+// arraymath.py::_partition (argpartition=True variant), verbatim.
+template <typename T>
+int64_t numba_arg_partition(std::vector<T>& A, std::vector<int64_t>& I,
+                            int64_t low, int64_t high) {
+    const int64_t mid = (low + high) >> 1;
+    if (numba_nan_aware_lt(A[mid], A[low])) {
+        std::swap(A[low], A[mid]);
+        std::swap(I[low], I[mid]);
+    }
+    if (numba_nan_aware_lt(A[high], A[mid])) {
+        std::swap(A[high], A[mid]);
+        std::swap(I[high], I[mid]);
+    }
+    if (numba_nan_aware_lt(A[mid], A[low])) {
+        std::swap(A[low], A[mid]);
+        std::swap(I[low], I[mid]);
+    }
+    const T pivot = A[mid];
+
+    std::swap(A[high], A[mid]);
+    std::swap(I[high], I[mid]);
+    int64_t i = low;
+    int64_t j = high - 1;
+    for (;;) {
+        while (i < high && numba_nan_aware_lt(A[i], pivot)) ++i;
+        while (j >= low && numba_nan_aware_lt(pivot, A[j])) --j;
+        if (i >= j) break;
+        std::swap(A[i], A[j]);
+        std::swap(I[i], I[j]);
+        ++i;
+        --j;
+    }
+    std::swap(A[i], A[high]);
+    std::swap(I[i], I[high]);
+    return i;
+}
+
+// arraymath.py::_select (via _arg_select_w_nan): quickselect for the kth.
+template <typename T>
+void numba_arg_select(std::vector<T>& A, std::vector<int64_t>& I, int64_t k,
+                      int64_t low, int64_t high) {
+    int64_t i = numba_arg_partition(A, I, low, high);
+    while (i != k) {
+        if (i < k) {
+            low = i + 1;
+        } else {
+            high = i - 1;
+        }
+        i = numba_arg_partition(A, I, low, high);
+    }
+}
+
+// One row of utils.py::fast_knn_indices + the knn_dists gather from
+// nearest_neighbors' precomputed branch.
+template <typename T>
+void numba_fast_knn_row(const T* d, int64_t m, int64_t n_neighbors,
+                        int32_t* knn_indices_row, std::vector<T>& arry,
+                        std::vector<int64_t>& idx_arry,
+                        std::vector<int32_t>& candidates) {
+    arry.assign(d, d + m);
+    idx_arry.resize(static_cast<std::size_t>(m));
+    std::iota(idx_arry.begin(), idx_arry.end(), 0);
+    numba_arg_select(arry, idx_arry, n_neighbors - 1, 0, m - 1);
+    candidates.assign(idx_arry.begin(), idx_arry.begin() + n_neighbors);
+    std::sort(candidates.begin(), candidates.end());
+    // order = np.argsort(r[candidates], kind="mergesort") over the ORIGINAL
+    // row values; candidates ascending, so stable sort ties by index.
+    std::stable_sort(candidates.begin(), candidates.end(),
+                     [d](int32_t a, int32_t b) { return d[a] < d[b]; });
+    for (int64_t j = 0; j < n_neighbors; ++j)
+        knn_indices_row[j] = candidates[static_cast<std::size_t>(j)];
+}
+
+}  // namespace
+
 void fast_knn_from_dmat(const std::vector<float>& dmat, int64_t n, int64_t m,
                         int64_t n_neighbors, int32_t* knn_indices,
                         float* knn_dists) {
-    std::vector<int32_t> order(m);
+    std::vector<float> arry;
+    std::vector<int64_t> idx_arry;
+    std::vector<int32_t> candidates;
     for (int64_t row = 0; row < n; ++row) {
         const float* d = dmat.data() + row * m;
-        std::iota(order.begin(), order.end(), 0);
-        // argsort(kind="mergesort"): stable, so ties keep ascending index.
-        std::stable_sort(order.begin(), order.end(),
-                         [d](int32_t a, int32_t b) { return d[a] < d[b]; });
-        for (int64_t j = 0; j < n_neighbors; ++j) {
-            knn_indices[row * n_neighbors + j] = order[j];
-            knn_dists[row * n_neighbors + j] = d[order[j]];
-        }
+        numba_fast_knn_row(d, m, n_neighbors, knn_indices + row * n_neighbors,
+                           arry, idx_arry, candidates);
+        for (int64_t j = 0; j < n_neighbors; ++j)
+            knn_dists[row * n_neighbors + j] =
+                d[knn_indices[row * n_neighbors + j]];
     }
 }
+// ----------------------------------------------------------------------------
 
 // ------------------------------------------------------ init_graph_transform
 
@@ -1525,18 +1620,20 @@ namespace {
 void fast_knn_from_dmat_f64(const std::vector<double>& dmat, int64_t n,
                             int64_t m, int64_t n_neighbors,
                             int32_t* knn_indices, float* knn_dists) {
-    std::vector<int32_t> order(static_cast<std::size_t>(m));
+    // --- aligned-umap additions: numba argpartition semantics (see the
+    // fast_knn_from_dmat notes above) on the float64 target matrix. --------
+    std::vector<double> arry;
+    std::vector<int64_t> idx_arry;
+    std::vector<int32_t> candidates;
     for (int64_t row = 0; row < n; ++row) {
         const double* d = dmat.data() + row * m;
-        std::iota(order.begin(), order.end(), 0);
-        std::stable_sort(order.begin(), order.end(),
-                         [d](int32_t a, int32_t b) { return d[a] < d[b]; });
-        for (int64_t j = 0; j < n_neighbors; ++j) {
-            knn_indices[row * n_neighbors + j] = order[j];
-            knn_dists[row * n_neighbors + j] =
-                static_cast<float>(d[order[j]]);
-        }
+        numba_fast_knn_row(d, m, n_neighbors, knn_indices + row * n_neighbors,
+                           arry, idx_arry, candidates);
+        for (int64_t j = 0; j < n_neighbors; ++j)
+            knn_dists[row * n_neighbors + j] = static_cast<float>(
+                d[knn_indices[row * n_neighbors + j]]);
     }
+    // ----------------------------------------------------------------------
 }
 
 // sklearn pairwise_distances on the (n, 1) float64 target column.

@@ -73,6 +73,10 @@ target_sources(umapcpp PRIVATE src/umap.cpp)
 target_sources(umapcpp PRIVATE src/supervised.cpp)
 # ----------------------------------------------------------------------------
 
+# --- aligned-umap additions --------------------------------------------------
+target_sources(umapcpp PRIVATE src/aligned_umap.cpp src/layouts_aligned.cpp)
+# ----------------------------------------------------------------------------
+
 # --- densmap additions ------------------------------------------------------
 # densMAP replicates np.dot(float32, float32) via the same BLAS numpy's macOS
 # wheels link (Accelerate); off Apple platforms a sequential f32 dot is used.
@@ -197,6 +201,10 @@ target_sources(umap_tests PRIVATE tests/test_densmap.cpp)
 target_sources(umap_tests PRIVATE
     tests/test_supervised.cpp
     tests/test_sparse_class.cpp)
+# ----------------------------------------------------------------------------
+
+# --- aligned-umap additions --------------------------------------------------
+target_sources(umap_tests PRIVATE tests/test_aligned.cpp)
 # ----------------------------------------------------------------------------
 
 # --- metal-gpu additions ----------------------------------------------------
