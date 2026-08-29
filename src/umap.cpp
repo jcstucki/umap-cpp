@@ -37,6 +37,89 @@
 
 namespace umap {
 
+// --- gpu-knn additions -------------------------------------------------------
+#ifdef UMAP_ENABLE_METAL
+namespace {
+
+// k cap of the Metal exact-kNN engine (thread-memory heap path).
+constexpr int kGpuKnnMaxK = 256;
+
+// Resolve an input-metric name (+ kwds) to the Metal exact-kNN engine's
+// metric id and parameter block. Covers the named dense metrics the engine
+// implements; everything else (discrete/object metrics, the boolean jaccard
+// family, callables, ...) returns false and the caller keeps the CPU port.
+// Mis-sized kwds arrays also return false so the CPU path raises upstream's
+// faithful error.
+bool gpu_dense_metric(const std::string& name, const MetricKwds& kwds,
+                      int64_t dim, metal::KnnMetric* metric,
+                      metal::KnnMetricParams* mp) {
+    using metal::KnnMetric;
+    if (name == "euclidean" || name == "l2") {
+        *metric = KnnMetric::euclidean;
+    } else if (name == "sqeuclidean") {
+        *metric = KnnMetric::sqeuclidean;
+    } else if (name == "manhattan" || name == "l1" || name == "taxicab") {
+        *metric = KnnMetric::manhattan;
+    } else if (name == "chebyshev" || name == "linfinity" ||
+               name == "linfty" || name == "linf") {
+        *metric = KnnMetric::chebyshev;
+    } else if (name == "minkowski") {
+        *metric = KnnMetric::minkowski;
+        mp->p = static_cast<float>(kwds.p);
+    } else if (name == "cosine") {
+        *metric = KnnMetric::cosine;
+    } else if (name == "correlation") {
+        *metric = KnnMetric::correlation;
+    } else if (name == "hamming") {
+        *metric = KnnMetric::hamming;
+    } else if (name == "canberra") {
+        *metric = KnnMetric::canberra;
+    } else if (name == "braycurtis") {
+        *metric = KnnMetric::braycurtis;
+    } else if (name == "seuclidean" || name == "standardised_euclidean") {
+        if (!kwds.v.empty() &&
+            kwds.v.size() != static_cast<std::size_t>(dim))
+            return false;
+        *metric = KnnMetric::seuclidean;
+        mp->v.assign(kwds.v.begin(), kwds.v.end());
+    } else if (name == "wminkowski" || name == "weighted_minkowski") {
+        if (!kwds.v.empty() &&
+            kwds.v.size() != static_cast<std::size_t>(dim))
+            return false;
+        *metric = KnnMetric::wminkowski;
+        mp->p = static_cast<float>(kwds.p);
+        mp->v.assign(kwds.v.begin(), kwds.v.end());
+    } else if (name == "mahalanobis") {
+        if (!kwds.vinv.empty() &&
+            kwds.vinv.size() != static_cast<std::size_t>(dim) * dim)
+            return false;
+        *metric = KnnMetric::mahalanobis;
+        mp->vinv.assign(kwds.vinv.begin(), kwds.vinv.end());
+    } else {
+        return false;
+    }
+    return true;
+}
+
+// Sparse CSR coverage: the norm-trick family the sparse kernel implements,
+// restricted to names umap's own sparse registry admits at the class level
+// ("l2"/"sqeuclidean" are rejected earlier by _validate_parameters).
+bool gpu_sparse_metric(const std::string& name, metal::KnnMetric* metric) {
+    if (name == "euclidean") {
+        *metric = metal::KnnMetric::euclidean;
+        return true;
+    }
+    if (name == "cosine") {
+        *metric = metal::KnnMetric::cosine;
+        return true;
+    }
+    return false;
+}
+
+}  // namespace
+#endif  // UMAP_ENABLE_METAL
+// -----------------------------------------------------------------------------
+
 // ---------------------------------------------------------------- pairwise
 
 namespace {
@@ -2345,37 +2428,54 @@ UMAP& UMAP::fit_impl(const float* X, int64_t n_samples, int64_t n_features,
         small_data_ = true;
         knn_index_.reset();
         sparse_knn_index_.reset();
-        // --- phase4 additions ------------------------------------------------
-        // Device::GPU exact kNN: the Metal brute-force kernel replaces the
-        // sklearn pairwise replication for dense euclidean/l2/cosine with
-        // n_neighbors <= 64. GPU distances are float32 (the CPU replica is
-        // float64-accumulated) and exact ties resolve in device order, so a
-        // GPU fit is bitwise-different from the sklearn replication -- which
-        // is why this is gated behind the device flag (seeded-parity users
-        // stay on the CPU default). The disconnection mask is applied to the
-        // kNN rows afterwards (the CPU path masks the full distance matrix
+        // --- phase4 additions (extended by the gpu-knn pass) -----------------
+        // Device::GPU exact kNN: the Metal engine replaces the sklearn
+        // pairwise replication for the named dense metrics it implements
+        // (euclidean/l2, sqeuclidean, manhattan family, chebyshev family,
+        // minkowski(p), cosine, correlation, hamming, canberra, braycurtis,
+        // seuclidean, wminkowski, mahalanobis) and for sparse
+        // euclidean/cosine, with n_neighbors <= 256. GPU distances are
+        // float32 (the CPU replica is float64-accumulated) and exact ties
+        // resolve in ascending-index order, so a GPU fit is
+        // bitwise-different from the sklearn replication -- which is why
+        // this is gated behind the device flag (seeded-parity users stay on
+        // the CPU default). The disconnection mask is applied to the kNN
+        // rows afterwards (the CPU path masks the full distance matrix
         // first): the surviving edges are identical, but edges_removed_ then
         // counts only kNN entries rather than all n^2 pairs.
         bool gpu_knn_done = false;
         if (params_.device == Device::GPU) {
-            const bool gpu_metric_euclid =
-                params_.metric == "euclidean" || params_.metric == "l2";
-            const bool gpu_metric_cosine = params_.metric == "cosine";
-            if (!sparse_data_ && (gpu_metric_euclid || gpu_metric_cosine) &&
-                n_neighbors_ <= 64 && metal_available()) {
 #ifdef UMAP_ENABLE_METAL
+            metal::KnnMetric gpu_metric{};
+            metal::KnnMetricParams gpu_mp;
+            const bool gpu_supported =
+                n_neighbors_ <= kGpuKnnMaxK &&
+                (sparse_data_
+                     ? gpu_sparse_metric(params_.metric, &gpu_metric)
+                     : gpu_dense_metric(params_.metric, params_.metric_kwds,
+                                        n_features, &gpu_metric, &gpu_mp));
+            if (gpu_supported && metal_available()) {
                 knn_cols_ = n_neighbors_;
                 knn_indices_.assign(
                     static_cast<std::size_t>(n_index) * n_neighbors_, -1);
                 knn_dists_.assign(
                     static_cast<std::size_t>(n_index) * n_neighbors_, 0.0f);
-                gpu_knn_done = metal::gpu_brute_force_knn(
-                    X_indexed, static_cast<int>(n_index),
-                    static_cast<int>(n_features), X_indexed,
-                    static_cast<int>(n_index), static_cast<int>(n_neighbors_),
-                    gpu_metric_cosine ? metal::KnnMetric::cosine
-                                      : metal::KnnMetric::euclidean,
-                    knn_indices_.data(), knn_dists_.data());
+                gpu_knn_done =
+                    sparse_data_
+                        ? metal::gpu_sparse_brute_force_knn(
+                              sp_indptr, sp_indices, sp_values,
+                              static_cast<int>(n_index), sp_indptr,
+                              sp_indices, sp_values,
+                              static_cast<int>(n_index),
+                              static_cast<int>(n_neighbors_), gpu_metric,
+                              knn_indices_.data(), knn_dists_.data())
+                        : metal::gpu_brute_force_knn(
+                              X_indexed, static_cast<int>(n_index),
+                              static_cast<int>(n_features), X_indexed,
+                              static_cast<int>(n_index),
+                              static_cast<int>(n_neighbors_), gpu_metric,
+                              knn_indices_.data(), knn_dists_.data(),
+                              &gpu_mp);
                 if (gpu_knn_done && std::isfinite(disconnection_distance_)) {
                     for (std::size_t i = 0; i < knn_dists_.size(); ++i) {
                         if (knn_indices_[i] >= 0 &&
@@ -2388,14 +2488,14 @@ UMAP& UMAP::fit_impl(const float* X, int64_t n_samples, int64_t n_features,
                         }
                     }
                 }
-#endif
             }
+#endif
             if (!gpu_knn_done) {
                 warn_msg(
                     "UMAP: device=GPU requested but the Metal exact-kNN "
-                    "kernel covers only dense euclidean/l2/cosine with "
-                    "n_neighbors <= 64 (and needs a Metal device); using the "
-                    "CPU pairwise path.");
+                    "engine covers the named dense metrics and sparse "
+                    "euclidean/cosine with n_neighbors <= 256 (and needs a "
+                    "Metal device); using the CPU path for this kNN.");
             }
         }
         if (!gpu_knn_done) {
@@ -2532,7 +2632,72 @@ UMAP& UMAP::fit_impl(const float* X, int64_t n_samples, int64_t n_features,
                 knn_indices_ = pknn->indices;
                 knn_dists_ = pknn->dists;
             }
-        } else if (sparse_data_) {
+        } else {
+            // --- gpu-knn additions ------------------------------------------
+            // Device::GPU: the Metal engine computes the EXACT brute-force
+            // kNN graph here, replacing NN-descent's approximate graph
+            // (recall 1.0 >= NN-descent's, so this is quality-parity like
+            // the rest of GPU mode -- NOT bit-identical to Python's
+            // approximate graph; the numpy RandomState also skips
+            // NN-descent's draws). No search index is built: device=GPU
+            // transforms run their kNN on the engine directly, but update()
+            // then raises (it needs the NN-descent index) and a model loaded
+            // where Metal is unavailable cannot transform. unique=True stays
+            // on the CPU (transform would need the deduplicated rows, which
+            // are not retained).
+            bool gpu_knn_done = false;
+            if (params_.device == Device::GPU) {
+#ifdef UMAP_ENABLE_METAL
+                metal::KnnMetric gpu_metric{};
+                metal::KnnMetricParams gpu_mp;
+                const bool gpu_supported =
+                    n_neighbors_ <= kGpuKnnMaxK && !params_.unique &&
+                    (sparse_data_
+                         ? gpu_sparse_metric(params_.metric, &gpu_metric)
+                         : gpu_dense_metric(params_.metric,
+                                            params_.metric_kwds, n_features,
+                                            &gpu_metric, &gpu_mp));
+                if (gpu_supported && metal_available()) {
+                    knn_cols_ = n_neighbors_;
+                    knn_indices_.assign(
+                        static_cast<std::size_t>(n_index) * n_neighbors_, -1);
+                    knn_dists_.assign(
+                        static_cast<std::size_t>(n_index) * n_neighbors_,
+                        0.0f);
+                    gpu_knn_done =
+                        sparse_data_
+                            ? metal::gpu_sparse_brute_force_knn(
+                                  sp_indptr, sp_indices, sp_values,
+                                  static_cast<int>(n_index), sp_indptr,
+                                  sp_indices, sp_values,
+                                  static_cast<int>(n_index),
+                                  static_cast<int>(n_neighbors_), gpu_metric,
+                                  knn_indices_.data(), knn_dists_.data())
+                            : metal::gpu_brute_force_knn(
+                                  X_indexed, static_cast<int>(n_index),
+                                  static_cast<int>(n_features), X_indexed,
+                                  static_cast<int>(n_index),
+                                  static_cast<int>(n_neighbors_), gpu_metric,
+                                  knn_indices_.data(), knn_dists_.data(),
+                                  &gpu_mp);
+                    if (gpu_knn_done) {
+                        knn_index_.reset();
+                        sparse_knn_index_.reset();
+                    }
+                }
+#endif
+                if (!gpu_knn_done) {
+                    warn_msg(
+                        "UMAP: device=GPU requested but the Metal exact-kNN "
+                        "engine covers the named dense metrics and sparse "
+                        "euclidean/cosine with n_neighbors <= 256 (unique="
+                        "True excluded, and it needs a Metal device); using "
+                        "the CPU NN-descent path for this kNN.");
+                }
+            }
+            if (!gpu_knn_done) {
+            // ----------------------------------------------------------------
+            if (sparse_data_) {
             // --- supervised-sparse additions --------------------------------
             // Sparse NN-descent (continuing the numpy RandomState stream)
             // with the prepared sparse search index kept for transform().
@@ -2549,7 +2714,7 @@ UMAP& UMAP::fit_impl(const float* X, int64_t n_samples, int64_t n_features,
             knn_dists_ = sparse_knn_index_->knn_dists();
             knn_cols_ = n_neighbors_;
             // ----------------------------------------------------------------
-        } else {
+            } else {
             // NN-descent (continuing the numpy RandomState stream) with the
             // prepared search index kept for transform(). hardening
             // additions: metric == "custom" resolves through pynndescent's
@@ -2563,6 +2728,10 @@ UMAP& UMAP::fit_impl(const float* X, int64_t n_samples, int64_t n_features,
             knn_indices_ = knn_index_->knn_indices();
             knn_dists_ = knn_index_->knn_dists();
             knn_cols_ = n_neighbors_;
+            }
+            // --- gpu-knn additions ------------------------------------------
+            }  // if (!gpu_knn_done): end of the CPU NN-descent index builds
+            // ----------------------------------------------------------------
         }
         // Disconnect any vertices farther apart than _disconnection_distance
         // (default +inf: only unfilled heap slots at +inf are masked; note
@@ -3071,11 +3240,32 @@ const SparseMatrix& UMAP::fit_transform_graph(const float* X,
 
 MembershipStrengths UMAP::transform_membership(const float* X_new,
                                                int64_t n_queries) const {
+    // --- gpu-knn additions ---------------------------------------------------
+    // Under device=GPU with an engine-covered metric the transform kNN runs
+    // exactly on the Metal engine against the training data (any n), so no
+    // search index is needed (GPU standard-branch fits skip building one).
+    // The kNN is exact rather than pynndescent's epsilon-bounded graph
+    // search: quality parity, not bit-identical to the CPU query path.
+    bool gpu_standard_knn = false;
+#ifdef UMAP_ENABLE_METAL
+    metal::KnnMetric gpu_metric{};
+    metal::KnnMetricParams gpu_mp;
+    bool gpu_metric_ok = false;
+    if (params_.device == Device::GPU && params_.metric != "precomputed") {
+        gpu_metric_ok = gpu_dense_metric(params_.metric, params_.metric_kwds,
+                                         dim_, &gpu_metric, &gpu_mp);
+    }
+    gpu_standard_knn = gpu_metric_ok && !params_.unique &&
+                       params_.n_neighbors <= kGpuKnnMaxK &&
+                       metal_available();
+#endif
+    // -------------------------------------------------------------------------
     // #848: raise when a search index would be needed but none exists
     // (metric="precomputed" standard-branch fits set _knn_search_index=None
     // via nearest_neighbors upstream, so their transform raises too;
-    // precomputed_knn without a search index likewise).
-    if (!small_data_ && !knn_index_) {
+    // precomputed_knn without a search index likewise). gpu-knn additions:
+    // the GPU engine serves index-less standard transforms when covered.
+    if (!small_data_ && !knn_index_ && !gpu_standard_knn) {
         throw std::runtime_error(
             "No search index available: transforming data"
             " into an existing embedding is not supported");
@@ -3117,33 +3307,28 @@ MembershipStrengths UMAP::transform_membership(const float* X_new,
         cols = n_neighbors_;
         indices.resize(static_cast<std::size_t>(n_queries) * cols);
         dists.resize(static_cast<std::size_t>(n_queries) * cols);
-        // --- phase4 additions ------------------------------------------------
+        // --- phase4 additions (extended by the gpu-knn pass) -----------------
         // Device::GPU exact kNN of the queries vs the training data (same
-        // scope and deviations as the fit-time small-data path; the
-        // disconnection pruning below applies to these arrays either way).
+        // metric coverage and deviations as the fit-time small-data path;
+        // the disconnection pruning below applies to these arrays either
+        // way).
         bool gpu_knn_done = false;
         if (params_.device == Device::GPU) {
-            const bool gpu_metric_euclid =
-                params_.metric == "euclidean" || params_.metric == "l2";
-            const bool gpu_metric_cosine = params_.metric == "cosine";
-            if ((gpu_metric_euclid || gpu_metric_cosine) && cols <= 64 &&
-                metal_available()) {
 #ifdef UMAP_ENABLE_METAL
+            if (gpu_metric_ok && cols <= kGpuKnnMaxK && metal_available()) {
                 gpu_knn_done = metal::gpu_brute_force_knn(
                     raw_data_.data(), static_cast<int>(n_),
                     static_cast<int>(dim_), X_new, static_cast<int>(n_queries),
-                    static_cast<int>(cols),
-                    gpu_metric_cosine ? metal::KnnMetric::cosine
-                                      : metal::KnnMetric::euclidean,
-                    indices.data(), dists.data());
-#endif
+                    static_cast<int>(cols), gpu_metric, indices.data(),
+                    dists.data(), &gpu_mp);
             }
+#endif
             if (!gpu_knn_done) {
                 warn_msg(
                     "UMAP: device=GPU requested but the Metal exact-kNN "
-                    "kernel covers only dense euclidean/l2/cosine with "
-                    "n_neighbors <= 64 (and needs a Metal device); using the "
-                    "CPU pairwise path.");
+                    "engine covers the named dense metrics and sparse "
+                    "euclidean/cosine with n_neighbors <= 256 (and needs a "
+                    "Metal device); using the CPU path for this kNN.");
             }
         }
         if (!gpu_knn_done) {
@@ -3166,6 +3351,38 @@ MembershipStrengths UMAP::transform_membership(const float* X_new,
         // ---------------------------------------------------------------------
     } else {
         cols = params_.n_neighbors;
+        indices.resize(static_cast<std::size_t>(n_queries) * cols);
+        dists.resize(static_cast<std::size_t>(n_queries) * cols);
+        // --- gpu-knn additions -----------------------------------------------
+        // Device::GPU: exact engine kNN of the queries vs the training data
+        // (raw_data_ rows match the search-index vertex order in every
+        // reachable state, incl. the post-update() permutation quirk).
+        bool gpu_knn_done = false;
+        if (gpu_standard_knn) {
+#ifdef UMAP_ENABLE_METAL
+            gpu_knn_done = metal::gpu_brute_force_knn(
+                raw_data_.data(), static_cast<int>(n_),
+                static_cast<int>(dim_), X_new, static_cast<int>(n_queries),
+                static_cast<int>(cols), gpu_metric, indices.data(),
+                dists.data(), &gpu_mp);
+#endif
+        }
+        if (!gpu_knn_done) {
+            if (params_.device == Device::GPU) {
+                warn_msg(
+                    "UMAP: device=GPU requested but the Metal exact-kNN "
+                    "engine covers the named dense metrics and sparse "
+                    "euclidean/cosine with n_neighbors <= 256 (and needs a "
+                    "Metal device); using the CPU query path for this kNN.");
+            }
+            if (!knn_index_) {
+                // The GPU route was eligible at the top-of-function check
+                // but the kernel launch failed at runtime.
+                throw std::runtime_error(
+                    "No search index available: transforming data"
+                    " into an existing embedding is not supported");
+            }
+        // ---------------------------------------------------------------------
         // epsilon = 0.24 if self._knn_search_index._angular_trees else 0.12
         // (the kwds-aware resolve_metric mirrors the flag the index was
         // built with, including the generic-metric hook's angular list;
@@ -3177,10 +3394,11 @@ MembershipStrengths UMAP::transform_membership(const float* X_new,
                     .angular_trees
                 ? 0.24
                 : 0.12;
-        indices.resize(static_cast<std::size_t>(n_queries) * cols);
-        dists.resize(static_cast<std::size_t>(n_queries) * cols);
         knn_index_->query(X_new, n_queries, cols, epsilon, indices.data(),
                           dists.data());
+        // --- gpu-knn additions -----------------------------------------------
+        }  // if (!gpu_knn_done)
+        // ---------------------------------------------------------------------
     }
 
     // Remove any nearest neighbours whose distances are greater than our
@@ -3301,11 +3519,12 @@ std::vector<float> UMAP::transform_from_membership(
     // transform's SGD (move_other=false against the frozen training
     // embedding) is not routed to the Metal kernel: GPU quality parity was
     // validated for the fit configuration only. Note once per call and run
-    // the CPU path.
+    // the CPU path. (gpu-knn additions: the transform *kNN* does run on the
+    // Metal engine where covered; this note is about the optimization only.)
     if (params_.device == Device::GPU) {
         warn_msg(
-            "UMAP: device=GPU covers fit's layout SGD only; transform's "
-            "optimization runs on the CPU.");
+            "UMAP: device=GPU covers transform's kNN but not its "
+            "optimization; the move_other=false SGD runs on the CPU.");
     }
     // -------------------------------------------------------------------------
     const int dim_out = params_.n_components;
@@ -3980,10 +4199,13 @@ UMAP& UMAP::update_impl(const float* X_new, const int32_t* new_indptr,
         if (!knn_index_) {
             // metric="precomputed" is caught above; this is the
             // precomputed_knn-without-search-index case (upstream:
-            // AttributeError on None.prepare()).
+            // AttributeError on None.prepare()) or -- gpu-knn additions -- a
+            // device=GPU standard fit, whose exact engine kNN skips the
+            // NN-descent index that update() continues.
             throw std::runtime_error(
                 "UMAP: update() requires a search index (the model was fit "
-                "with precomputed_knn without one)");
+                "with precomputed_knn without one, or with device=GPU exact "
+                "kNN, which builds no NN-descent index)");
         }
         if (!index_rs_.has_value()) {
             throw std::runtime_error(
@@ -4087,6 +4309,22 @@ MembershipStrengths UMAP::transform_membership_sparse(
     int64_t cols;
     std::vector<int32_t> indices;
     std::vector<float> dists;
+    // --- gpu-knn additions ---------------------------------------------------
+    // Under device=GPU with a norm-trick metric the sparse transform kNN
+    // runs exactly on the Metal CSR kernel against the training CSR (any n);
+    // GPU standard-branch sparse fits skip building the search index.
+    bool gpu_standard_knn = false;
+#ifdef UMAP_ENABLE_METAL
+    metal::KnnMetric gpu_metric{};
+    bool gpu_metric_ok = false;
+    if (params_.device == Device::GPU && params_.metric != "precomputed") {
+        gpu_metric_ok = gpu_sparse_metric(params_.metric, &gpu_metric);
+    }
+    gpu_standard_knn = gpu_metric_ok && !params_.unique &&
+                       params_.n_neighbors <= kGpuKnnMaxK &&
+                       metal_available();
+#endif
+    // -------------------------------------------------------------------------
     // --- hardening additions -------------------------------------------------
     // upstream transform's sparse precomputed branch: rows hold distances
     // from each new point to (a superset of) its nearest training points;
@@ -4151,12 +4389,37 @@ MembershipStrengths UMAP::transform_membership_sparse(
         // kernel, densify fallback); dists.astype(np.float32) happens after
         // the k-selection, exactly like transform().
         cols = n_neighbors_;
+        indices.resize(static_cast<std::size_t>(n_queries) * cols);
+        dists.resize(static_cast<std::size_t>(n_queries) * cols);
+        // --- gpu-knn additions -----------------------------------------------
+        // Device::GPU: the CSR engine replaces the sklearn sparse pairwise
+        // replication (same deviations as the dense small-data path).
+        bool gpu_knn_done = false;
+        if (params_.device == Device::GPU) {
+#ifdef UMAP_ENABLE_METAL
+            if (gpu_metric_ok && cols <= kGpuKnnMaxK && metal_available()) {
+                gpu_knn_done = metal::gpu_sparse_brute_force_knn(
+                    raw_indptr_.data(), raw_indices_.data(),
+                    raw_values_.data(), static_cast<int>(n_), q_indptr,
+                    q_indices, q_data, static_cast<int>(n_queries),
+                    static_cast<int>(cols), gpu_metric, indices.data(),
+                    dists.data());
+            }
+#endif
+            if (!gpu_knn_done) {
+                warn_msg(
+                    "UMAP: device=GPU requested but the Metal exact-kNN "
+                    "engine covers the named dense metrics and sparse "
+                    "euclidean/cosine with n_neighbors <= 256 (and needs a "
+                    "Metal device); using the CPU path for this kNN.");
+            }
+        }
+        if (!gpu_knn_done) {
+        // ---------------------------------------------------------------------
         SparseSmallDmat sd = sparse_small_dmat(
             q_indptr, q_indices, q_data, n_queries, raw_indptr_.data(),
             raw_indices_.data(), raw_values_.data(), n_, dim_, params_.metric,
             params_.metric_kwds, /*x_is_y=*/false);
-        indices.resize(static_cast<std::size_t>(n_queries) * cols);
-        dists.resize(static_cast<std::size_t>(n_queries) * cols);
         if (sd.is_f64) {
             std::vector<double> kdst(static_cast<std::size_t>(n_queries) *
                                      cols);
@@ -4168,13 +4431,40 @@ MembershipStrengths UMAP::transform_membership_sparse(
             numpy_knn_from_dmat(sd.f32, n_queries, n_, cols, indices.data(),
                                 dists.data());
         }
+        // --- gpu-knn additions -----------------------------------------------
+        }  // if (!gpu_knn_done)
+        // ---------------------------------------------------------------------
     } else {
+        cols = params_.n_neighbors;
+        indices.resize(static_cast<std::size_t>(n_queries) * cols);
+        dists.resize(static_cast<std::size_t>(n_queries) * cols);
+        // --- gpu-knn additions -----------------------------------------------
+        // Device::GPU: exact CSR engine kNN of the queries vs the training
+        // data; serves index-less GPU standard-branch sparse fits.
+        bool gpu_knn_done = false;
+        if (gpu_standard_knn) {
+#ifdef UMAP_ENABLE_METAL
+            gpu_knn_done = metal::gpu_sparse_brute_force_knn(
+                raw_indptr_.data(), raw_indices_.data(), raw_values_.data(),
+                static_cast<int>(n_), q_indptr, q_indices, q_data,
+                static_cast<int>(n_queries), static_cast<int>(cols),
+                gpu_metric, indices.data(), dists.data());
+#endif
+        }
+        if (!gpu_knn_done) {
+            if (params_.device == Device::GPU) {
+                warn_msg(
+                    "UMAP: device=GPU requested but the Metal exact-kNN "
+                    "engine covers the named dense metrics and sparse "
+                    "euclidean/cosine with n_neighbors <= 256 (and needs a "
+                    "Metal device); using the CPU query path for this kNN.");
+            }
+        // ---------------------------------------------------------------------
         if (!sparse_knn_index_) {
             throw std::runtime_error(
                 "No search index available: transforming data"
                 " into an existing embedding is not supported");
         }
-        cols = params_.n_neighbors;
         // epsilon = 0.24 if self._knn_search_index._angular_trees else 0.12.
         // hardening additions: dim_/kwds bound so n_features-requiring
         // metric names (hamming etc.) resolve instead of throwing.
@@ -4185,10 +4475,11 @@ MembershipStrengths UMAP::transform_membership_sparse(
                     .angular_trees
                 ? 0.24
                 : 0.12;
-        indices.resize(static_cast<std::size_t>(n_queries) * cols);
-        dists.resize(static_cast<std::size_t>(n_queries) * cols);
         sparse_knn_index_->query(q_indptr, q_indices, q_data, n_queries, cols,
                                  epsilon, indices.data(), dists.data());
+        // --- gpu-knn additions -----------------------------------------------
+        }  // if (!gpu_knn_done)
+        // ---------------------------------------------------------------------
     }
 
     // indices[dists >= self._disconnection_distance] = -1.

@@ -542,7 +542,17 @@ TEST_CASE("phase4 dispatch: unsupported GPU combos fall back to the bit-exact "
     base.init = "random";
     base.random_state = 7;
     base.n_epochs = 60;
-    base.metric = "manhattan";  // small-data kNN not GPU-covered either
+    // gpu-knn additions: the engine now covers every named dense metric
+    // (manhattan included), so the not-GPU-covered kNN half of this test
+    // rides the documented custom-callable fallback instead.
+    base.metric = "custom";
+    base.custom_metric = [](const float* x, const float* y, std::size_t d) {
+        double s = 0.0;
+        for (std::size_t i = 0; i < d; ++i)
+            s += std::fabs(static_cast<double>(x[i]) -
+                           static_cast<double>(y[i]));
+        return static_cast<float>(s);
+    };
 
     SUBCASE("densmap") {
         umap::UMAPParams p = base;
