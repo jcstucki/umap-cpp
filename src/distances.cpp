@@ -516,6 +516,40 @@ double count_distance(double x, double y, double poisson_lambda,
     return result / normalisation;
 }
 
+double count_distance_f32_lambda(double x, double y, float poisson_lambda,
+                                 double normalisation) {
+    // numba's float32-poisson_lambda specialization: np.log(float32) is the
+    // float32 log (logf); the k*log_lambda - poisson_lambda - log_k_factorial
+    // terms then promote int64/float32 operands to float64 (numba unifies
+    // int64 x float32 -> float64), so only log_lambda and poisson_lambda
+    // carry float32 rounding. Everything else matches count_distance above.
+    // (Pinned against the reference numba compilation, audit 2026-08-29 c07.)
+    const long long lo = static_cast<long long>(std::min(x, y));
+    const long long hi = static_cast<long long>(std::max(x, y));
+
+    const float log_lambda = std::log(poisson_lambda);
+
+    double log_k_factorial;
+    if (lo < 2) {
+        log_k_factorial = 0.0;
+    } else if (lo < 10) {
+        log_k_factorial = 0.0;
+        for (long long k = 2; k < lo; ++k) {
+            log_k_factorial += std::log(static_cast<double>(k));
+        }
+    } else {
+        log_k_factorial = approx_log_Gamma(static_cast<double>(lo + 1));
+    }
+
+    double result = 0.0;
+    for (long long k = lo; k < hi; ++k) {
+        result += static_cast<double>(k) * static_cast<double>(log_lambda) -
+                  static_cast<double>(poisson_lambda) - log_k_factorial;
+        log_k_factorial += std::log(static_cast<double>(k));
+    }
+    return result / normalisation;
+}
+
 double hierarchical_categorical_distance(
     double x, double y,
     const std::vector<std::unordered_map<double, double>>& cat_hierarchy) {

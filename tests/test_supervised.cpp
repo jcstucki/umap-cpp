@@ -199,6 +199,21 @@ TEST_CASE("supervised fit: discrete ordinal target (s6, bit-exact)") {
              golden_supervised::s6_embedding);
 }
 
+TEST_CASE("supervised fit: discrete count target (s7, bit-exact)") {
+    // float32 y end to end: scipy.stats.tmean gives a float32
+    // poisson_lambda and count_distance's numba f32 specialization takes
+    // np.log(lambda) in float32 (audit 2026-08-29 c07 -- the earlier f64
+    // promotion shifted the graph by <= 4 ulp and the embedding entirely).
+    UMAPParams p = base_params();
+    p.target_metric = "count";
+    const std::vector<float> y =
+        yf(golden_supervised::s7_y, golden_supervised::sn);
+    run_case(p, y.data(), golden_supervised::s7_graph_indptr,
+             golden_supervised::s7_graph_indices,
+             golden_supervised::s7_graph_data, golden_supervised::s7_fit_init,
+             golden_supervised::s7_embedding);
+}
+
 TEST_CASE("supervised fit separates labels better than unsupervised") {
     // Unsupervised baseline reproduces the Python baseline bit-exactly, and
     // the supervised embedding must separate the 3 label centroids more.

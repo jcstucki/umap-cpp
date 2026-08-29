@@ -2565,19 +2565,29 @@ void UMAP::supervise_graph(const float* y, const std::vector<int64_t>& index,
             };
         } else if (tm == "count") {
             // scipy.stats.tmin/tmax/tmean with no limits are plain
-            // min/max/np.mean; normalisation = count_distance(min, max,
-            // poisson_lambda=lambda) / 2.
+            // min/max/np.mean -- computed on the FLOAT32 y (check_array
+            // keeps the input dtype and the C++ y surface is float32), so
+            // tmean returns a float32 poisson_lambda and count_distance's
+            // numba f32 specialization takes np.log(lambda) in float32.
+            // normalisation = count_distance(min, max, poisson_lambda=
+            // lambda) / 2 stays float64 like upstream. (The previous f64
+            // promotion of this chain moved the graph by <= 4 ulp and the
+            // embedding entirely -- audit 2026-08-29, c07.)
             double mn = y_[0], mx = y_[0];
             for (const double v : y_) {
                 mn = std::min(mn, v);
                 mx = std::max(mx, v);
             }
-            const double lambda_ =
-                numpy_mean_f64(y_.data(), static_cast<int64_t>(y_.size()));
+            std::vector<float> y32(y_.size());
+            for (std::size_t i = 0; i < y_.size(); ++i)
+                y32[i] = static_cast<float>(y_[i]);
+            const float lambda_ =
+                numpy_mean_f32(y32.data(), static_cast<int64_t>(y32.size()));
             const double normalisation =
-                count_distance(mn, mx, lambda_, 1.0) / 2.0;
+                count_distance_f32_lambda(mn, mx, lambda_, 1.0) / 2.0;
             metric_fn = [lambda_, normalisation](double a, double b) {
-                return count_distance(a, b, lambda_, normalisation);
+                return count_distance_f32_lambda(a, b, lambda_,
+                                                 normalisation);
             };
         } else {
             // "string"/"myers" need object-dtype y; "hierarchical_

@@ -88,6 +88,14 @@ double categorical_distance(double x, double y);
 double ordinal_distance(double x, double y, double support_size = 1.0);
 double count_distance(double x, double y, double poisson_lambda = 1.0,
                       double normalisation = 1.0);
+// count_distance as numba specializes it for FLOAT32 poisson_lambda (the
+// supervised target_metric="count" chain: check_array keeps y float32, so
+// scipy.stats.tmean returns a float32 lambda and np.log(lambda) is computed
+// in float32; every other term of the kernel accumulates in float64 exactly
+// like the double variant above). Verified against the reference numba
+// compilation (audit 2026-08-29, c07).
+double count_distance_f32_lambda(double x, double y, float poisson_lambda,
+                                 double normalisation = 1.0);
 // cat_hierarchy: one map per level, category value -> group id. Missing keys
 // throw std::out_of_range (upstream numba would raise a KeyError).
 double hierarchical_categorical_distance(

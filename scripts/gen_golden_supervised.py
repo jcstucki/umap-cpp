@@ -176,6 +176,24 @@ m6 = um.UMAP(init="random", random_state=42, a=ab_a, b=ab_b,
              target_metric="ordinal")
 emit_case("s6", X, yord, m6)
 
+# s7: discrete target branch, target_metric="count", FLOAT32 y. check_array
+# keeps the float32 dtype, so scipy.stats.tmean returns a float32
+# poisson_lambda and count_distance's numba f32 specialization computes
+# np.log(lambda) in float32 (audit 2026-08-29, c07: the C++ used to promote
+# this chain to float64). Counts reach past 10 so both log_k_factorial
+# branches (explicit loop and approx_log_Gamma) participate.
+ycnt = (1.0 + np.random.RandomState(21).poisson(5.0, len(labels))).astype(
+    np.float32)
+ycnt[:4] = [1.0, 2.0, 13.0, 17.0]  # pin lo<2 and lo>=10 pairs (y=0 would
+# poison the chain with log(0) upstream as well)
+# the golden must discriminate the f32 chain: the f32 mean (what
+# scipy.stats.tmean computes for f32 y) must differ from the f64 mean.
+assert float(ycnt.mean(dtype=np.float32)) != \
+    float(ycnt.astype(np.float64).mean()), "pick y with non-representable mean"
+m7 = um.UMAP(init="random", random_state=42, a=ab_a, b=ab_b,
+             target_metric="count")
+emit_case("s7", X, ycnt, m7)
+
 # Unsupervised baseline embedding for the label-separation behavioral test.
 m0 = um.UMAP(init="random", random_state=42, a=ab_a, b=ab_b)
 emb0 = m0.fit_transform(X)
