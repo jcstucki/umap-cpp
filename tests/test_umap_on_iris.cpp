@@ -4,21 +4,21 @@
 // tests/upstream_data.hpp.
 //
 // Skips (see tests/PORTING_NOTES.md):
-//   * test_umap_trustworthiness_on_sphere_iris -- output_metric="haversine" is
-//     not wired into the UMAP class yet (optimize_layout_generic is ported).
 //   * test_umap_transform_on_iris_modified_dtype -- upstream re-casts
 //     embedding_ to float64 and checks transform still works; the C++
 //     embedding is always float32, there is no dtype to modify.
-//   * test_umap_sparse_transform_on_iris / test_precomputed_sparse_transform_
-//     on_iris -- sparse input / sparse precomputed not wired into the class.
-//   * test_umap_clusterability_on_supervised_iris -- supervised fit (y).
-// Adaptation:
+//   * test_precomputed_sparse_transform_on_iris -- the sparse precomputed
+//     branch is not ported.
+// Adaptations:
 //   * test_umap_inverse_transform_on_iris: sklearn KDTree queries are ported
 //     as exact brute-force kNN (the tree is exact too).
 //   * test_precomputed_knn_on_iris: the pytest.warns bookkeeping is replaced
 //     by behavioural checks (the C++ port emits the same warnings on stderr);
 //     the NotImplementedError match "search index" maps to the C++
 //     std::invalid_argument whose message contains "search index".
+//   * test_umap_clusterability_on_supervised_iris: sklearn KMeans(3) +
+//     adjusted_rand_score are replaced by the ports in upstream_helpers.hpp
+//     (k-means++/Lloyd/n_init=10; upstream leaves KMeans unseeded).
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -156,8 +156,31 @@ TEST_CASE("test_initialized_umap_trustworthiness_on_iris") {
     CHECK(trust >= 0.97);
 }
 
-// output_metric="haversine" is not wired into the UMAP class yet.
-TEST_CASE("test_umap_trustworthiness_on_sphere_iris" * doctest::skip()) {}
+TEST_CASE("test_umap_trustworthiness_on_sphere_iris") {
+    UMAPParams p = iris_params();
+    p.n_epochs = 200;
+    p.output_metric = "haversine";
+    UMAP model(p);
+    const std::vector<float> emb =
+        model.fit_transform(iris_f32().data(), kIrisN, kIrisDim);
+    // Project onto a 3D embedding of the sphere (r = 3) and use cosine
+    // distance for the input-space ranks, like upstream.
+    const double r = 3.0;
+    std::vector<float> projected(kIrisN * 3);
+    for (int64_t i = 0; i < kIrisN; ++i) {
+        const double theta = emb[i * 2 + 0], phi = emb[i * 2 + 1];
+        projected[i * 3 + 0] =
+            static_cast<float>(r * std::sin(theta) * std::cos(phi));
+        projected[i * 3 + 1] =
+            static_cast<float>(r * std::sin(theta) * std::sin(phi));
+        projected[i * 3 + 2] = static_cast<float>(r * std::cos(theta));
+    }
+    const double trust =
+        testutil::trustworthiness(iris_f32().data(), kIrisN, kIrisDim,
+                                  projected.data(), 3, 10, "cosine");
+    CAPTURE(trust);
+    CHECK(trust >= 0.65);
+}
 
 TEST_CASE("test_umap_transform_on_iris") {
     const std::vector<float> emb =
@@ -183,7 +206,26 @@ TEST_CASE("test_umap_transform_on_iris_w_pynndescent") {
 }
 
 TEST_CASE("test_umap_transform_on_iris_modified_dtype" * doctest::skip()) {}
-TEST_CASE("test_umap_sparse_transform_on_iris" * doctest::skip()) {}
+
+TEST_CASE("test_umap_sparse_transform_on_iris") {
+    const int64_t n = subset_n(), nq = rest_n();
+    const testutil::Csr data =
+        testutil::dense_to_csr(iris_subset().data(), n, kIrisDim);
+    UMAPParams p = iris_params();
+    p.n_epochs = 100;
+    UMAP model(p);
+    model.fit(data.indptr.data(), data.indices.data(), data.data.data(), n,
+              kIrisDim);
+    const testutil::Csr new_data =
+        testutil::dense_to_csr(iris_rest().data(), nq, kIrisDim);
+    const std::vector<float> emb = model.transform(
+        new_data.indptr.data(), new_data.indices.data(), new_data.data.data(),
+        nq);
+    const double trust = testutil::trustworthiness(
+        iris_rest().data(), nq, kIrisDim, emb.data(), 2, 10);
+    CAPTURE(trust);
+    CHECK(trust >= 0.80);
+}
 
 TEST_CASE("test_precomputed_transform_on_iris") {
     // distance_matrix = squareform(pdist(data)) in float64, cast like upstream.
@@ -212,8 +254,26 @@ TEST_CASE("test_precomputed_transform_on_iris") {
     CHECK(trust >= 0.85);
 }
 
+// The sparse precomputed branch is not ported.
 TEST_CASE("test_precomputed_sparse_transform_on_iris" * doctest::skip()) {}
-TEST_CASE("test_umap_clusterability_on_supervised_iris" * doctest::skip()) {}
+
+TEST_CASE("test_umap_clusterability_on_supervised_iris") {
+    // conftest::supervised_iris_model = UMAP(n_neighbors=10, min_dist=0.01,
+    // n_epochs=200, random_state=42).fit(iris.data, iris.target).
+    UMAPParams p = iris_params();
+    p.n_epochs = 200;
+    std::vector<float> y(kIrisN);
+    for (int64_t i = 0; i < kIrisN; ++i)
+        y[i] = static_cast<float>(updata::iris_target[i]);
+    UMAP model(p);
+    model.fit(iris_f32().data(), kIrisN, kIrisDim, y.data());
+    const std::vector<int> clusters = testutil::kmeans_predict(
+        model.embedding().data(), kIrisN, 2, 3);
+    std::vector<int> target(updata::iris_target, updata::iris_target + kIrisN);
+    const double ari = testutil::adjusted_rand_score(clusters, target);
+    CAPTURE(ari);
+    CHECK(ari >= 0.95);
+}
 
 // --- inverse-update additions ------------------------------------------------
 TEST_CASE("test_umap_inverse_transform_on_iris") {

@@ -11,9 +11,11 @@
 //     doctest skips.
 //   * test_sokalmichener / test_sparse_sokalmichener / test_sparse_sokalsneath:
 //     skipped upstream for sklearn >= 1.8 (venv: 1.9); mirrored.
-//   * sparse chebyshev/minkowski/hamming/canberra/braycurtis/correlation and
-//     the sparse binary metrics + sparse_hellinger: the C++ sparse registry
-//     ports only euclidean/manhattan/cosine so far (Phase 1b TODO); skipped.
+// The full sparse metric surface is ported (tests-unskip): the sparse
+// spatial/binary/hellinger cases run against sklearn goldens with upstream's
+// corrections and tolerances (decimal 6; 3 for sparse hellinger). Metrics in
+// pynndescent's sparse_need_n_features tuple get n_features = 20 bound, and
+// minkowski gets numba's default p=2.0 (upstream calls the kernel without p).
 #include <cmath>
 #include <cstdint>
 #include <functional>
@@ -98,14 +100,25 @@ SparseRows sparse_spatial_csr() {
     return SparseRows{c.indptr, c.indices, c.data};
 }
 
-using SparseFn = float (*)(const int32_t*, const float*, int64_t,
-                           const int32_t*, const float*, int64_t);
+// conftest.py::sparse_binary_data = csr(binary_data) (bool -> 1.0f values).
+SparseRows sparse_binary_csr() {
+    const std::vector<float> dense = testutil::to_f32(
+        updata::binary_data, static_cast<std::size_t>(kSpatialN) * kSpatialDim);
+    const testutil::Csr c = testutil::dense_to_csr(dense.data(), kSpatialN,
+                                                   kSpatialDim);
+    return SparseRows{c.indptr, c.indices, c.data};
+}
 
-void check_sparse_matrix(SparseFn fn, const double* golden, int decimal = 6) {
-    const SparseRows s = sparse_spatial_csr();
+// run_test_sparse_metric: SparseDist carries the bound trailing argument
+// (n_features for sparse_need_n_features metrics, minkowski's p) like
+// pynndescent's _partial_dist_func; plain kernels convert implicitly.
+void check_sparse_matrix(const umap::spdist::SparseDist& fn,
+                         const double* golden, int decimal = 6,
+                         const SparseRows& s = sparse_spatial_csr(),
+                         int n = kSpatialN) {
     const double tol = 1.5 * std::pow(10.0, -decimal);
-    for (int i = 0; i < kSpatialN; ++i)
-        for (int j = 0; j < kSpatialN; ++j) {
+    for (int i = 0; i < n; ++i)
+        for (int j = 0; j < n; ++j) {
             const float d = fn(s.indices.data() + s.indptr[i],
                                s.data.data() + s.indptr[i],
                                s.indptr[i + 1] - s.indptr[i],
@@ -114,8 +127,7 @@ void check_sparse_matrix(SparseFn fn, const double* golden, int decimal = 6) {
                                s.indptr[j + 1] - s.indptr[j]);
             CAPTURE(i);
             CAPTURE(j);
-            CHECK(std::abs(static_cast<double>(d) -
-                           golden[i * kSpatialN + j]) < tol);
+            CHECK(std::abs(static_cast<double>(d) - golden[i * n + j]) < tol);
         }
 }
 
@@ -225,31 +237,76 @@ TEST_CASE("test_sparse_manhattan") {
                         umgold::sparse_manhattan);
 }
 
-// Sparse metrics beyond euclidean/manhattan/cosine are not in the C++ sparse
-// registry yet (Phase 1b "remaining sparse_named_distances metrics" TODO).
-TEST_CASE("test_sparse_chebyshev" * doctest::skip()) {}
-TEST_CASE("test_sparse_minkowski" * doctest::skip()) {}
-TEST_CASE("test_sparse_hamming" * doctest::skip()) {}
-TEST_CASE("test_sparse_canberra" * doctest::skip()) {}
+TEST_CASE("test_sparse_chebyshev") {
+    check_sparse_matrix(&umap::spdist::sparse_chebyshev,
+                        umgold::sparse_chebyshev);
+}
+
+TEST_CASE("test_sparse_minkowski") {
+    // Upstream calls the kernel without p -> numba's default p=2.0.
+    check_sparse_matrix({&umap::spdist::sparse_minkowski, 2.0},
+                        umgold::sparse_minkowski);
+}
+
+TEST_CASE("test_sparse_hamming") {
+    check_sparse_matrix({&umap::spdist::sparse_hamming, kSpatialDim},
+                        umgold::sparse_hamming);
+}
+
+TEST_CASE("test_sparse_canberra") {
+    check_sparse_matrix(&umap::spdist::sparse_canberra,
+                        umgold::sparse_canberra);
+}
 
 TEST_CASE("test_sparse_cosine") {
     check_sparse_matrix(&umap::spdist::sparse_cosine, umgold::sparse_cosine);
 }
 
-TEST_CASE("test_sparse_correlation" * doctest::skip()) {}
-TEST_CASE("test_sparse_braycurtis" * doctest::skip()) {}
+TEST_CASE("test_sparse_correlation") {
+    check_sparse_matrix({&umap::spdist::sparse_correlation, kSpatialDim},
+                        umgold::sparse_correlation);
+}
+
+TEST_CASE("test_sparse_braycurtis") {
+    check_sparse_matrix(&umap::spdist::sparse_bray_curtis,
+                        umgold::sparse_braycurtis);
+}
 
 // --------------------------------------------- sparse binary metric tests
-// (none of the binary metrics are in the C++ sparse registry yet)
 
-TEST_CASE("test_sparse_jaccard" * doctest::skip()) {}
-TEST_CASE("test_sparse_matching" * doctest::skip()) {}
-TEST_CASE("test_sparse_dice" * doctest::skip()) {}
-TEST_CASE("test_sparse_kulsinski" * doctest::skip()) {}     // + upstream skip
-TEST_CASE("test_sparse_rogerstanimoto" * doctest::skip()) {}
-TEST_CASE("test_sparse_russellrao" * doctest::skip()) {}
-TEST_CASE("test_sparse_sokalmichener" * doctest::skip()) {}  // upstream skip
-TEST_CASE("test_sparse_sokalsneath" * doctest::skip()) {}    // upstream skip
+TEST_CASE("test_sparse_jaccard") {
+    check_sparse_matrix(&umap::spdist::sparse_jaccard,
+                        umgold::sparse_binary_jaccard, 6, sparse_binary_csr());
+}
+
+TEST_CASE("test_sparse_matching") {
+    check_sparse_matrix({&umap::spdist::sparse_matching, kSpatialDim},
+                        umgold::sparse_binary_matching, 6, sparse_binary_csr());
+}
+
+TEST_CASE("test_sparse_dice") {
+    check_sparse_matrix(&umap::spdist::sparse_dice, umgold::sparse_binary_dice,
+                        6, sparse_binary_csr());
+}
+
+// Upstream: skipped for scipy >= 1.9 (metric removed; venv scipy 1.18).
+TEST_CASE("test_sparse_kulsinski" * doctest::skip()) {}
+
+TEST_CASE("test_sparse_rogerstanimoto") {
+    check_sparse_matrix({&umap::spdist::sparse_rogers_tanimoto, kSpatialDim},
+                        umgold::sparse_binary_rogerstanimoto, 6,
+                        sparse_binary_csr());
+}
+
+TEST_CASE("test_sparse_russellrao") {
+    check_sparse_matrix({&umap::spdist::sparse_russellrao, kSpatialDim},
+                        umgold::sparse_binary_russellrao, 6,
+                        sparse_binary_csr());
+}
+
+// Upstream: skipped for sklearn >= 1.8 (metric removed; venv sklearn 1.9).
+TEST_CASE("test_sparse_sokalmichener" * doctest::skip()) {}
+TEST_CASE("test_sparse_sokalsneath" * doctest::skip()) {}
 
 // ------------------------------------- standardised / weighted distances
 
@@ -320,8 +377,42 @@ TEST_CASE("test_hellinger") {
         }
 }
 
-// sparse_hellinger / sparse_ll_dirichlet are not ported yet.
-TEST_CASE("test_sparse_hellinger" * doctest::skip()) {}
+TEST_CASE("test_sparse_hellinger") {
+    // sparse_hellinger(|row_i|, |row_j|) over rows [:-2] vs the reference
+    // pairwise_special_metric golden (upstream decimal=3).
+    SparseRows s = sparse_spatial_csr();
+    std::vector<float> absdata = s.data;
+    for (float& v : absdata) v = std::abs(v);
+    const int n = kSpatialN - 2;
+    const double tol = 1.5e-3;
+    for (int i = 0; i < n; ++i)
+        for (int j = 0; j < n; ++j) {
+            const float d = umap::spdist::sparse_hellinger(
+                s.indices.data() + s.indptr[i], absdata.data() + s.indptr[i],
+                s.indptr[i + 1] - s.indptr[i], s.indices.data() + s.indptr[j],
+                absdata.data() + s.indptr[j], s.indptr[j + 1] - s.indptr[j]);
+            CAPTURE(i);
+            CAPTURE(j);
+            CHECK(std::abs(static_cast<double>(d) -
+                           umgold::sparse_hellinger_golden[i * n + j]) < tol);
+        }
+
+    // "Ensure ll_dirichlet runs" -- evaluate the full 12 x 12 matrix on the
+    // RAW signed data like upstream, which only asserts the result is not
+    // None (NaN entries from log of negative sums are permitted upstream, so
+    // no per-entry value check here; the assertion is that it evaluates).
+    int evaluated = 0;
+    for (int i = 0; i < kSpatialN; ++i)
+        for (int j = 0; j < kSpatialN; ++j) {
+            const volatile float d = umap::spdist::sparse_ll_dirichlet(
+                s.indices.data() + s.indptr[i], s.data.data() + s.indptr[i],
+                s.indptr[i + 1] - s.indptr[i], s.indices.data() + s.indptr[j],
+                s.data.data() + s.indptr[j], s.indptr[j + 1] - s.indptr[j]);
+            (void)d;
+            ++evaluated;
+        }
+    CHECK(evaluated == kSpatialN * kSpatialN);
+}
 
 TEST_CASE("test_grad_metrics_match_metrics") {
     // named_distances_with_gradients ∩ spatial_distances, like upstream.

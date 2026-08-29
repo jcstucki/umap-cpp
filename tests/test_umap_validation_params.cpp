@@ -4,9 +4,9 @@
 //
 // Skips (see tests/PORTING_NOTES.md): tests whose invalid value cannot be
 // expressed against the typed C++ params surface (non-integer n_components,
-// numeric metric/init objects), and tests of unported features (output_metric,
-// target_n_neighbors, densmap knobs, n_jobs, callable metrics, update(),
-// inverse_transform(), supervised y).
+// numeric metric/init objects, y length mismatches against the pointer-typed
+// y), n_jobs, callable metrics, and unported features (update(),
+// inverse_transform()).
 #include <cstdint>
 #include <random>
 #include <stdexcept>
@@ -134,10 +134,23 @@ TEST_CASE("test_umap_negative_n_epochs") {
     check_fit_raises(p);
 }
 
-// target_n_neighbors belongs to the unported supervised-fit surface.
-TEST_CASE("test_umap_negative_target_n_neighbours" * doctest::skip()) {}
-// output_metric is not wired into the UMAP class yet.
-TEST_CASE("test_umap_bad_output_metric" * doctest::skip()) {}
+TEST_CASE("test_umap_negative_target_n_neighbours") {
+    UMAPParams p;
+    p.target_n_neighbors = 1;
+    check_fit_raises(p);
+}
+
+TEST_CASE("test_umap_bad_output_metric") {
+    UMAPParams p;
+    p.output_metric = "foobar";
+    check_fit_raises(p);
+    p = UMAPParams();
+    p.output_metric = "precomputed";
+    check_fit_raises(p);
+    p = UMAPParams();
+    p.output_metric = "hamming";  // named distance without a gradient
+    check_fit_raises(p);
+}
 
 TEST_CASE("test_haversine_on_highd") {
     UMAPParams p;
@@ -145,7 +158,15 @@ TEST_CASE("test_haversine_on_highd") {
     check_fit_raises(p);  // nn_data is 5-dimensional
 }
 
-TEST_CASE("test_umap_haversine_embed_to_highd" * doctest::skip()) {}
+TEST_CASE("test_umap_haversine_embed_to_highd") {
+    // Raised when the output metric is resolved for a 3-d embedding
+    // ("haversine is only defined for 2 dimensional data"), after the kNN
+    // stage, exactly like the upstream fit.
+    UMAPParams p;
+    p.n_components = 3;
+    p.output_metric = "haversine";
+    check_fit_raises(p);
+}
 
 TEST_CASE("test_umap_too_many_neighbors_warns") {
     UMAPParams p;
@@ -162,11 +183,37 @@ TEST_CASE("test_umap_too_many_neighbors_warns") {
     CHECK(u.effective_n_neighbors() == 99);
 }
 
-// densmap is being ported on main; its validation knobs are not present yet.
-TEST_CASE("test_densmap_lambda" * doctest::skip()) {}
-TEST_CASE("test_densmap_var_shift" * doctest::skip()) {}
-TEST_CASE("test_densmap_frac" * doctest::skip()) {}
-TEST_CASE("test_densmap_bad_output_metric" * doctest::skip()) {}
+TEST_CASE("test_densmap_lambda") {
+    UMAPParams p;
+    p.densmap = true;
+    p.dens_lambda = -1.0;
+    check_fit_raises(p);
+}
+
+TEST_CASE("test_densmap_var_shift") {
+    UMAPParams p;
+    p.densmap = true;
+    p.dens_var_shift = -1.0;
+    check_fit_raises(p);
+}
+
+TEST_CASE("test_densmap_frac") {
+    UMAPParams p;
+    p.densmap = true;
+    p.dens_frac = -1.0;
+    check_fit_raises(p);
+    p = UMAPParams();
+    p.densmap = true;
+    p.dens_frac = 2.0;
+    check_fit_raises(p);
+}
+
+TEST_CASE("test_densmap_bad_output_metric") {
+    UMAPParams p;
+    p.densmap = true;
+    p.output_metric = "haversine";
+    check_fit_raises(p);
+}
 
 TEST_CASE("test_umap_unique_and_precomputed") {
     UMAPParams p;
@@ -225,11 +272,11 @@ TEST_CASE("test_umap_update_bad_params") {
     }
 }
 // -----------------------------------------------------------------------------
-// fit(X, y) length validation belongs to the unported supervised surface.
+// fit(X, y) length mismatches are unrepresentable against the pointer-typed
+// y surface (y carries no length; callers pass n_samples-length arrays).
 TEST_CASE("test_umap_fit_data_and_targets_compliant" * doctest::skip()) {}
 
 TEST_CASE("test_umap_fit_instance_returned") {
-    // Data-only variant (fit(x, y) needs the supervised surface).
     std::mt19937 rng(0);
     std::uniform_real_distribution<float> unif(0.0f, 1.0f);
     std::vector<float> x(256 * 10);
@@ -237,6 +284,16 @@ TEST_CASE("test_umap_fit_instance_returned") {
     UMAPParams p;
     p.n_epochs = 11;
     p.init = "random";
+
+    // Passing both data and targets.
+    std::vector<float> y(256);
+    std::uniform_int_distribution<int> randint(0, 9);
+    for (float& v : y) v = static_cast<float>(randint(rng));
+    UMAP uy(p);
+    UMAP& res_y = uy.fit(x.data(), 256, 10, y.data());
+    CHECK(&res_y == &uy);
+
+    // Passing only data.
     UMAP u(p);
     UMAP& res = u.fit(x.data(), 256, 10);
     CHECK(&res == &u);

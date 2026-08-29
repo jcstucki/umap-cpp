@@ -1,10 +1,9 @@
 // Port of reference/umap/umap/tests/test_umap_repeated_data.py to doctest
 // (upstream test names preserved). spatial_repeats / binary_repeats are the
 // conftest fixtures baked in tests/upstream_data.hpp; repetition_dense is the
-// literal conftest array.
-//
-// Skips: the four sparse variants (sparse input is not wired into the UMAP
-// class yet) -- see tests/PORTING_NOTES.md.
+// literal conftest array. The sparse variants build conftest's
+// sparse_spatial_data_repeats = csr(spatial_repeats * binary_repeats) and
+// sparse_binary_data_repeats = csr(binary_repeats) from the baked fixtures.
 #include <cstdint>
 #include <vector>
 
@@ -29,12 +28,48 @@ bool first_two_rows_identical(const UMAP& model) {
     return true;
 }
 
+// conftest.py::sparse_spatial_data_repeats = csr(spatial_repeats *
+// binary_repeats).
+testutil::Csr sparse_spatial_repeats_csr() {
+    std::vector<float> dense(static_cast<std::size_t>(kRepN) * kRepDim);
+    for (std::size_t i = 0; i < dense.size(); ++i)
+        dense[i] = static_cast<float>(updata::spatial_repeats[i] *
+                                      updata::binary_repeats[i]);
+    return testutil::dense_to_csr(dense.data(), kRepN, kRepDim);
+}
+
+// conftest.py::sparse_binary_data_repeats = csr(binary_repeats).
+testutil::Csr sparse_binary_repeats_csr() {
+    const std::vector<float> dense = testutil::to_f32(
+        updata::binary_repeats, static_cast<std::size_t>(kRepN) * kRepDim);
+    return testutil::dense_to_csr(dense.data(), kRepN, kRepDim);
+}
+
+UMAP fit_sparse(const testutil::Csr& csr, bool force_approx, int n_epochs) {
+    UMAPParams p;
+    p.n_neighbors = 3;
+    p.unique = true;
+    p.force_approximation_algorithm = force_approx;
+    p.n_epochs = n_epochs;
+    UMAP model(p);
+    model.fit(csr.indptr.data(), csr.indices.data(), csr.data.data(), kRepN,
+              kRepDim);
+    return model;
+}
+
 }  // namespace
 
 TEST_SUITE("test_umap_repeated_data.py") {
 
-TEST_CASE("test_repeated_points_large_sparse_spatial" * doctest::skip()) {}
-TEST_CASE("test_repeated_points_small_sparse_spatial" * doctest::skip()) {}
+TEST_CASE("test_repeated_points_large_sparse_spatial") {
+    const UMAP model = fit_sparse(sparse_spatial_repeats_csr(), true, 20);
+    CHECK(first_two_rows_identical(model));
+}
+
+TEST_CASE("test_repeated_points_small_sparse_spatial") {
+    const UMAP model = fit_sparse(sparse_spatial_repeats_csr(), false, 20);
+    CHECK(first_two_rows_identical(model));
+}
 
 TEST_CASE("test_repeated_points_large_dense_spatial") {
     const std::vector<float> data = testutil::to_f32(
@@ -61,8 +96,15 @@ TEST_CASE("test_repeated_points_small_dense_spatial") {
     CHECK(first_two_rows_identical(model));
 }
 
-TEST_CASE("test_repeated_points_large_sparse_binary" * doctest::skip()) {}
-TEST_CASE("test_repeated_points_small_sparse_binary" * doctest::skip()) {}
+TEST_CASE("test_repeated_points_large_sparse_binary") {
+    const UMAP model = fit_sparse(sparse_binary_repeats_csr(), true, 50);
+    CHECK(first_two_rows_identical(model));
+}
+
+TEST_CASE("test_repeated_points_small_sparse_binary") {
+    const UMAP model = fit_sparse(sparse_binary_repeats_csr(), false, 20);
+    CHECK(first_two_rows_identical(model));
+}
 
 TEST_CASE("test_repeated_points_large_dense_binary") {
     const std::vector<float> data = testutil::to_f32(
