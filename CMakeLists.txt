@@ -85,6 +85,10 @@ target_sources(umapcpp PRIVATE src/model_io.cpp src/umap_c.cpp)
 target_sources(umapcpp PRIVATE src/supervised.cpp)
 # ----------------------------------------------------------------------------
 
+# --- aligned-umap additions --------------------------------------------------
+target_sources(umapcpp PRIVATE src/aligned_umap.cpp src/layouts_aligned.cpp)
+# ----------------------------------------------------------------------------
+
 # --- densmap additions ------------------------------------------------------
 # densMAP replicates np.dot(float32, float32) via the same BLAS numpy's macOS
 # wheels link (Accelerate); off Apple platforms a sequential f32 dot is used.
@@ -261,6 +265,10 @@ target_sources(umap_tests PRIVATE
 # Port of test_composite_models.py (UMAP operator* / + / -); goldens from
 # scripts/gen_golden_composite.py -> tests/golden_composite.hpp.
 target_sources(umap_tests PRIVATE tests/test_composite_models.cpp)
+# ----------------------------------------------------------------------------
+
+# --- aligned-umap additions --------------------------------------------------
+target_sources(umap_tests PRIVATE tests/test_aligned.cpp)
 # ----------------------------------------------------------------------------
 
 # --- metal-gpu additions ----------------------------------------------------

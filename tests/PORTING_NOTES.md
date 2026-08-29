@@ -51,8 +51,28 @@ per file below.
   progress on main).
 - fit_transform's upstream (embedding, rad_h, rad_l) tuple maps to
   fit_transform + rad_orig()/rad_emb() accessors.
+| test_densmap.py | densmap in progress on main (separate workstream) |
+| test_composite_models.py | fuzzy-set union/intersection composite models not ported |
+| test_spectral.py | both tests target `tswspectral_layout` (init="tswspectral" is TODO); the ported `spectral_layout` surface is already covered by tests/test_spectral.cpp (eigenpair parity, multi-component layouts, dispatch) |
 
 ## Per-file skips / adaptations
+
+### test_aligned.cpp (branch aligned-umap; test_aligned_umap.py port lives here)
+- Fixtures aligned_iris / aligned_iris_relations replicated from conftest.py
+  (5 iris slices of 50 rows, stride 25; 4 x {a: a+25}). Upstream's
+  aligned_iris_model is UNSEEDED; the port bakes random_state=42, for which
+  the reference passes the same thresholds (verified in
+  scripts/gen_golden_aligned.py: nn_acc 0.718/0.782/0.752/0.776/0.740,
+  ari 1.000/0.633). Thresholds verbatim (0.65 / 0.75+0.40 / 0.45).
+- nn_accuracy's argsort uses a stable sort (upstream np.argsort quicksort tie
+  order differs at exact-tie boundaries; noise-level for these bars).
+- KMeans in test_local_clustering is the seeded testutil helper (upstream
+  KMeans is unseeded).
+- Skip: test_aligned_update_array_error (upstream @pytest.mark.skip
+  "Temporarily disable"; also passes arrays where scalars are expected,
+  unrepresentable in the typed C++ surface).
+- test_expand_relations_golden_ws3 / test_expand_relations_shape_and_sum:
+  characterization constants verbatim.
 
 ### test_umap_trustworthiness.cpp
 - Skip: `test_string_metric_supervised_umap_trustworthiness` -- upstream's y
