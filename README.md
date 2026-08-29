@@ -24,15 +24,26 @@ kNN, `unique=True`, ndarray/PCA init stages, n_epochs lists, graph mode,
 whole kNN/fuzzy-graph pipeline of the NN-descent branch (indices identical;
 distances ~1 ulp due to numba fastmath), and sparse-input equivalents.
 Stochastic-quality paths are validated with the upstream test-suite thresholds
-(trustworthiness / kNN accuracy / ARI, ported verbatim).
+(trustworthiness / kNN accuracy / ARI, ported verbatim). The hardening pass
+extends the surface to upstream's full sparse small-data metric routing
+(including the float64 sklearn manhattan kernel and the densify fallback),
+sparse precomputed distance matrices, sparse search-index persistence,
+callable metrics (`custom_metric`/`custom_metric_grad`/`custom_output_metric`
+as the `std::function` equivalents of upstream's callables), and `n_jobs`
+parallelism gating (seeded fits force `n_jobs=1` with upstream's warning).
 
 Documented deviations (each noted at its definition site and in
 [ROADMAP.md](ROADMAP.md)): Spectra-vs-ARPACK eigensolver residuals in spectral
 init (~1e-6, up to sign), `find_ab_params` reaching scipy's optimum to ~1e-7,
 tau-prng standing in for `RandomState` in some multi-component spectral
-branches, exact-tie ordering in a few argsort/argpartition sites, and the GPU
-path's float32/hogwild semantics (below). `ROADMAP.md` is the authoritative,
-per-feature log of parity levels and deviations.
+branches, exact-tie ordering in a few argsort/argpartition sites (including
+the sparse-precomputed k-selection), sparse `init="pca"` (sklearn's
+randomized TruncatedSVD is not bit-replicable) and callable metrics on sparse
+input (the CSR callable signature) both raising, kNN construction staying
+single-threaded regardless of `n_jobs` (performance-only; bit-exact with
+`NUMBA_NUM_THREADS=1`), `"custom"`-metric models not being serialisable, and
+the GPU path's float32/hogwild semantics (below). `ROADMAP.md` is the
+authoritative, per-feature log of parity levels and deviations.
 
 ## Building
 
@@ -192,7 +203,6 @@ Intentionally not ported (Python-ecosystem-bound; documented here and in
 * **`umap.plot`** and the Bokeh/interactive tooling — matplotlib/pandas/
   datashader front-ends; use the CSV/npy outputs with your plotting tool of
   choice.
-* AlignedUMAP is tracked in ROADMAP.md (in progress on a separate branch).
 
 ## Layout
 
