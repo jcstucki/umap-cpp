@@ -625,6 +625,57 @@ std::vector<float> sparse_pairwise_distances_sklearn(
         "densifies via pairwise_special_metric)");
 }
 
+// --- hardening additions -----------------------------------------------------
+// sklearn manhattan_distances on CSR float32 input: the cython
+// _sparse_manhattan kernel (pairwise_fast.pyx). Per pair the two rows merge
+// by ascending column; on shared columns the *float32* subtraction
+// X_data[i] - Y_data[j] feeds C fabs (double), unmatched entries contribute
+// fabs(float32 value); the accumulator and the output matrix are float64.
+std::vector<double> sparse_manhattan_sklearn(
+    const int32_t* x_indptr, const int32_t* x_indices, const float* x_data,
+    int64_t nx, const int32_t* y_indptr, const int32_t* y_indices,
+    const float* y_data, int64_t ny) {
+    std::vector<double> out(static_cast<std::size_t>(nx) * ny, 0.0);
+    for (int64_t px = 0; px < nx; ++px) {
+        const int32_t x_end = x_indptr[px + 1];
+        for (int64_t py = 0; py < ny; ++py) {
+            const int32_t y_end = y_indptr[py + 1];
+            int32_t i = x_indptr[px];
+            int32_t j = y_indptr[py];
+            double d = 0.0;
+            while (i < x_end && j < y_end) {
+                const int32_t ix = x_indices[i];
+                const int32_t iy = y_indices[j];
+                if (ix == iy) {
+                    // float32 subtraction (both operands are `floating`),
+                    // fabs/accumulation in double.
+                    const float diff = x_data[i] - y_data[j];
+                    d += std::fabs(static_cast<double>(diff));
+                    ++i;
+                    ++j;
+                } else if (ix < iy) {
+                    d += std::fabs(static_cast<double>(x_data[i]));
+                    ++i;
+                } else {
+                    d += std::fabs(static_cast<double>(y_data[j]));
+                    ++j;
+                }
+            }
+            while (j < y_end) {
+                d += std::fabs(static_cast<double>(y_data[j]));
+                ++j;
+            }
+            while (i < x_end) {
+                d += std::fabs(static_cast<double>(x_data[i]));
+                ++i;
+            }
+            out[static_cast<std::size_t>(px) * ny + py] = d;
+        }
+    }
+    return out;
+}
+// -----------------------------------------------------------------------------
+
 // ----------------------------------------------------------------------------
 
 namespace {
@@ -846,6 +897,81 @@ const std::set<std::string>& upstream_pynn_sparse_named_distances() {
         "sqeuclidean", "symmetric-kl", "symmetric_kullback_liebler",
         "wasserstein", "wasserstein-1d", "wasserstein_1d"};
     return s;
+}
+
+// X.toarray() row expansion (CSR indices are sorted and duplicate-free after
+// the fit()-side sort_indices replication).
+std::vector<float> csr_to_dense_rows(const int32_t* indptr,
+                                     const int32_t* indices, const float* data,
+                                     int64_t n, int64_t dim) {
+    std::vector<float> out(static_cast<std::size_t>(n) * dim, 0.0f);
+    for (int64_t i = 0; i < n; ++i)
+        for (int32_t k = indptr[i]; k < indptr[i + 1]; ++k)
+            out[static_cast<std::size_t>(i) * dim + indices[k]] = data[k];
+    return out;
+}
+
+// The small-data sparse distance matrix with upstream's full routing:
+//   try: dmat = pairwise_distances(X[, Y], metric=self.metric, **kwds)
+//     -> sklearn-native sparse kernels: euclidean/l2 (float32 upcast
+//        kernel), cosine (float32), manhattan/l1/cityblock (the float64
+//        _sparse_manhattan kernel);
+//   except (ValueError, TypeError):  # unknown-to-sklearn or scipy-on-sparse
+//     -> dmat = pairwise_special_metric(X.toarray()[, Y.toarray()],
+//            metric=dist.named_distances[self.metric], kwds=...)
+//        == the densified float32 _pairwise_callable route
+//        (pairwise_distances_sklearn);
+//   names only pynndescent's registries admit KeyError upstream
+//   (dist.named_distances[metric] inside the except block) -- mapped to
+//   std::out_of_range here.
+// Only the manhattan family produces a float64 matrix (is_f64).
+struct SparseSmallDmat {
+    std::vector<float> f32;
+    std::vector<double> f64;
+    bool is_f64 = false;
+};
+
+SparseSmallDmat sparse_small_dmat(const int32_t* x_indptr,
+                                  const int32_t* x_indices,
+                                  const float* x_data, int64_t nx,
+                                  const int32_t* y_indptr,
+                                  const int32_t* y_indices,
+                                  const float* y_data, int64_t ny,
+                                  int64_t dim, const std::string& metric,
+                                  const MetricKwds& kwds, bool x_is_y) {
+    SparseSmallDmat r;
+    if (metric == "euclidean" || metric == "l2" || metric == "cosine") {
+        r.f32 = sparse_pairwise_distances_sklearn(
+            x_indptr, x_indices, x_data, nx, y_indptr, y_indices, y_data, ny,
+            metric, x_is_y);
+        return r;
+    }
+    if (metric == "manhattan" || metric == "l1" || metric == "cityblock") {
+        r.f64 = sparse_manhattan_sklearn(x_indptr, x_indices, x_data, nx,
+                                         y_indptr, y_indices, y_data, ny);
+        r.is_f64 = true;
+        return r;
+    }
+    if (upstream_named_distances().count(metric) == 0) {
+        // Upstream: dist.named_distances[self.metric] raises KeyError (only
+        // pynndescent's registries know the name), which fit does not catch.
+        throw std::out_of_range(
+            "sparse small-data fit: metric '" + metric +
+            "' is not in umap's named_distances registry -- upstream raises "
+            "KeyError in the pairwise_special_metric fallback");
+    }
+    const std::vector<float> Xd =
+        csr_to_dense_rows(x_indptr, x_indices, x_data, nx, dim);
+    if (x_is_y) {
+        r.f32 = pairwise_distances_sklearn(Xd.data(), nx, Xd.data(), ny, dim,
+                                           metric, /*x_is_y=*/true, kwds);
+    } else {
+        const std::vector<float> Yd =
+            csr_to_dense_rows(y_indptr, y_indices, y_data, ny, dim);
+        r.f32 = pairwise_distances_sklearn(Xd.data(), nx, Yd.data(), ny, dim,
+                                           metric, /*x_is_y=*/false, kwds);
+    }
+    return r;
 }
 
 }  // namespace
@@ -1511,6 +1637,15 @@ UMAP& UMAP::fit_impl(const float* X, int64_t n_samples, int64_t n_features,
                 throw std::invalid_argument(
                     "Metric 'hellinger' does not support negative values");
     }
+    // hardening additions: the sparse flavour of the same guard (upstream
+    // X.min() < 0; implicit zeros can never be negative, so the stored
+    // values decide).
+    if (X == nullptr && params_.metric == "hellinger") {
+        for (float v : raw_values_)
+            if (v < 0.0f)
+                throw std::invalid_argument(
+                    "Metric 'hellinger' does not support negative values");
+    }
     // ------------------------------------------------------------------------
     n_ = n_samples;
     dim_ = n_features;
@@ -1764,6 +1899,7 @@ UMAP& UMAP::fit_impl(const float* X, int64_t n_samples, int64_t n_features,
         if (!gpu_knn_done) {
         // ---------------------------------------------------------------------
         std::vector<float> dmat;
+        bool f64_knn_done = false;  // hardening additions: manhattan family
         if (params_.metric == "precomputed") {
             // pairwise_distances(X, metric="precomputed") is a validated
             // passthrough of the input distance matrix.
@@ -1771,12 +1907,43 @@ UMAP& UMAP::fit_impl(const float* X, int64_t n_samples, int64_t n_features,
                         X_indexed + static_cast<std::size_t>(n_index) * n_index);
         } else if (sparse_data_) {
             // --- supervised-sparse additions --------------------------------
-            // pairwise_distances(X_csr, metric=self.metric): sklearn's native
-            // sparse float32 kernels (euclidean/l2, cosine).
-            dmat = sparse_pairwise_distances_sklearn(
+            // pairwise_distances(X_csr, metric=self.metric) with upstream's
+            // full routing (hardening additions): sklearn's native sparse
+            // kernels for euclidean/l2/cosine (float32) and the manhattan
+            // family (float64 _sparse_manhattan), the densify fallback
+            // (pairwise_special_metric) for every other admitted name.
+            SparseSmallDmat sd = sparse_small_dmat(
                 sp_indptr, sp_indices, sp_values, n_index, sp_indptr,
-                sp_indices, sp_values, n_index, params_.metric,
-                /*x_is_y=*/true);
+                sp_indices, sp_values, n_index, n_features, params_.metric,
+                params_.metric_kwds, /*x_is_y=*/true);
+            if (sd.is_f64) {
+                // float64 mask + fast_knn_indices; the astype(np.float32)
+                // lands where upstream's does (fuzzy_simplicial_set's
+                // knn_dists.astype after nearest_neighbors "precomputed").
+                if (std::isfinite(disconnection_distance_)) {
+                    for (double& v : sd.f64) {
+                        if (v >= disconnection_distance_) {
+                            ++edges_removed_;
+                            v = std::numeric_limits<double>::infinity();
+                        }
+                    }
+                }
+                knn_cols_ = n_neighbors_;
+                knn_indices_.assign(
+                    static_cast<std::size_t>(n_index) * n_neighbors_, -1);
+                std::vector<double> kdst(
+                    static_cast<std::size_t>(n_index) * n_neighbors_);
+                fast_knn_from_dmat_f64(sd.f64, n_index, n_index, n_neighbors_,
+                                       knn_indices_.data(), kdst.data());
+                knn_dists_.resize(kdst.size());
+                for (std::size_t i = 0; i < kdst.size(); ++i) {
+                    if (std::isinf(kdst[i])) knn_indices_[i] = -1;
+                    knn_dists_[i] = static_cast<float>(kdst[i]);
+                }
+                f64_knn_done = true;
+            } else {
+                dmat = std::move(sd.f32);
+            }
             // ----------------------------------------------------------------
         } else {
             // hardening additions: metric == "custom" rides the identical
@@ -1788,6 +1955,7 @@ UMAP& UMAP::fit_impl(const float* X, int64_t n_samples, int64_t n_features,
                                               params_.metric, /*x_is_y=*/true,
                                               params_.metric_kwds, &cid);
         }
+        if (!f64_knn_done) {
         // dmat[dmat >= self._disconnection_distance] = np.inf (skipped for
         // the default +inf threshold, where the mask is all-False).
         if (std::isfinite(disconnection_distance_)) {
@@ -1810,6 +1978,7 @@ UMAP& UMAP::fit_impl(const float* X, int64_t n_samples, int64_t n_features,
         for (std::size_t i = 0; i < knn_dists_.size(); ++i) {
             if (std::isinf(knn_dists_[i])) knn_indices_[i] = -1;
         }
+        }  // if (!f64_knn_done)  -- hardening additions
         // --- phase4 additions ------------------------------------------------
         }  // if (!gpu_knn_done): end of the CPU pairwise/fast_knn path
         // ---------------------------------------------------------------------
@@ -3167,13 +3336,20 @@ UMAP& UMAP::update_impl(const float* X_new, const int32_t* new_indptr,
         if (n_total < 4096) {
             // Still small data: full pairwise recompute +
             // fuzzy_simplicial_set(dmat, self._n_neighbors, "precomputed").
+            // hardening additions: the sparse dmat takes upstream's full
+            // metric routing (float64 manhattan kernel, densify fallback).
             std::vector<float> dmat;
+            std::vector<double> dmat64;
+            bool is_f64 = false;
             if (sparse_data_) {
-                dmat = sparse_pairwise_distances_sklearn(
+                SparseSmallDmat sd = sparse_small_dmat(
                     raw_indptr_.data(), raw_indices_.data(),
                     raw_values_.data(), n_total, raw_indptr_.data(),
-                    raw_indices_.data(), raw_values_.data(), n_total,
-                    params_.metric, /*x_is_y=*/true);
+                    raw_indices_.data(), raw_values_.data(), n_total, dim_,
+                    params_.metric, params_.metric_kwds, /*x_is_y=*/true);
+                is_f64 = sd.is_f64;
+                dmat = std::move(sd.f32);
+                dmat64 = std::move(sd.f64);
             } else {
                 // hardening additions: custom metrics take the same
                 // _pairwise_callable route as fit's small-data branch.
@@ -3189,8 +3365,19 @@ UMAP& UMAP::update_impl(const float* X_new, const int32_t* new_indptr,
                 static_cast<std::size_t>(n_total) * n_neighbors_);
             std::vector<float> kdst(
                 static_cast<std::size_t>(n_total) * n_neighbors_);
-            fast_knn_from_dmat(dmat, n_total, n_total, n_neighbors_,
-                               kidx.data(), kdst.data());
+            if (is_f64) {
+                // float64 k-selection; the astype(np.float32) lands at
+                // fuzzy_simplicial_set's boundary like upstream.
+                std::vector<double> kdst64(
+                    static_cast<std::size_t>(n_total) * n_neighbors_);
+                fast_knn_from_dmat_f64(dmat64, n_total, n_total, n_neighbors_,
+                                       kidx.data(), kdst64.data());
+                for (std::size_t i = 0; i < kdst64.size(); ++i)
+                    kdst[i] = static_cast<float>(kdst64[i]);
+            } else {
+                fast_knn_from_dmat(dmat, n_total, n_total, n_neighbors_,
+                                   kidx.data(), kdst.data());
+            }
             fuzzy = fuzzy_simplicial_set(
                 static_cast<int>(n_total), kidx.data(), kdst.data(),
                 n_neighbors_, params_.set_op_mix_ratio,
@@ -3198,20 +3385,26 @@ UMAP& UMAP::update_impl(const float* X_new, const int32_t* new_indptr,
                 /*return_dists=*/false);
             // knn_indices = np.argsort(dmat)[:, : self.n_neighbors] (note:
             // self.n_neighbors, not _n_neighbors; plain argsort -- exact-tie
-            // order deviation documented). self._knn_indices/_knn_dists stay
-            // the *fit-time* arrays, exactly like upstream.
+            // order deviation documented; runs on the float64 dmat for the
+            // manhattan family). self._knn_indices/_knn_dists stay the
+            // *fit-time* arrays, exactly like upstream.
             init_knn_cols =
                 std::min<int64_t>(params_.n_neighbors, n_total);
             init_knn.resize(static_cast<std::size_t>(n_total) *
                             init_knn_cols);
             std::vector<int64_t> row_order(static_cast<std::size_t>(n_total));
             for (int64_t i = 0; i < n_total; ++i) {
-                const float* row =
-                    dmat.data() + static_cast<std::size_t>(i) * n_total;
+                const float* row32 =
+                    is_f64 ? nullptr
+                           : dmat.data() + static_cast<std::size_t>(i) * n_total;
+                const double* row64 =
+                    is_f64 ? dmat64.data() + static_cast<std::size_t>(i) * n_total
+                           : nullptr;
                 std::iota(row_order.begin(), row_order.end(), 0);
                 std::stable_sort(row_order.begin(), row_order.end(),
                                  [&](int64_t a, int64_t b) {
-                                     return row[a] < row[b];
+                                     return is_f64 ? row64[a] < row64[b]
+                                                   : row32[a] < row32[b];
                                  });
                 for (int64_t j = 0; j < init_knn_cols; ++j)
                     init_knn[static_cast<std::size_t>(i * init_knn_cols + j)] =
@@ -3364,16 +3557,28 @@ MembershipStrengths UMAP::transform_membership_sparse(
     std::vector<float> dists;
     if (small_data_) {
         // pairwise_distances(X_new, self._raw_data, metric=self.metric) +
-        // argpartition/argsort (== stable k-smallest per row).
+        // argpartition/argsort (== stable k-smallest per row). hardening
+        // additions: upstream's full metric routing (float64 manhattan
+        // kernel, densify fallback); dists.astype(np.float32) happens after
+        // the k-selection, exactly like transform().
         cols = n_neighbors_;
-        const std::vector<float> dmat = sparse_pairwise_distances_sklearn(
+        SparseSmallDmat sd = sparse_small_dmat(
             q_indptr, q_indices, q_data, n_queries, raw_indptr_.data(),
-            raw_indices_.data(), raw_values_.data(), n_, params_.metric,
-            /*x_is_y=*/false);
+            raw_indices_.data(), raw_values_.data(), n_, dim_, params_.metric,
+            params_.metric_kwds, /*x_is_y=*/false);
         indices.resize(static_cast<std::size_t>(n_queries) * cols);
         dists.resize(static_cast<std::size_t>(n_queries) * cols);
-        fast_knn_from_dmat(dmat, n_queries, n_, cols, indices.data(),
-                           dists.data());
+        if (sd.is_f64) {
+            std::vector<double> kdst(static_cast<std::size_t>(n_queries) *
+                                     cols);
+            fast_knn_from_dmat_f64(sd.f64, n_queries, n_, cols,
+                                   indices.data(), kdst.data());
+            for (std::size_t i = 0; i < kdst.size(); ++i)
+                dists[i] = static_cast<float>(kdst[i]);
+        } else {
+            fast_knn_from_dmat(sd.f32, n_queries, n_, cols, indices.data(),
+                               dists.data());
+        }
     } else {
         if (!sparse_knn_index_) {
             throw std::runtime_error(

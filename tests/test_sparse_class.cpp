@@ -149,6 +149,104 @@ TEST_CASE("sparse class: small-data cosine fit+transform (p2, bit-exact)") {
     CHECK(count_mismatch(temb, golden_sparse_class::p2_t_embedding) == 0);
 }
 
+// --- hardening additions -----------------------------------------------------
+TEST_CASE("sparse class: small-data manhattan fit+transform (p6, bit-exact)") {
+    // sklearn's float64 _sparse_manhattan kernel (float32 subtraction on
+    // shared columns, float64 fabs-accumulation), float64 fast_knn_indices,
+    // astype(np.float32) at the fuzzy_simplicial_set / transform boundary.
+    UMAPParams p = base_params();
+    p.metric = "manhattan";
+    UMAP model(p);
+    const std::vector<float> emb = model.fit_transform(
+        golden_sparse_class::p6_indptr, golden_sparse_class::p6_indices,
+        golden_sparse_class::p6_data, golden_sparse_class::p6_n,
+        golden_sparse_class::p6_dim);
+    CHECK(model.sparse_data());
+    CHECK(model.small_data());
+    CHECK(count_mismatch(emb, golden_sparse_class::p6_embedding) == 0);
+
+    const std::vector<float> temb = model.transform(
+        golden_sparse_class::p6_q_indptr, golden_sparse_class::p6_q_indices,
+        golden_sparse_class::p6_q_data, golden_sparse_class::p6_q_n);
+    CHECK(count_mismatch(temb, golden_sparse_class::p6_t_embedding) == 0);
+}
+
+TEST_CASE("sparse class: small-data hellinger fit+transform (p7, densify "
+          "fallback, bit-exact)") {
+    // Upstream: sklearn raises for metric="hellinger" on sparse input, and
+    // fit falls back to pairwise_special_metric(X.toarray()) -- the float32
+    // _pairwise_callable route with umap's numba hellinger kernel.
+    UMAPParams p = base_params();
+    p.metric = "hellinger";
+    UMAP model(p);
+    const std::vector<float> emb = model.fit_transform(
+        golden_sparse_class::p7_indptr, golden_sparse_class::p7_indices,
+        golden_sparse_class::p7_data, golden_sparse_class::p7_n,
+        golden_sparse_class::p7_dim);
+    CHECK(model.small_data());
+    CHECK(count_mismatch(emb, golden_sparse_class::p7_embedding) == 0);
+
+    const std::vector<float> temb = model.transform(
+        golden_sparse_class::p7_q_indptr, golden_sparse_class::p7_q_indices,
+        golden_sparse_class::p7_q_data, golden_sparse_class::p7_q_n);
+    CHECK(count_mismatch(temb, golden_sparse_class::p7_t_embedding) == 0);
+}
+
+TEST_CASE("sparse class: metric validation replicates the upstream elif "
+          "chain") {
+    const auto sparse_fit_throws = [](const std::string& metric) {
+        UMAPParams p = base_params();
+        p.metric = metric;
+        UMAP model(p);
+        CHECK_THROWS_AS(model.fit(golden_sparse_class::p1_indptr,
+                                  golden_sparse_class::p1_indices,
+                                  golden_sparse_class::p1_data,
+                                  golden_sparse_class::p1_n,
+                                  golden_sparse_class::p1_dim),
+                        std::invalid_argument);
+    };
+    // "Metric {} is not supported for sparse data": dist.named_distances
+    // names missing from umap's sparse registry ...
+    sparse_fit_throws("l2");
+    sparse_fit_throws("symmetric_kl");
+    sparse_fit_throws("seuclidean");
+    sparse_fit_throws("yule");
+    // ... and pynndescent names missing from its sparse registry.
+    sparse_fit_throws("spearmanr");
+
+    // pynndescent-only sparse names pass validation but KeyError upstream on
+    // the small-data branch (dist.named_distances[metric] in the fallback).
+    {
+        UMAPParams p = base_params();
+        p.metric = "sqeuclidean";
+        UMAP model(p);
+        CHECK_THROWS_AS(model.fit(golden_sparse_class::p1_indptr,
+                                  golden_sparse_class::p1_indices,
+                                  golden_sparse_class::p1_data,
+                                  golden_sparse_class::p1_n,
+                                  golden_sparse_class::p1_dim),
+                        std::out_of_range);
+    }
+
+    // The hellinger negative-data guard covers sparse values too.
+    {
+        std::vector<float> neg(golden_sparse_class::p1_data,
+                               golden_sparse_class::p1_data +
+                                   golden_sparse_class::p1_indptr
+                                       [golden_sparse_class::p1_n]);
+        neg[3] = -neg[3];
+        UMAPParams p = base_params();
+        p.metric = "hellinger";
+        UMAP model(p);
+        CHECK_THROWS_AS(model.fit(golden_sparse_class::p1_indptr,
+                                  golden_sparse_class::p1_indices, neg.data(),
+                                  golden_sparse_class::p1_n,
+                                  golden_sparse_class::p1_dim),
+                        std::invalid_argument);
+    }
+}
+// -----------------------------------------------------------------------------
+
 TEST_CASE("sparse class: unique=True csr_unique fit (p5, bit-exact)") {
     UMAPParams p = base_params();
     p.unique = true;

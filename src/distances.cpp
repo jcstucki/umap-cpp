@@ -1480,6 +1480,31 @@ DistanceF32Fn make_metric_f32(const std::string& name, const MetricKwds& kwds,
             return static_cast<float>(std::sqrt(result));
         };
     }
+    // --- hardening additions ------------------------------------------------
+    // hellinger: numba's f4 instantiation keeps np.sqrt(x[i] * y[i]) in
+    // float32 (f4 * f4 product, f4 sqrt) while the accumulators and the
+    // final expression are float64. Verified element-exact against
+    // pairwise_special_metric on the reference environment (sparse densify
+    // fallback + dense small-data route).
+    if (name == "hellinger") {
+        return [](const float* x, const float* y, std::size_t n) {
+            double result = 0.0;
+            double l1_norm_x = 0.0;
+            double l1_norm_y = 0.0;
+            for (std::size_t i = 0; i < n; ++i) {
+                const float prod = x[i] * y[i];  // f4 * f4
+                const float sq = std::sqrt(prod);  // np.sqrt(f4) -> f4
+                result += static_cast<double>(sq);
+                l1_norm_x += static_cast<double>(x[i]);
+                l1_norm_y += static_cast<double>(y[i]);
+            }
+            if (l1_norm_x == 0.0 && l1_norm_y == 0.0) return 0.0f;
+            if (l1_norm_x == 0.0 || l1_norm_y == 0.0) return 1.0f;
+            return static_cast<float>(
+                std::sqrt(1.0 - result / std::sqrt(l1_norm_x * l1_norm_y)));
+        };
+    }
+    // ------------------------------------------------------------------------
     // Adapter: widen the float32 rows to float64 and evaluate the
     // double-precision kernel (documented last-ulp deviation vs numba's f4
     // instantiation, exactly like pairwise_distances_sklearn's registry path).

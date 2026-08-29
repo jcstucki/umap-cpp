@@ -157,6 +157,26 @@ Q2.sort_indices()
 m2 = um.UMAP(init="random", random_state=42, a=ab_a, b=ab_b, metric="cosine")
 emit_fit("p2", X2, m2, queries=Q2)
 
+# --- hardening additions -----------------------------------------------------
+# ---- p6: p1 data with metric="manhattan" -- sklearn's float64
+# _sparse_manhattan kernel (f32 subtraction on shared columns, f64
+# fabs-accumulation), float64 fast_knn_indices, astype(np.float32) at the
+# fuzzy_simplicial_set boundary.
+m6 = um.UMAP(init="random", random_state=42, a=ab_a, b=ab_b,
+             metric="manhattan")
+emit_fit("p6", X1, m6, queries=Q1)
+
+# ---- p7: p1 data with metric="hellinger" -- the densify fallback
+# (pairwise_special_metric over X.toarray(), i.e. sklearn's
+# _pairwise_callable float32 route with umap's numba hellinger kernel).
+# scipy.sparse.random values are uniform [0, 1), so the negative-data guard
+# passes. hellinger is in the angular metric list, so angular_rp_forest is
+# set -- irrelevant on the small-data branch.
+m7 = um.UMAP(init="random", random_state=42, a=ab_a, b=ab_b,
+             metric="hellinger")
+emit_fit("p7", X1, m7, queries=Q1)
+# -----------------------------------------------------------------------------
+
 # ---- p5: duplicated rows + unique=True (csr_unique object-row semantics).
 X5 = scipy.sparse.vstack([X1[:60], X1[10:30], X1[:5]]).tocsr()
 X5.sort_indices()

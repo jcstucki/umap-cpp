@@ -640,9 +640,10 @@ class UMAP {
 // from numba's float32 kernels in the last ulp). Row-major nx x ny output.
 // metric_kwds are bound positionally like upstream (`pairwise_distances(X,
 // metric=_m, **self._metric_kwds)`); f32-faithful kernels exist for
-// euclidean/l2, manhattan, minkowski and seuclidean, other named metrics
-// evaluate the double-precision registry rounded to float32 (may differ from
-// numba's float32 kernels in the last ulp).
+// euclidean/l2, manhattan, minkowski, seuclidean and hellinger (hardening
+// additions: f4-faithful kernel, element-exact vs pairwise_special_metric),
+// other named metrics evaluate the double-precision registry rounded to
+// float32 (may differ from numba's float32 kernels in the last ulp).
 // --- hardening additions: metric == "custom" evaluates `custom` (the C++
 // callable-metric equivalent) through the identical _pairwise_callable route.
 std::vector<float> pairwise_distances_sklearn(const float* X, int64_t nx,
