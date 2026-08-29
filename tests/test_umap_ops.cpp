@@ -400,4 +400,100 @@ TEST_CASE("test_umap_graph_layout") {
 
 TEST_CASE("test_component_layout_options" * doctest::skip()) {}
 
+// --- hardening additions -----------------------------------------------------
+TEST_CASE("edges_removed / vertices_disconnected match the reference in all "
+          "fit branches  [hardening]") {
+    // Expected pairs Python-verified against reference/umap (the arguments
+    // upstream passes to raise_disconnected_warning, captured with a spy
+    // under NUMBA_NUM_THREADS=1 on the conftest fixtures; venv pins numpy
+    // 2.5.2 / scipy 1.18.1 / sklearn 1.9.0 / numba 0.67.0):
+    //   * small data masks the full n x n dmat, and only when the
+    //     disconnection distance is finite;
+    //   * the standard branch masks the kNN arrays unconditionally
+    //     (inf >= inf counts unfilled heap slots);
+    //   * vertices_disconnected is the number of zero-sum graph_ rows.
+    const std::vector<float> nn100 = testutil::to_f32(updata::nn_data, 100 * 5);
+    const std::vector<float> nn150 = testutil::to_f32(updata::nn_data, 150 * 5);
+
+    const auto fit_dense = [](const std::vector<float>& X, int64_t n,
+                              int64_t dim, UMAPParams p) {
+        p.random_state = 42u;
+        p.n_epochs = 11;
+        UMAP u(p);
+        u.fit(X.data(), n, dim);
+        return std::make_pair(u.edges_removed(), u.vertices_disconnected());
+    };
+
+    {  // dense small, dd = 1.0 -> (2850, 0)
+        UMAPParams p;
+        p.disconnection_distance = 1.0;
+        CHECK(fit_dense(nn100, 100, 5, p) == std::make_pair(int64_t{2850},
+                                                         int64_t{0}));
+    }
+    {  // dense small, default dd = inf -> (0, 0) (isfinite guard)
+        UMAPParams p;
+        CHECK(fit_dense(nn100, 100, 5, p) == std::make_pair(int64_t{0},
+                                                         int64_t{0}));
+    }
+    {  // dense small, dd = 0.5 -> (9188, 1)
+        UMAPParams p;
+        p.disconnection_distance = 0.5;
+        CHECK(fit_dense(nn100, 100, 5, p) == std::make_pair(int64_t{9188},
+                                                         int64_t{1}));
+    }
+    {  // dense standard (force_approximation), dd = 0.4 -> (1482, 6)
+        UMAPParams p;
+        p.disconnection_distance = 0.4;
+        p.force_approximation_algorithm = true;
+        CHECK(fit_dense(nn150, 150, 5, p) == std::make_pair(int64_t{1482},
+                                                         int64_t{6}));
+    }
+
+    // Precomputed input: the callable-flavour euclidean distance matrix
+    // (pairwise_distances(X, metric=named_distances["euclidean"])), which
+    // the C++ helper reproduces bit for bit.
+    const std::vector<float> nn80 = testutil::to_f32(updata::nn_data, 80 * 5);
+    const std::vector<float> dmat80 = umap::pairwise_distances_sklearn(
+        nn80.data(), 80, nn80.data(), 80, 5, "euclidean", /*x_is_y=*/true);
+    {  // precomputed small, dd = 1.0 -> (1836, 0)
+        UMAPParams p;
+        p.metric = "precomputed";
+        p.disconnection_distance = 1.0;
+        CHECK(fit_dense(dmat80, 80, 80, p) == std::make_pair(int64_t{1836},
+                                                         int64_t{0}));
+    }
+    {  // precomputed standard, dd = 0.4 -> (940, 12)
+        UMAPParams p;
+        p.metric = "precomputed";
+        p.disconnection_distance = 0.4;
+        p.force_approximation_algorithm = true;
+        CHECK(fit_dense(dmat80, 80, 80, p) == std::make_pair(int64_t{940},
+                                                         int64_t{12}));
+    }
+
+    // Sparse fits (conftest sparse_nn_data prefix rows; CSR row slices from
+    // row 0 reuse the backing arrays as-is).
+    const auto fit_sparse = [](int64_t n, UMAPParams p) {
+        p.random_state = 42u;
+        p.n_epochs = 11;
+        UMAP u(p);
+        u.fit(updata::sparse_nn_indptr, updata::sparse_nn_indices,
+              updata::sparse_nn_values, n, 50);
+        return std::make_pair(u.edges_removed(), u.vertices_disconnected());
+    };
+    {  // sparse small euclidean, dd = 3.0 -> (7492, 0)
+        UMAPParams p;
+        p.disconnection_distance = 3.0;
+        CHECK(fit_sparse(100, p) == std::make_pair(int64_t{7492},
+                                                   int64_t{0}));
+    }
+    {  // sparse standard euclidean, dd = 3.0 -> (84, 0)
+        UMAPParams p;
+        p.disconnection_distance = 3.0;
+        p.force_approximation_algorithm = true;
+        CHECK(fit_sparse(150, p) == std::make_pair(int64_t{84}, int64_t{0}));
+    }
+}
+// -----------------------------------------------------------------------------
+
 }  // TEST_SUITE
