@@ -23,7 +23,7 @@ Venv used: scipy 1.18.1, sklearn 1.9.0, numpy 2.5.2, numba 0.67.0.
 | test_plot.py | matplotlib — out of C++ scope |
 | test_aligned_umap.py | AlignedUMAP not yet ported |
 | test_composite_models.py | fuzzy-set union/intersection composite models not ported |
-| test_spectral.py | both tests target `tswspectral_layout` (init="tswspectral" is TODO); the ported `spectral_layout` surface is already covered by tests/test_spectral.cpp (eigenpair parity, multi-component layouts, dispatch) |
+| ~~test_spectral.py~~ | PORTED (branch tswspectral) as tests/test_tswspectral.cpp: both upstream cases verbatim — `test_tsw_spectral_init` (rmsd < 1e-6, per-column sign aligned; the upstream test is skipped for scipy >= 1.15 because eigsh "SM" @ tol=1e-4 misconverges there, and the C++ solvers behave like the scipy [1.10, 1.15) window where it runs) and `test_ensure_fallback_to_random_on_spectral_failure` (unseeded upstream `u` baked as np.random.seed(777), regenerated bit-exact in-test via NumpyRandomState; pytest.warns → `used_random_fallback` out-param). The `spectral_layout` surface is covered by tests/test_spectral.cpp |
 
 ## Unskip pass (branch tests-unskip)
 
