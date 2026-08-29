@@ -233,6 +233,31 @@ out.append("// case ce: %d/%d query rows have an exact tie at the k=%d "
 model_e = um.UMAP(init="random", random_state=42, a=ab_a, b=ab_b)
 emit_fit("ce", Xe, model_e, queries=Qe)
 
+# ---- case cf: ensure_all_finite="allow-nan" with a NaN row (audit
+# 2026-08-29, fuzz nan_allow). sklearn's _pairwise_callable computes the
+# DIAGONAL as metric(x, x) = NaN for the NaN row (so it selects NaN
+# neighbours, not self@0.0), the NaN memberships make graph.data.max() and
+# weights.max() NaN (np.max propagates), the epoch weight filter becomes a
+# no-op and every epochs_per_sample entry stays -1. Bit-exact end to end.
+Xf = make_blobs(np.random.RandomState(555), 60, 4,
+                [[0.0] * 4, [3.0, -2.0, 1.0, 0.5]], 0.9)
+Xf[13, 2] = np.nan
+model_f = um.UMAP(n_neighbors=7, init="random", random_state=42, n_epochs=50,
+                  a=ab_a, b=ab_b)
+emb_f = model_f.fit_transform(Xf, ensure_all_finite="allow-nan")
+gf = model_f.graph_.tocsr().copy()
+gf.sort_indices()
+assert np.isnan(gf.data).any(), "NaN memberships must survive into graph_"
+out.append("// ---- cf: 60x4 with a NaN row, ensure_all_finite=allow-nan")
+out.append("static const std::int64_t cf_n = %d;" % Xf.shape[0])
+out.append("static const std::int64_t cf_dim = %d;" % Xf.shape[1])
+out.append(carr("cf_X", Xf))
+out.append(carr("cf_graph_indptr", gf.indptr, "std::int32_t"))
+out.append(carr("cf_graph_indices", gf.indices, "std::int32_t"))
+out.append(carr("cf_graph_data", gf.data))
+out.append(carr("cf_embedding", emb_f))
+out.append("")
+
 # ---- iris-like 150x4 dataset for the trustworthiness test
 centers4 = [[5.0, 3.4, 1.5, 0.2], [5.9, 2.8, 4.3, 1.3], [6.6, 3.0, 5.6, 2.0]]
 Xt = make_blobs(np.random.RandomState(2024), 150, 4, centers4, 0.35)

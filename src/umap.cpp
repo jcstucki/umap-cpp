@@ -77,8 +77,15 @@ std::vector<float> pairwise_distances_sklearn(const float* X, int64_t nx,
             const float* xi = X + i * dim;
             const int64_t j0 = x_is_y ? i : 0;
             for (int64_t j = j0; j < ny; ++j) {
+                // sklearn's _pairwise_callable computes the DIAGONAL as
+                // metric(x, x) -- +0.0f for finite rows but NaN for rows
+                // containing NaN (ensure_all_finite="allow-nan"), which
+                // changes the NaN row's neighbour selection. Audit
+                // 2026-08-29 fuzz nan_allow: a 0.0 diagonal fill kept
+                // self at distance 0 in the kNN where upstream picks NaN
+                // neighbours only.
                 const float d = (x_is_y && i == j)
-                                    ? 0.0f
+                                    ? numba_euclidean_f32(xi, xi, dim)
                                     : numba_euclidean_f32(xi, Y + j * dim, dim);
                 out[static_cast<std::size_t>(i) * ny + j] = d;
                 if (x_is_y) out[static_cast<std::size_t>(j) * ny + i] = d;

@@ -8,11 +8,13 @@
 // update() / inverse_transform() legs are skipped (not ported). See
 // tests/PORTING_NOTES.md.
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <vector>
 
 #include "doctest.h"
+#include "golden_umap.hpp"
 #include "umap/umap.hpp"
 
 namespace {
@@ -92,6 +94,57 @@ TEST_CASE("test_check_input_data") {
                     std::invalid_argument);
     CHECK_THROWS_AS(call_umap_functions(with_inf_nan(), "allow-nan"),
                     std::invalid_argument);
+}
+
+TEST_CASE("allow-nan fit is BIT-EXACT vs Python (NaN row, cf golden)") {
+    // Audit 2026-08-29 (fuzz nan_allow): sklearn's _pairwise_callable
+    // computes the pairwise DIAGONAL as metric(x, x) -- NaN for a NaN row,
+    // so the NaN row selects NaN neighbours (the port used to fill 0.0 and
+    // keep self at distance 0). Downstream, np.max PROPAGATES the NaN
+    // memberships: the epoch weight filter no-ops and every
+    // epochs_per_sample entry stays -1. Golden-verified end to end: graph_
+    // CSR (NaN entries compare as NaN) and the final embedding.
+    using namespace golden_umap;
+    UMAPParams p;
+    p.n_neighbors = 7;
+    p.init = "random";
+    p.random_state = 42;
+    p.n_epochs = 50;
+    p.a = cd_a;  // scipy find_ab_params(1.0, 0.1) values, as in the golden
+    p.b = cd_b;
+    p.ensure_all_finite = "allow-nan";
+    UMAP model(p);
+    const std::vector<float> emb =
+        model.fit_transform(cf_X, cf_n, cf_dim);
+
+    const umap::SparseMatrix& g = model.graph();
+    const std::size_t nnz =
+        sizeof(cf_graph_indices) / sizeof(cf_graph_indices[0]);
+    REQUIRE(g.indices.size() == nnz);
+    for (std::size_t i = 0;
+         i < sizeof(cf_graph_indptr) / sizeof(cf_graph_indptr[0]); ++i)
+        CHECK(g.indptr[i] == cf_graph_indptr[i]);
+    std::size_t bad = 0;
+    bool saw_nan = false;
+    for (std::size_t i = 0; i < nnz; ++i) {
+        if (g.indices[i] != cf_graph_indices[i]) ++bad;
+        const float a = g.data[i];
+        const float b = cf_graph_data[i];
+        if (std::isnan(b)) {
+            saw_nan = true;
+            if (!std::isnan(a)) ++bad;
+        } else if (a != b) {
+            ++bad;
+        }
+    }
+    CHECK(bad == 0);
+    CHECK(saw_nan);  // the NaN memberships must survive into graph_
+
+    REQUIRE(emb.size() == static_cast<std::size_t>(cf_n) * 2);
+    std::size_t emb_bad = 0;
+    for (std::size_t i = 0; i < emb.size(); ++i)
+        if (emb[i] != cf_embedding[i]) ++emb_bad;
+    CHECK(emb_bad == 0);
 }
 
 }  // TEST_SUITE

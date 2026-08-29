@@ -31,6 +31,12 @@ std::vector<double> make_epochs_per_sample(const float* weights,
     if (n_weights == 0) return result;
     float w_max = weights[0];
     for (std::size_t i = 1; i < n_weights; ++i) {
+        // weights.max() propagates NaN (allow-nan graphs): every n_samples
+        // is then NaN, `NaN > 0` is false and all entries stay -1 upstream.
+        if (std::isnan(weights[i])) {
+            w_max = weights[i];
+            break;
+        }
         if (weights[i] > w_max) w_max = weights[i];
     }
     const float n_epochs_f = static_cast<float>(n_epochs);
@@ -54,6 +60,10 @@ std::vector<double> make_epochs_per_sample(const double* weights,
     if (n_weights == 0) return result;
     double w_max = weights[0];
     for (std::size_t i = 1; i < n_weights; ++i) {
+        if (std::isnan(weights[i])) {  // np.max propagates NaN
+            w_max = weights[i];
+            break;
+        }
         if (weights[i] > w_max) w_max = weights[i];
     }
     for (std::size_t i = 0; i < n_weights; ++i) {
@@ -81,6 +91,10 @@ std::vector<double> make_epochs_per_sample_i64(const float* weights,
     if (n_weights == 0) return result;
     float w_max = weights[0];
     for (std::size_t i = 1; i < n_weights; ++i) {
+        if (std::isnan(weights[i])) {  // np.max propagates NaN
+            w_max = weights[i];
+            break;
+        }
         if (weights[i] > w_max) w_max = weights[i];
     }
     for (std::size_t i = 0; i < n_weights; ++i) {
@@ -583,23 +597,37 @@ int resolve_epochs_and_filter_graph(SparseMatrix& graph, int n_epochs,
 
     // graph.data[graph.data < graph.data.max() / n_epochs_max] = 0.0
     // (threshold computed in float32, like np.float32.max() / float(n)).
-    if (!graph.data.empty()) {
-        float data_max = graph.data[0];
-        for (float v : graph.data) {
-            if (v > data_max) data_max = v;
+    // An EMPTY graph raises exactly like numpy's graph.data.max() on a
+    // zero-size array in upstream simplicial_set_embedding (e.g. a 2-point
+    // fit whose only membership edges are the zeroed self-edges -- audit
+    // 2026-08-29 fuzz n2: the previous empty-guard silently succeeded).
+    if (graph.data.empty()) {
+        throw std::invalid_argument(
+            "zero-size array to reduction operation maximum which has no "
+            "identity");
+    }
+    float data_max = graph.data[0];
+    for (float v : graph.data) {
+        // np.max (maximum.reduce) PROPAGATES NaN: under allow-nan a NaN
+        // membership row turns the threshold into NaN and the filter into a
+        // no-op (every `v < NaN` is false), exactly like upstream.
+        if (std::isnan(v)) {
+            data_max = v;
+            break;
         }
-        const float threshold =
-            data_max / static_cast<float>(n_epochs_max > 10 ? n_epochs_max
-                                                            : default_epochs);
-        for (float& v : graph.data) {
+        if (v > data_max) data_max = v;
+    }
+    const float threshold =
+        data_max / static_cast<float>(n_epochs_max > 10 ? n_epochs_max
+                                                        : default_epochs);
+    for (float& v : graph.data) {
+        if (v < threshold) v = 0.0f;
+    }
+    // scipy tocoo() data sharing: the filter writes through into the
+    // caller's stored graph (structure untouched -- see layouts.hpp).
+    if (write_through != nullptr) {
+        for (float& v : write_through->data) {
             if (v < threshold) v = 0.0f;
-        }
-        // scipy tocoo() data sharing: the filter writes through into the
-        // caller's stored graph (structure untouched -- see layouts.hpp).
-        if (write_through != nullptr) {
-            for (float& v : write_through->data) {
-                if (v < threshold) v = 0.0f;
-            }
         }
     }
     graph.eliminate_zeros();

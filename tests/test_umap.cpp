@@ -487,3 +487,24 @@ TEST_CASE("umap: single-sample fit and pre-fit transform edge cases") {
     UMAP unfitted{UMAPParams()};
     CHECK_THROWS_AS(unfitted.transform(one_point, 1), std::runtime_error);
 }
+
+TEST_CASE("umap: two-sample fit raises like upstream (empty graph .max())") {
+    // n=2 with k > n: upstream truncates n_neighbors to 1, every point's
+    // single nearest neighbour is itself (distance 0 -> membership 0), the
+    // fuzzy graph is EMPTY after eliminate_zeros, and
+    // simplicial_set_embedding dies in graph.data.max() with numpy's
+    // ValueError. The port used to succeed via an empty-graph guard (audit
+    // 2026-08-29, fuzz n2).
+    const float two_points[2] = {0.5f, -1.25f};  // 2 x 1
+    UMAPParams p;
+    p.random_state = 1;
+    p.init = "random";
+    p.a = 1.5;
+    p.b = 0.9;
+    UMAP model(p);
+    CHECK_THROWS_WITH_AS(
+        model.fit(two_points, 2, 1),
+        "zero-size array to reduction operation maximum which has no "
+        "identity",
+        std::invalid_argument);
+}
