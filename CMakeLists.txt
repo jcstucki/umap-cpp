@@ -274,6 +274,8 @@ target_sources(umap_tests PRIVATE tests/test_aligned.cpp)
 # --- metal-gpu additions ----------------------------------------------------
 if(UMAP_ENABLE_METAL)
     target_sources(umap_tests PRIVATE tests/test_metal.cpp)
+    # gpu-knn additions: exact-kNN engine parity / e2e / fallback suite.
+    target_sources(umap_tests PRIVATE tests/test_gpu_knn.cpp)
 endif()
 # ----------------------------------------------------------------------------
 
