@@ -14,7 +14,8 @@ struct MetalContext {
     MTL::Device* device = nullptr;
     MTL::CommandQueue* queue = nullptr;
     MTL::Library* library = nullptr;  // umap_kernels.metallib
-    MTL::ComputePipelineState* knn_pipeline = nullptr;
+    // gpu-knn additions: the kNN engine keeps its own specialized-pipeline
+    // cache in src/metal/gpu_knn.cpp (function-constant metric variants).
     MTL::ComputePipelineState* sgd_pipeline = nullptr;
 
     bool ok() const { return device && queue && library; }

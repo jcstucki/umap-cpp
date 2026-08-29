@@ -93,11 +93,11 @@ MTL::ComputePipelineState* pipeline(const char* function_name) {
 
     MTL::ComputePipelineState** slot = nullptr;
     const std::string name(function_name);
-    if (name == "brute_force_knn") {
-        slot = &ctx.knn_pipeline;
-    } else if (name == "sgd_epoch") {
+    if (name == "sgd_epoch") {
         slot = &ctx.sgd_pipeline;
     } else {
+        // gpu-knn additions: the kNN engine builds its specialized pipelines
+        // in src/metal/gpu_knn.cpp, not through this named-slot cache.
         return nullptr;
     }
     if (*slot) return *slot;
