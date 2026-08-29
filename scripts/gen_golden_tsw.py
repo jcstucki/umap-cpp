@@ -29,20 +29,34 @@ Usage:
 import os
 import sys
 
+os.environ.setdefault("NUMBA_NUM_THREADS", "1")
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REF = os.environ.get("UMAP_REFERENCE", os.path.join(REPO, "reference", "umap"))
+sys.path.insert(0, os.path.join(REPO, "reference", "pynndescent"))
 sys.path.insert(0, REF)
 
 import numpy as np  # noqa: E402
 import scipy.sparse  # noqa: E402
 
+import umap.umap_ as um  # noqa: E402
 from umap.spectral import tswspectral_layout  # noqa: E402
+from sklearn.manifold import trustworthiness  # noqa: E402
+
+
+def fmt_float32(v):
+    s = "%.9g" % float(v)
+    if "." not in s and "e" not in s:
+        s += ".0"
+    return s + "f"
 
 
 def carr(name, values, ctype="double", fmt="{:.17g}"):
     flat = np.asarray(values).ravel()
     if ctype.startswith("int"):
         vals = ", ".join(str(int(v)) for v in flat)
+    elif ctype == "float":
+        vals = ", ".join(fmt_float32(v) for v in flat)
     else:
         vals = ", ".join(fmt.format(v) for v in flat)
     return "static const %s %s[] = {%s};" % (ctype, name, vals)
@@ -118,6 +132,134 @@ def main():
     out.append(carr("t2_u_head", u.ravel()[:5]))
     out.append(carr("t2_u_tail", u.ravel()[-3:]))
     out.append("static const double t2_u_mean = %.17g;" % u.mean())
+
+    # ---- UMAP-class init="tswspectral" fit fixture (small-data branch) ----
+    # Full seeded reference fit with init="tswspectral" on 200x5 blobs
+    # (small-data branch, connected graph asserted). Captures the stage
+    # inputs of optimize_layout_euclidean (post-rescale init, rng_state,
+    # filtered edges, epochs_per_sample) via a monkeypatch, plus the final
+    # embedding and its trustworthiness. The rng_state is additionally
+    # verified in-script against the replicated RandomState(42) stream the
+    # C++ class performs: TruncatedSVD's randomized_range_finder consumes
+    # normal(size=(n, (dim + 1) + 10)) [n_oversamples=10] which the
+    # default-method eigsh solve discards, then noisy_scale_coords'
+    # normal(0, 1e-4, (n, dim)), then randint(INT32_MIN + 1, INT32_MAX, 3).
+    captured = []
+    orig_opt = um.optimize_layout_euclidean
+
+    def capturing_opt(head_embedding, tail_embedding, head, tail, n_epochs,
+                      n_vertices, epochs_per_sample, a, b, rng_state, *args,
+                      **kwargs):
+        captured.append({
+            "init": head_embedding.copy(),
+            "rng_state": rng_state.copy(),
+            "n_epochs": n_epochs,
+            "head": head.copy(),
+            "tail": tail.copy(),
+            "eps": epochs_per_sample.copy(),
+        })
+        return orig_opt(head_embedding, tail_embedding, head, tail, n_epochs,
+                        n_vertices, epochs_per_sample, a, b, rng_state, *args,
+                        **kwargs)
+
+    um.optimize_layout_euclidean = capturing_opt
+    try:
+        # Overlapping blobs (same centers as gen_golden_umap.py) so the kNN
+        # graph is connected at the default n_neighbors=15.
+        centers5 = [
+            [0.0] * 5,
+            [2.0, 1.5, 0.0, -1.0, 0.5],
+            [-1.5, 2.0, 1.0, 0.5, -1.0],
+        ]
+        rngX = np.random.RandomState(9573)
+        pts = []
+        nw, dimw = 200, 5
+        per = nw // len(centers5)
+        for ci, c in enumerate(centers5):
+            cnt = (per if ci < len(centers5) - 1
+                   else nw - per * (len(centers5) - 1))
+            pts.append(rngX.randn(cnt, dimw) * 1.0 + np.asarray(c))
+        Xw = np.vstack(pts).astype(np.float32)
+
+        model = um.UMAP(init="tswspectral", random_state=42)
+        emb = model.fit_transform(Xw)
+        assert model._small_data
+        cap = captured[0]
+    finally:
+        um.optimize_layout_euclidean = orig_opt
+
+    # The filtered graph the init saw: fit's epoch filter wrote explicit
+    # zeros back through the shared tocoo() data into model.graph_.
+    g = model.graph_.copy().tocsr()
+    g.eliminate_zeros()
+    ncomp = scipy.sparse.csgraph.connected_components(g)[0]
+    assert ncomp == 1, "tsw class fixture graph must be connected"
+
+    # Stream-parity self-validation of the captured SGD rng_state.
+    rs = np.random.RandomState(42)
+    rs.normal(size=(nw, (2 + 1) + 10))
+    rs.normal(0.0, 0.0001, size=(nw, 2))
+    expect = rs.randint(np.iinfo(np.int32).min + 1, np.iinfo(np.int32).max,
+                        3).astype(np.int64)
+    assert np.array_equal(expect, cap["rng_state"]), (expect,
+                                                      cap["rng_state"])
+
+    # Convergence gate: the captured (post-rescale) init must match the
+    # dense-eigh truth reconstruction up to per-column sign, so the C++
+    # up-to-sign comparison at 1e-2 is well-posed (scipy >= 1.15 eigsh at
+    # tol=1e-4 can misconverge on unlucky graphs; assert this one is clean).
+    L = normalized_laplacian(g.toarray())
+    w_all, v_all = np.linalg.eigh(L)
+    order = np.argsort(w_all)[1:3]
+    emb64 = v_all[:, order]
+    expansion = 10.0 / np.abs(emb64).max()
+    rs2 = np.random.RandomState(42)
+    rs2.normal(size=(nw, 13))
+    noise = rs2.normal(scale=0.0001, size=(nw, 2)).astype(np.float32)
+
+    def rescale(col):
+        return (10.0 * (col - col.min()) / (col.max() - col.min())).astype(
+            np.float32)
+
+    worst = 0.0
+    for j in range(2):
+        cands = []
+        for s in (1.0, -1.0):
+            pre = (s * emb64[:, j] * expansion).astype(np.float32) + noise[:, j]
+            cands.append(np.abs(rescale(pre) - cap["init"][:, j]).max())
+        worst = max(worst, min(cands))
+    assert worst < 5e-3, "eigsh misconverged for this fixture: %g" % worst
+
+    tw = trustworthiness(Xw, emb, n_neighbors=5)
+
+    out.append("")
+    out.append("// ---- UMAP-class init=\"tswspectral\" fit (small-data"
+               " branch): 200x5")
+    out.append("// blobs (RandomState(9573)), UMAP(init=\"tswspectral\","
+               " random_state=42).")
+    out.append("// Stage inputs captured from optimize_layout_euclidean;"
+               " rng_state")
+    out.append("// verified in-script against the replicated RandomState(42)"
+               " stream")
+    out.append("// (n * (dim + 11) discarded tsvd normals + n * dim noise +"
+               " randint)")
+    out.append("// and the init against the dense-eigh truth (up-to-sign"
+               " %.2g)." % worst)
+    out.append("static const std::int64_t tswc_n = %d;" % nw)
+    out.append("static const std::int64_t tswc_dim = %d;" % dimw)
+    out.append(carr("tswc_X", Xw, "float"))
+    out.append("static const int tswc_fit_n_epochs = %d;" % cap["n_epochs"])
+    out.append("static const std::int64_t tswc_fit_n_edges = %d;"
+               % cap["head"].shape[0])
+    out.append(carr("tswc_fit_head", cap["head"], "int32_t"))
+    out.append(carr("tswc_fit_tail", cap["tail"], "int32_t"))
+    out.append(carr("tswc_fit_eps", cap["eps"]))
+    out.append(carr("tswc_fit_rng_state", cap["rng_state"], "int64_t"))
+    out.append(carr("tswc_fit_init", cap["init"], "float"))
+    out.append(carr("tswc_embedding", emb, "float"))
+    out.append("static const double tswc_trust_py = %.17g;" % tw)
+    print("tsw class fit: trust %.5f, init-vs-eigh %.3g, n_epochs %d"
+          % (tw, worst, cap["n_epochs"]), file=sys.stderr)
 
     out.append("")
     out.append("}  // namespace golden_tsw")

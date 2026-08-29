@@ -61,6 +61,17 @@ std::vector<double> make_epochs_per_sample(const double* weights,
                                            std::size_t n_weights, int n_epochs);
 // ----------------------------------------------------------------------------
 
+// --- composite additions ------------------------------------------------------
+// np.int64-epochs flavour: the composite operators (__mul__/__add__/__sub__)
+// pass n_epochs = np.max(result.n_epochs), an np.int64 -- and int64 * float32
+// promotes to FLOAT64 in numpy, so n_samples = n_epochs * (w / w.max()) is
+// computed as f8(f4(w / w.max())) * n_epochs instead of the all-float32
+// product of the normal fit path (python-int n_epochs).
+std::vector<double> make_epochs_per_sample_i64(const float* weights,
+                                               std::size_t n_weights,
+                                               int n_epochs);
+// ------------------------------------------------------------------------------
+
 // --- densmap additions ------------------------------------------------------
 // The densMAP auxiliary data optimize_layout_euclidean consumes (upstream's
 // densmap_kwds dict after simplicial_set_embedding fills in mu / mu_sum / R).
@@ -160,6 +171,9 @@ void optimize_layout_euclidean(
 // densMAP.") and with epochs_list (upstream's optimize_layout_generic cannot
 // take a list of epochs -- numba typing error; we throw std::invalid_argument
 // instead).
+// numpy_int64_epochs selects the composite operators' epochs-per-sample
+// flavour (make_epochs_per_sample_i64 above): they pass an np.int64 n_epochs
+// whose numpy promotion computes n_samples in float64.
 std::vector<float> simplicial_set_embedding_from_init(
     const SparseMatrix& graph, const float* init_embedding, int n_components,
     double a, double b, const int64_t rng_state[3], int n_epochs = -1,
@@ -169,7 +183,8 @@ std::vector<float> simplicial_set_embedding_from_init(
     const std::vector<int>* epochs_list = nullptr,
     std::vector<std::vector<float>>* embedding_list = nullptr,
     const DensmapParams* densmap_kwds = nullptr,
-    const OutputMetricFn* output_metric = nullptr);
+    const OutputMetricFn* output_metric = nullptr,
+    bool numpy_int64_epochs = false);
 
 // --- umap-class additions ---------------------------------------------------
 // The n_epochs-resolution + weight-filtering prologue of

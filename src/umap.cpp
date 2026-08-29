@@ -107,20 +107,108 @@ std::vector<float> pairwise_distances_sklearn(const float* X, int64_t nx,
     return out;
 }
 
+// --- composite additions ------------------------------------------------------
+// numba's np.argpartition machinery (numba/np/arraymath.py, numba 0.67):
+// median-of-three Hoare partition with index co-swapping + plain quickselect.
+// utils.py::fast_knn_indices runs under numba, so on rows with exact distance
+// ties straddling the n_neighbors boundary the SELECTED candidate subset is
+// this algorithm's (not a stable prefix) -- e.g. duplicate points in the iris
+// feature slices. Replicated exactly for bit-parity with the reference.
+namespace {
+
+template <typename T>
+inline bool nb_nan_aware_less_than(T a, T b) {
+    // numba nan_aware_less_than: NaNs sort to the end.
+    if (std::isnan(a)) return false;
+    if (std::isnan(b)) return true;
+    return a < b;
+}
+
+template <typename T>
+int64_t numba_argpartition_step(T* A, int64_t low, int64_t high, int64_t* I) {
+    const int64_t mid = (low + high) >> 1;
+    if (nb_nan_aware_less_than(A[mid], A[low])) {
+        std::swap(A[low], A[mid]);
+        std::swap(I[low], I[mid]);
+    }
+    if (nb_nan_aware_less_than(A[high], A[mid])) {
+        std::swap(A[high], A[mid]);
+        std::swap(I[high], I[mid]);
+    }
+    if (nb_nan_aware_less_than(A[mid], A[low])) {
+        std::swap(A[low], A[mid]);
+        std::swap(I[low], I[mid]);
+    }
+    const T pivot = A[mid];
+    std::swap(A[high], A[mid]);
+    std::swap(I[high], I[mid]);
+    int64_t i = low;
+    int64_t j = high - 1;
+    while (true) {
+        while (i < high && nb_nan_aware_less_than(A[i], pivot)) ++i;
+        while (j >= low && nb_nan_aware_less_than(pivot, A[j])) --j;
+        if (i >= j) break;
+        std::swap(A[i], A[j]);
+        std::swap(I[i], I[j]);
+        ++i;
+        --j;
+    }
+    std::swap(A[i], A[high]);
+    std::swap(I[i], I[high]);
+    return i;
+}
+
+// numba _select (quickselect loop) with the argpartition index array.
+template <typename T>
+void numba_arg_select(T* A, int64_t k, int64_t low, int64_t high, int64_t* I) {
+    int64_t i = numba_argpartition_step(A, low, high, I);
+    while (i != k) {
+        if (i < k) {
+            low = i + 1;
+            i = numba_argpartition_step(A, low, high, I);
+        } else {
+            high = i - 1;
+            i = numba_argpartition_step(A, low, high, I);
+        }
+    }
+}
+
+// utils.py::fast_knn_indices row body:
+//   candidates = np.argpartition(r, n_neighbors - 1)[:n_neighbors]
+//   candidates.sort()
+//   order = np.argsort(r[candidates], kind="mergesort")
+//   knn_indices[row] = candidates[order]
+template <typename T, typename OutDist>
+void fast_knn_row(const T* d, int64_t m, int64_t n_neighbors,
+                  std::vector<T>& vals, std::vector<int64_t>& idx,
+                  int32_t* out_indices, OutDist* out_dists) {
+    vals.assign(d, d + m);
+    idx.resize(static_cast<std::size_t>(m));
+    std::iota(idx.begin(), idx.end(), int64_t{0});
+    numba_arg_select(vals.data(), n_neighbors - 1, int64_t{0}, m - 1,
+                     idx.data());
+    std::vector<int64_t> candidates(idx.begin(), idx.begin() + n_neighbors);
+    std::sort(candidates.begin(), candidates.end());
+    std::stable_sort(candidates.begin(), candidates.end(),
+                     [d](int64_t a, int64_t b) { return d[a] < d[b]; });
+    for (int64_t j = 0; j < n_neighbors; ++j) {
+        out_indices[j] = static_cast<int32_t>(candidates[j]);
+        out_dists[j] = static_cast<OutDist>(d[candidates[j]]);
+    }
+}
+
+}  // namespace
+// ------------------------------------------------------------------------------
+
 void fast_knn_from_dmat(const std::vector<float>& dmat, int64_t n, int64_t m,
                         int64_t n_neighbors, int32_t* knn_indices,
                         float* knn_dists) {
-    std::vector<int32_t> order(m);
+    std::vector<float> vals;
+    std::vector<int64_t> idx;
     for (int64_t row = 0; row < n; ++row) {
-        const float* d = dmat.data() + row * m;
-        std::iota(order.begin(), order.end(), 0);
-        // argsort(kind="mergesort"): stable, so ties keep ascending index.
-        std::stable_sort(order.begin(), order.end(),
-                         [d](int32_t a, int32_t b) { return d[a] < d[b]; });
-        for (int64_t j = 0; j < n_neighbors; ++j) {
-            knn_indices[row * n_neighbors + j] = order[j];
-            knn_dists[row * n_neighbors + j] = d[order[j]];
-        }
+        fast_knn_row(dmat.data() + row * m, m, n_neighbors, vals, idx,
+                     knn_indices + row * n_neighbors,
+                     knn_dists + row * n_neighbors);
     }
 }
 
@@ -785,6 +873,142 @@ std::vector<float> ndarray_init_with_jitter(std::vector<float> arr, int64_t n,
 }  // namespace
 // ----------------------------------------------------------------------------
 
+// --- composite additions ------------------------------------------------------
+namespace {
+
+// spectral.multi_component_layout for n_components <= 2 * dim, with numpy
+// RandomState stream parity (the branch upstream takes for few components):
+//   * the meta layout is the deterministic +/- eye construction (no draws);
+//   * per component IN LABEL ORDER the reference consumes
+//       - size < 2*dim or size <= dim+1: random_state.uniform(-data_range,
+//         data_range, (size, dim)) -- replicated value-exactly;
+//       - else: _spectral_layout(init="random")'s discarded eigsh warm start
+//         gen.normal(size=(size, dim + 1)); the eigensolve itself is our
+//         Spectra path (deterministic, ARPACK-level parity up to sign), and
+//         on solver failure upstream's gen.uniform(-10, 10, (size, dim))
+//         fallback is drawn from the same stream.
+// This keeps the SGD rng_state and the noisy_scale_coords noise stream-exact
+// for disconnected graphs with few components (e.g. supervised fits whose
+// epoch filter severs the class blocks). The n_components > 2*dim case still
+// routes through the tau-prng component_layout (sklearn SpectralEmbedding
+// draws are not replicated -- documented deviation).
+std::vector<float> multi_component_layout_numpy(
+    const SparseMatrix& graph, int32_t n_comp,
+    const std::vector<int32_t>& labels, int dim, nnd::NumpyRandomState& rs) {
+    const int64_t n = graph.n_rows;
+    std::vector<float> result(static_cast<std::size_t>(n) * dim, 0.0f);
+
+    // k = ceil(n_comp / 2); base = hstack([eye(k), zeros(k, dim - k)]);
+    // meta_embedding = vstack([base, -base])[:n_comp].
+    const int32_t half = (n_comp + 1) / 2;
+    std::vector<double> meta(static_cast<std::size_t>(n_comp) * dim, 0.0);
+    for (int32_t c = 0; c < n_comp; ++c) {
+        if (c < half)
+            meta[static_cast<std::size_t>(c) * dim + c] = 1.0;
+        else
+            meta[static_cast<std::size_t>(c) * dim + (c - half)] = -1.0;
+    }
+
+    std::vector<int32_t> local(static_cast<std::size_t>(n), -1);
+    for (int32_t label = 0; label < n_comp; ++label) {
+        std::vector<int32_t> rows;
+        for (int32_t i = 0; i < n; ++i)
+            if (labels[static_cast<std::size_t>(i)] == label)
+                rows.push_back(i);
+        const int64_t cn = static_cast<int64_t>(rows.size());
+
+        // distances = pairwise_distances([meta[label]], meta);
+        // data_range = distances[distances > 0].min() / 2.0
+        double min_pos = std::numeric_limits<double>::infinity();
+        for (int32_t c = 0; c < n_comp; ++c) {
+            double acc = 0.0;
+            for (int d = 0; d < dim; ++d) {
+                const double diff =
+                    meta[static_cast<std::size_t>(label) * dim + d] -
+                    meta[static_cast<std::size_t>(c) * dim + d];
+                acc += diff * diff;
+            }
+            const double dist = std::sqrt(acc);
+            if (dist > 0.0) min_pos = std::min(min_pos, dist);
+        }
+        const double data_range = min_pos / 2.0;
+
+        if (cn < 2 * dim || cn <= dim + 1) {
+            // result[mask] = uniform(-data_range, data_range, (cn, dim))
+            //              + meta_embedding[label]
+            for (int64_t i = 0; i < cn; ++i) {
+                for (int d = 0; d < dim; ++d) {
+                    result[static_cast<std::size_t>(rows[i]) * dim + d] =
+                        static_cast<float>(
+                            rs.uniform(-data_range, data_range) +
+                            meta[static_cast<std::size_t>(label) * dim + d]);
+                }
+            }
+            continue;
+        }
+
+        // _spectral_layout(init="random") on the (connected) component:
+        // the warm start gen.normal(size=(cn, dim + 1)) is discarded.
+        const int kk = dim + 1;
+        for (int64_t i = 0; i < cn * kk; ++i) (void)rs.gauss();
+
+        // component_graph = graph[mask][:, mask] (ascending row order).
+        for (int64_t i = 0; i < cn; ++i)
+            local[static_cast<std::size_t>(rows[i])] = static_cast<int32_t>(i);
+        SparseMatrix comp(static_cast<int32_t>(cn), static_cast<int32_t>(cn));
+        for (int64_t i = 0; i < cn; ++i) {
+            const int32_t r = rows[i];
+            for (int32_t p = graph.indptr[r]; p < graph.indptr[r + 1]; ++p) {
+                const int32_t lc = local[static_cast<std::size_t>(
+                    graph.indices[p])];
+                if (lc >= 0) {
+                    comp.indices.push_back(lc);
+                    comp.data.push_back(graph.data[p]);
+                }
+            }
+            comp.indptr[static_cast<std::size_t>(i) + 1] =
+                static_cast<int32_t>(comp.indices.size());
+        }
+        for (int64_t i = 0; i < cn; ++i)
+            local[static_cast<std::size_t>(rows[i])] = -1;
+
+        std::vector<double> evals, evecs;  // evecs row-major (cn x kk)
+        std::vector<double> comp_emb(static_cast<std::size_t>(cn) * dim);
+        if (normalized_laplacian_eigs(comp, kk, evals, evecs)) {
+            // order = argsort(eigenvalues)[1:k] (ascending already).
+            for (int64_t i = 0; i < cn; ++i)
+                for (int d = 0; d < dim; ++d)
+                    comp_emb[static_cast<std::size_t>(i) * dim + d] =
+                        evecs[static_cast<std::size_t>(i) * kk + d + 1];
+        } else {
+            // ArpackError fallback inside _spectral_layout: warn + return
+            // gen.uniform(-10, 10, (cn, dim)).
+            std::fprintf(stderr,
+                         "Spectral initialisation failed! Falling back to "
+                         "random initialisation!\n");
+            for (auto& v : comp_emb) v = rs.uniform(-10.0, 10.0);
+        }
+        // expansion = data_range / np.max(np.abs(component_embedding));
+        // result[mask] = component_embedding * expansion + meta[label]
+        double max_abs = 0.0;
+        for (const double v : comp_emb) max_abs = std::max(max_abs, std::abs(v));
+        const double expansion = data_range / max_abs;
+        for (int64_t i = 0; i < cn; ++i) {
+            for (int d = 0; d < dim; ++d) {
+                result[static_cast<std::size_t>(rows[i]) * dim + d] =
+                    static_cast<float>(
+                        comp_emb[static_cast<std::size_t>(i) * dim + d] *
+                            expansion +
+                        meta[static_cast<std::size_t>(label) * dim + d]);
+            }
+        }
+    }
+    return result;
+}
+
+}  // namespace
+// ------------------------------------------------------------------------------
+
 std::vector<float> UMAP::make_fit_init(const float* data, int64_t n_index,
                                        const SparseMatrix& filtered_graph,
                                        nnd::NumpyRandomState& rs) const {
@@ -830,31 +1054,62 @@ std::vector<float> UMAP::make_fit_init(const float* data, int64_t n_index,
         }
         return out;
     }
-    if (params_.init != "spectral") {
+    if (params_.init != "spectral" && params_.init != "tswspectral") {
         throw std::runtime_error("UMAP: init='" + params_.init +
                                  "' is not implemented yet");
     }
 
-    // init == "spectral": spectral_layout followed by noisy_scale_coords.
+    // init == "spectral" / "tswspectral": spectral_layout (respectively
+    // tswspectral_layout) followed by noisy_scale_coords. With the default
+    // method (eigsh, resolved below 2e6 rows) the two differ ONLY in how many
+    // warm-start normals they draw and discard -- see the wiring notes in
+    // spectral.hpp -- so both share the eigensolve below.
     std::vector<double> emb64(total);
     std::vector<int32_t> labels;
     const int32_t n_comp = connected_components(filtered_graph, labels);
     if (n_comp > 1) {
-        // Documented deviation: the multi-component path uses the tau-prng
-        // implementation in spectral.hpp (sklearn SpectralEmbedding /
-        // per-component solves); numpy stream parity is not maintained.
-        auto s = rs.rng_state3();
-        int64_t tau_state[3] = {s[0], s[1], s[2]};
-        const std::vector<float> multi = multi_component_layout(
-            n_index > 0 ? data : nullptr, dim_, filtered_graph, n_comp, labels,
-            dim, tau_state);
-        for (std::size_t i = 0; i < total; ++i)
-            emb64[i] = static_cast<double>(multi[i]);
+        // Disconnected graphs route to multi_component_layout BEFORE any
+        // eigsh/tsvd warm-start draw, for "tswspectral" exactly as for
+        // "spectral" (upstream's _spectral_layout dispatches on connectivity
+        // before touching the init parameter).
+        if (n_comp <= 2 * dim) {
+            // Few components: the meta layout is the deterministic +/- eye
+            // construction and every numpy draw is replicable -- the stream
+            // (and the small-component/fallback values) stay numpy-exact.
+            const std::vector<float> multi = multi_component_layout_numpy(
+                filtered_graph, n_comp, labels, dim, rs);
+            for (std::size_t i = 0; i < total; ++i)
+                emb64[i] = static_cast<double>(multi[i]);
+        } else {
+            // Documented deviation: with many components the meta layout is
+            // component_layout (sklearn SpectralEmbedding draws we do not
+            // replicate); the tau-prng implementation in spectral.hpp serves
+            // this case with distributional parity only.
+            auto s = rs.rng_state3();
+            int64_t tau_state[3] = {s[0], s[1], s[2]};
+            const std::vector<float> multi = multi_component_layout(
+                n_index > 0 ? data : nullptr, dim_, filtered_graph, n_comp,
+                labels, dim, tau_state);
+            for (std::size_t i = 0; i < total; ++i)
+                emb64[i] = static_cast<double>(multi[i]);
+        }
     } else {
-        // _spectral_layout draws X = gen.normal(size=(n, dim + 1)) as an
-        // eigsh warm start it never uses (v0=ones); consume for stream parity.
+        // Warm-start draws the reference generates and discards (consumed
+        // here for numpy stream parity):
+        //   * "spectral": _spectral_layout(init="random") draws
+        //     X = gen.normal(size=(n, dim + 1)) but eigsh gets v0=ones;
+        //   * "tswspectral": _spectral_layout(init="tsvd") runs sklearn
+        //     TruncatedSVD(algorithm="randomized") whose
+        //     randomized_range_finder draws
+        //     random_state.normal(size=(n, k + n_oversamples)) with
+        //     n_oversamples=10 -- n * (dim + 11) gaussians -- and the
+        //     default-method eigsh branch then discards the warm start too
+        //     (v0=ones; method=None resolves to "eigsh" below 2e6 rows).
         const int k = dim + 1;
-        for (int64_t i = 0; i < n * k; ++i) (void)rs.gauss();
+        const int64_t n_gauss =
+            n * static_cast<int64_t>(params_.init == "tswspectral" ? k + 10
+                                                                   : k);
+        for (int64_t i = 0; i < n_gauss; ++i) (void)rs.gauss();
         std::vector<double> eigenvalues, eigenvectors;
         if (normalized_laplacian_eigs(filtered_graph, k, eigenvalues,
                                       eigenvectors)) {
@@ -1582,21 +1837,17 @@ namespace {
 // utils.py::fast_knn_indices semantics on a float64 distance matrix (the
 // supervised small-data target path: sklearn pairwise on float64 y), with the
 // row gather still in float64; fuzzy_simplicial_set then casts to float32
-// (knn_dists.astype(np.float32)).
+// (knn_dists.astype(np.float32)). Same numba argpartition machinery as
+// fast_knn_from_dmat (see the composite additions above).
 void fast_knn_from_dmat_f64(const std::vector<double>& dmat, int64_t n,
                             int64_t m, int64_t n_neighbors,
                             int32_t* knn_indices, float* knn_dists) {
-    std::vector<int32_t> order(static_cast<std::size_t>(m));
+    std::vector<double> vals;
+    std::vector<int64_t> idx;
     for (int64_t row = 0; row < n; ++row) {
-        const double* d = dmat.data() + row * m;
-        std::iota(order.begin(), order.end(), 0);
-        std::stable_sort(order.begin(), order.end(),
-                         [d](int32_t a, int32_t b) { return d[a] < d[b]; });
-        for (int64_t j = 0; j < n_neighbors; ++j) {
-            knn_indices[row * n_neighbors + j] = order[j];
-            knn_dists[row * n_neighbors + j] =
-                static_cast<float>(d[order[j]]);
-        }
+        fast_knn_row(dmat.data() + row * m, m, n_neighbors, vals, idx,
+                     knn_indices + row * n_neighbors,
+                     knn_dists + row * n_neighbors);
     }
 }
 
@@ -2828,5 +3079,156 @@ SparseMatrix UMAP::transform_graph(const int32_t* q_indptr,
 }
 
 // ----------------------------------------------------------------------------
+
+// --- composite additions ------------------------------------------------------
+// umap_.py::__mul__ / __add__ / __sub__: compose two fitted models over the
+// same samples. See umap.hpp for the semantics and documented deviations.
+
+UMAP UMAP::combine_with(const UMAP& other, int op) const {
+    // check_is_fitted(self / other, attributes=["graph_"], ...): upstream's
+    // NotFittedError is a ValueError subclass.
+    if (!fitted_ || !other.fitted_)
+        throw std::invalid_argument("Only fitted UMAP models can be combined");
+    if (graph_.n_rows != other.graph_.n_rows)
+        throw std::invalid_argument(
+            "Only models with the equivalent samples can be combined");
+
+    UMAP result;
+    UMAPParams& rp = result.params_;
+
+    // _populate_combined_params stores flattened tuples upstream; the scalar
+    // params store the reduction each operator later applies (documented
+    // deviation in umap.hpp). Only the reductions below are ever consumed.
+    rp.n_neighbors = std::max(params_.n_neighbors, other.params_.n_neighbors);
+    rp.n_components =
+        std::min(params_.n_components, other.params_.n_components);
+    rp.learning_rate =
+        std::min(params_.learning_rate, other.params_.learning_rate);
+    rp.repulsion_strength =
+        (params_.repulsion_strength + other.params_.repulsion_strength) / 2.0;
+    const double negative_sample_rate =
+        (static_cast<double>(params_.negative_sample_rate) +
+         static_cast<double>(other.params_.negative_sample_rate)) /
+        2.0;
+    rp.negative_sample_rate =
+        static_cast<int>(std::llround(negative_sample_rate));
+    rp.verbose = params_.verbose || other.params_.verbose;
+
+    // n_epochs: flattened with None -> -1; None only if ALL entries are -1,
+    // else np.max. A list-valued n_epochs flattens into the tuple, so a list
+    // model contributes max(list).
+    const auto encode_epochs = [](const UMAPParams& p) -> int {
+        if (p.n_epochs_list.has_value())
+            return *std::max_element(p.n_epochs_list->begin(),
+                                     p.n_epochs_list->end());
+        return p.n_epochs.value_or(-1);
+    };
+    const int e1 = encode_epochs(params_);
+    const int e2 = encode_epochs(other.params_);
+    const int requested_epochs =
+        (e1 == -1 && e2 == -1) ? -1 : std::max(e1, e2);
+    if (requested_epochs >= 0) rp.n_epochs = requested_epochs;
+
+    // result.densmap = np.any(...); result.output_dens = np.any(...);
+    // _densmap_kwds from the maxima.
+    rp.densmap = params_.densmap || other.params_.densmap;
+    rp.output_dens = params_.output_dens || other.params_.output_dens;
+    rp.dens_lambda = std::max(params_.dens_lambda, other.params_.dens_lambda);
+    rp.dens_frac = std::max(params_.dens_frac, other.params_.dens_frac);
+    rp.dens_var_shift =
+        std::max(params_.dens_var_shift, other.params_.dens_var_shift);
+    if (rp.densmap || rp.output_dens)
+        throw std::runtime_error(
+            "KeyError: 'graph_dists' -- composing densmap/output_dens models "
+            "reads the _densmap_kwds[\"graph_dists\"] entry "
+            "_populate_combined_params never sets (upstream fails "
+            "identically)");
+
+    // a/b for the re-embedding: np.mean of the fitted _a/_b values.
+    result.a_ = (a_ + other.a_) / 2.0;
+    result.b_ = (b_ + other.b_) / 2.0;
+    result.initial_alpha_ = rp.learning_rate;
+
+    // Combine the fuzzy simplicial sets.
+    switch (op) {
+        case 0:  // __mul__: intersection at weight 0.5, reset_local_metric.
+            result.graph_ = reset_local_connectivity(
+                general_simplicial_set_intersection(graph_, other.graph_, 0.5),
+                /*reset_local_metric=*/true);
+            break;
+        case 1:  // __add__: union, reset_local_metric.
+            result.graph_ = reset_local_connectivity(
+                general_simplicial_set_union(graph_, other.graph_),
+                /*reset_local_metric=*/true);
+            break;
+        default:  // __sub__: right-complement intersection, no metric reset.
+            result.graph_ = reset_local_connectivity(
+                general_simplicial_set_intersection(
+                    graph_, other.graph_, /*weight=*/0.5,
+                    /*right_complement=*/true),
+                /*reset_local_metric=*/false);
+            break;
+    }
+
+    // if connected_components(result.graph_)[0] > 1: warn + init="random".
+    // (Note the reference's warning typo: __mul__ says "multi-component",
+    // __add__ / __sub__ say "mult-component".)
+    std::vector<int32_t> labels;
+    const int32_t n_comp = connected_components(result.graph_, labels);
+    if (n_comp > 1) {
+        warn_msg(op == 0
+                     ? "Combined graph is not connected but multi-component "
+                       "layout is unsupported. Falling back to random "
+                       "initialization."
+                     : "Combined graph is not connected but mult-component "
+                       "layout is unsupported. Falling back to random "
+                       "initialization.");
+        rp.init = "random";
+    } else {
+        rp.init = "spectral";
+    }
+
+    // simplicial_set_embedding(None, result.graph_, min(n_components),
+    // min(learning_rate), mean(_a), mean(_b), mean(repulsion_strength),
+    // mean(negative_sample_rate), n_epochs, init, check_random_state(42),
+    // "euclidean", {}, densmap=False, ..., parallel=False). The epoch weight
+    // filter writes through the shared tocoo() data into result.graph_
+    // exactly as in fit (result.graph_ is CSR; scipy csr.tocoo() reuses the
+    // data buffer).
+    SparseMatrix g = result.graph_;
+    const int n_epochs = resolve_epochs_and_filter_graph(
+        g, requested_epochs, /*default_epochs_boost=*/0,
+        /*write_through=*/&result.graph_);
+
+    nnd::NumpyRandomState rs(42);  // check_random_state(42)
+    result.fit_init_ = result.make_fit_init(/*data=*/nullptr, /*n_index=*/0,
+                                            g, rs);
+    const auto r3 = rs.rng_state3();
+    const int64_t rng_state[3] = {r3[0], r3[1], r3[2]};
+    // numpy_int64_epochs: n_epochs = np.max(result.n_epochs) is an np.int64,
+    // so epochs_per_sample is computed with the int64*float32->float64
+    // promotion (make_epochs_per_sample_i64).
+    result.embedding_ = simplicial_set_embedding_from_init(
+        g, result.fit_init_.data(), rp.n_components, result.a_, result.b_,
+        rng_state, n_epochs, rp.repulsion_strength, result.initial_alpha_,
+        negative_sample_rate, /*parallel=*/false, /*graph_prefiltered=*/true,
+        /*epochs_list=*/nullptr, /*embedding_list=*/nullptr,
+        /*densmap_kwds=*/nullptr, /*output_metric=*/nullptr,
+        /*numpy_int64_epochs=*/true);
+
+    // The result is "fitted" in upstream's check_is_fitted(["graph_"]) sense
+    // (so composites can be composed further) but holds no raw data: the
+    // transform/update surfaces raise (upstream: AttributeError '_raw_data').
+    result.n_ = g.n_rows;
+    result.dim_ = 0;
+    result.small_data_ = false;
+    result.fitted_ = true;
+    return result;
+}
+
+UMAP UMAP::operator*(const UMAP& other) const { return combine_with(other, 0); }
+UMAP UMAP::operator+(const UMAP& other) const { return combine_with(other, 1); }
+UMAP UMAP::operator-(const UMAP& other) const { return combine_with(other, 2); }
+// ------------------------------------------------------------------------------
 
 }  // namespace umap

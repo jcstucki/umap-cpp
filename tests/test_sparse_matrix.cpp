@@ -66,9 +66,10 @@ TEST_CASE("scaled and eliminate_zeros") {
     std::vector<float> d1 = a.to_dense();
     for (std::size_t i = 0; i < d1.size(); ++i) CHECK(d2[i] == 2.0f * d1[i]);
 
-    // a - a has explicit zeros everywhere in the union pattern
+    // a - a is empty: scipy's csr_binop_csr prunes exact-zero results (the
+    // binops never store explicit zeros).
     SparseMatrix z = a.subtract(a);
-    CHECK(z.nnz() == a.nnz());
+    CHECK(z.nnz() == 0);
     z.eliminate_zeros();
     CHECK(z.nnz() == 0);
     std::vector<float> zeros(9, 0.0f);

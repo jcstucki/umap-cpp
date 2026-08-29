@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <vector>
 
@@ -32,10 +33,13 @@
 #include "doctest.h"
 #include "golden_spectral.hpp"
 #include "golden_tsw.hpp"
+#include "trustworthiness.hpp"
+#include "umap/layouts.hpp"
 #include "umap/nn_descent.hpp"  // nnd::NumpyRandomState (u regeneration)
 #include "umap/rng.hpp"
 #include "umap/sparse_matrix.hpp"
 #include "umap/spectral.hpp"
+#include "umap/umap.hpp"
 
 namespace {
 
@@ -385,5 +389,101 @@ TEST_CASE("initialize_embedding dispatch: tswspectral") {
         CHECK(err < 0.01);
     }
 }
+
+// --- UMAP-class init="tswspectral" wiring (goldens: gen_golden_tsw.py) ------
+// Seeded parity vs a real Python UMAP(init="tswspectral", random_state=42)
+// fit on the small-data branch. The graph pipeline and the SGD rng_state are
+// bit-exact; the init is compared up to the per-column eigenvector sign
+// (Spectra vs ARPACK) and the embedding at quality level, exactly like the
+// init="spectral" cases in test_umap.cpp.
+
+TEST_CASE("umap class: fit RandomState stream parity (tswspectral init)") {
+    using namespace golden_tsw;
+    // Small-data branch consumes nothing before the init; tswspectral init
+    // draws the discarded TruncatedSVD warm start normal(size=(n, dim+1+10))
+    // -- n_oversamples=10, i.e. n*(dim+11) gaussians instead of spectral's
+    // n*(dim+1) -- then noisy_scale_coords' normal(size=(n, dim)), then the
+    // SGD rng_state. The golden was captured from the reference fit itself.
+    umap::nnd::NumpyRandomState rs(42);
+    for (int64_t i = 0; i < tswc_n * (2 + 11); ++i) (void)rs.gauss();
+    for (int64_t i = 0; i < tswc_n * 2; ++i) (void)rs.normal(0.0, 0.0001);
+    const auto r3 = rs.rng_state3();
+    for (int c = 0; c < 3; ++c) CHECK(r3[c] == tswc_fit_rng_state[c]);
+}
+
+TEST_CASE("umap class: golden fit parity, init=\"tswspectral\" "
+          "(small-data branch)") {
+    using namespace golden_tsw;
+    umap::UMAPParams p;
+    p.init = "tswspectral";
+    p.random_state = 42;
+    umap::UMAP model(p);
+    const std::vector<float> emb =
+        model.fit_transform(tswc_X, tswc_n, tswc_dim);
+    CHECK(model.small_data());
+
+    // Graph pipeline bit-exact: n_epochs default resolution, filtered
+    // head/tail edge lists, epochs_per_sample (a/b-independent).
+    umap::SparseMatrix g = model.graph();
+    const int n_epochs = umap::resolve_epochs_and_filter_graph(g, -1);
+    CHECK(n_epochs == tswc_fit_n_epochs);
+    std::vector<int32_t> head, tail;
+    for (int32_t row = 0; row < g.n_rows; ++row) {
+        for (int32_t k = g.indptr[row]; k < g.indptr[row + 1]; ++k) {
+            head.push_back(row);
+            tail.push_back(g.indices[k]);
+        }
+    }
+    REQUIRE(static_cast<int64_t>(head.size()) == tswc_fit_n_edges);
+    CHECK(std::memcmp(head.data(), tswc_fit_head,
+                      head.size() * sizeof(int32_t)) == 0);
+    CHECK(std::memcmp(tail.data(), tswc_fit_tail,
+                      tail.size() * sizeof(int32_t)) == 0);
+    const std::vector<double> eps = umap::make_epochs_per_sample(
+        g.data.data(), g.data.size(), n_epochs);
+    double eps_diff = 0.0;
+    for (std::size_t i = 0; i < eps.size(); ++i)
+        eps_diff = std::max(eps_diff, std::abs(eps[i] - tswc_fit_eps[i]));
+    CHECK(eps_diff == 0.0);
+
+    // Post-rescale init up to the per-column sign (in the rescaled [0,10]
+    // space a pre-rescale sign flip is x -> 10 - x). The gen script verified
+    // the Python side converged to the dense-eigh truth (~2e-6), so 1e-2
+    // bounds the Spectra-vs-ARPACK gap + the 1e-4 noise.
+    std::vector<float> init = model.fit_init();
+    for (int d = 0; d < 2; ++d) {
+        float mn = init[d], mx = init[d];
+        for (int64_t i = 1; i < tswc_n; ++i) {
+            mn = std::min(mn, init[i * 2 + d]);
+            mx = std::max(mx, init[i * 2 + d]);
+        }
+        for (int64_t i = 0; i < tswc_n; ++i) {
+            float& v = init[i * 2 + d];
+            v = (10.0f * (v - mn)) / (mx - mn);
+        }
+    }
+    double init_err = 0.0;
+    for (int d = 0; d < 2; ++d) {
+        double direct = 0.0, flipped = 0.0;
+        for (int64_t i = 0; i < tswc_n; ++i) {
+            const double o = init[i * 2 + d];
+            const double gv = tswc_fit_init[i * 2 + d];
+            direct = std::max(direct, std::abs(o - gv));
+            flipped = std::max(flipped, std::abs((10.0 - o) - gv));
+        }
+        init_err = std::max(init_err, std::min(direct, flipped));
+    }
+    CHECK(init_err < 1e-2);
+
+    // Embedding quality matches Python's on the same data.
+    CHECK(all_finite(emb));
+    const double tw_ours = testutil::trustworthiness(
+        tswc_X, tswc_n, tswc_dim, emb.data(), 2, 5);
+    const double tw_py = testutil::trustworthiness(
+        tswc_X, tswc_n, tswc_dim, tswc_embedding, 2, 5);
+    CHECK(tw_ours >= tw_py - 0.02);
+    CHECK(tw_ours >= tswc_trust_py - 0.02);
+}
+// ----------------------------------------------------------------------------
 
 }  // TEST_SUITE

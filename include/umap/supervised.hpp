@@ -79,4 +79,16 @@ SparseMatrix general_simplicial_set_intersection(const SparseMatrix& ss1,
                                                  double weight = 0.5,
                                                  bool right_complement = false);
 
+// --- composite additions ------------------------------------------------------
+// umap_.py::general_simplicial_set_union with sparse.py::general_sset_union as
+// its core: result structure is (ss1 + ss2), every stored value overwritten by
+// the fuzzy union left + right - left * right where absent entries take
+// left_min / right_min = max(data.min() / 2, 1e-8) (note: unlike the
+// intersection, the union's right_min has NO 1e-4 clamp). float32 .min()
+// reductions promoted to float64 by the /2.0 division, values computed in
+// float64 and rounded to float32 on store, exactly like the numba kernel.
+SparseMatrix general_simplicial_set_union(const SparseMatrix& ss1,
+                                          const SparseMatrix& ss2);
+// ------------------------------------------------------------------------------
+
 }  // namespace umap

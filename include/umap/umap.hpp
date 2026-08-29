@@ -86,8 +86,18 @@
 //     and the NaN disconnection mask is computed from that mutated graph.
 // ----------------------------------------------------------------------------
 //
+// --- composite additions -----------------------------------------------------
+//   * init="tswspectral": identical to init="spectral" except for the numpy
+//     draw count -- _spectral_layout(init="tsvd")'s TruncatedSVD warm start
+//     consumes n * (n_components + 11) normals which the default-method eigsh
+//     solve then discards (see spectral.hpp's wiring notes).
+//   * Composite models: operator* (fuzzy set intersection), operator+ (fuzzy
+//     set union) and operator- (right-complement intersection) compose two
+//     FITTED models, umap_.py __mul__/__add__/__sub__ semantics (see below).
+// -----------------------------------------------------------------------------
+//
 // Deferred (upstream branches NOT ported): sparse precomputed distances,
-// init="tswspectral", inverse_transform / update / AlignedUMAP.
+// AlignedUMAP.
 //
 // Seeded parity: when random_state is set, the numpy legacy RandomState
 // stream is replicated draw for draw (NN-descent seeding, init draws --
@@ -150,7 +160,7 @@ struct UMAPParams {
     std::string metric = "euclidean";     // named metrics or "precomputed"
     std::optional<int> n_epochs;          // None -> 500/200 (fit), 100/30 (transform)
     double learning_rate = 1.0;
-    std::string init = "spectral";        // "spectral" | "random" | "pca" ("tswspectral" TODO)
+    std::string init = "spectral";        // "spectral" | "random" | "pca" | "tswspectral"
     double min_dist = 0.1;
     double spread = 1.0;
     double set_op_mix_ratio = 1.0;
@@ -262,6 +272,48 @@ class UMAP {
     // Transform new points (row-major n_queries x n_features) into the
     // existing embedded space; returns n_queries x n_components.
     std::vector<float> transform(const float* X_new, int64_t n_queries) const;
+
+    // --- composite additions ------------------------------------------------
+    // umap_.py's fitted-model composition operators (__mul__ / __add__ /
+    // __sub__). Both operands must be fitted models over the SAME SAMPLES
+    // (upstream only checks graph_.shape[0]; the intended use is models fit
+    // on the same X, or on different feature subsets of the same rows):
+    //   * a * b: fuzzy set intersection --
+    //     general_simplicial_set_intersection(a.graph_, b.graph_, 0.5), then
+    //     reset_local_connectivity(graph, reset_local_metric=True);
+    //   * a + b: fuzzy set union -- general_simplicial_set_union, then
+    //     reset_local_connectivity(graph, True);
+    //   * a - b: contrastive / right-complement intersection --
+    //     general_simplicial_set_intersection(a.graph_, b.graph_, weight=0.5,
+    //     right_complement=True), then reset_local_connectivity(graph, False).
+    // The combined graph is then re-embedded via simplicial_set_embedding
+    // (data=None, n_components=min, initial_alpha=min(learning_rate),
+    // a/b=mean of the fitted values, gamma=mean(repulsion_strength),
+    // negative_sample_rate=mean, n_epochs=None if both were None else max,
+    // init="spectral" -- or "random" with upstream's warning when the
+    // combined graph is disconnected -- random_state=RandomState(42),
+    // metric="euclidean", parallel=False). The result carries graph_
+    // (including the explicit zeros upstream's shared-.data epoch filter
+    // writes back through tocoo()) and embedding_; it has no raw data, so
+    // transform/inverse_transform/update raise (upstream: AttributeError
+    // '_raw_data').
+    // Deviations (documented): upstream stores every parameter of the result
+    // as the flattened tuple of the operands' values; the scalar UMAPParams
+    // stores the reduction each operator applies instead (min/max/mean/any as
+    // listed above -- composing composites therefore reduces over the
+    // immediate operands, not the flattened leaf models), and params_.init
+    // records the init the composition actually used. densmap/output_dens
+    // operands throw (upstream reads the _densmap_kwds["graph_dists"] key
+    // _populate_combined_params never sets -- KeyError). Upstream's __sub__
+    // additionally MUTATES the left operand's graph_ in place (its
+    // general_simplicial_set_intersection(right_complement=True) writes the
+    // contrast values through `result = simplicial_set1.tocoo()`, which for a
+    // COO fit graph is the operand itself); the C++ `a - b` leaves `a`
+    // untouched.
+    UMAP operator*(const UMAP& other) const;  // fuzzy set intersection
+    UMAP operator+(const UMAP& other) const;  // fuzzy set union
+    UMAP operator-(const UMAP& other) const;  // right-complement intersection
+    // ------------------------------------------------------------------------
 
     // --- inverse-update additions -------------------------------------------
     // umap_.py::inverse_transform(X): transform points of the embedded space
@@ -420,6 +472,11 @@ class UMAP {
                       const int32_t* new_indices, const float* new_values,
                       int64_t n_new, int64_t n_features);
     // ------------------------------------------------------------------------
+    // --- composite additions ------------------------------------------------
+    // The shared body of operator* / operator+ / operator- (op: 0 = mul /
+    // intersection, 1 = add / union, 2 = sub / right-complement).
+    UMAP combine_with(const UMAP& other, int op) const;
+    // ------------------------------------------------------------------------
 
     UMAPParams params_;
     double a_ = 0.0;
@@ -496,8 +553,11 @@ std::vector<float> pairwise_distances_sklearn(const float* X, int64_t nx,
                                               const MetricKwds& kwds = {});
 
 // utils.py::fast_knn_indices semantics: per row of the (n x m) distance
-// matrix, the n_neighbors smallest entries with stable (mergesort) tie-break
-// by ascending column index. Outputs are (n x n_neighbors) row-major.
+// matrix, candidates = np.argpartition(row, n_neighbors - 1)[:n_neighbors]
+// (numba's median-of-three quickselect, replicated exactly -- on exact-tie
+// rows the subset straddling the boundary is algorithm-determined, NOT the
+// lowest indices), candidates sorted ascending, then a stable mergesort by
+// distance. Outputs are (n x n_neighbors) row-major.
 void fast_knn_from_dmat(const std::vector<float>& dmat, int64_t n, int64_t m,
                         int64_t n_neighbors, int32_t* knn_indices,
                         float* knn_dists);

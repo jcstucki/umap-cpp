@@ -60,6 +60,34 @@ std::vector<double> make_epochs_per_sample(const double* weights,
 }
 // ----------------------------------------------------------------------------
 
+// --- composite additions ------------------------------------------------------
+std::vector<double> make_epochs_per_sample_i64(const float* weights,
+                                               std::size_t n_weights,
+                                               int n_epochs) {
+    // The composite operators pass n_epochs = np.max(result.n_epochs), an
+    // np.int64; numpy promotes int64 * float32 to FLOAT64, so
+    // n_samples = n_epochs * (weights / weights.max()) becomes
+    // f8(n_epochs) * f8(f4(w / w_max)) -- the w / w_max quotient is still
+    // rounded to float32 first (f4 array / f4 scalar) -- instead of the
+    // all-float32 product of the normal fit path (python-int n_epochs).
+    std::vector<double> result(n_weights, -1.0);
+    if (n_weights == 0) return result;
+    float w_max = weights[0];
+    for (std::size_t i = 1; i < n_weights; ++i) {
+        if (weights[i] > w_max) w_max = weights[i];
+    }
+    for (std::size_t i = 0; i < n_weights; ++i) {
+        const float q32 = weights[i] / w_max;
+        const double n_samples =
+            static_cast<double>(n_epochs) * static_cast<double>(q32);
+        if (n_samples > 0.0) {
+            result[i] = static_cast<double>(n_epochs) / n_samples;
+        }
+    }
+    return result;
+}
+// ------------------------------------------------------------------------------
+
 // --- densmap additions ------------------------------------------------------
 #if defined(__APPLE__)
 // numpy's macOS wheels (>= 2.0) link Accelerate; np.dot(f32, f32) is
@@ -570,7 +598,8 @@ std::vector<float> simplicial_set_embedding_from_init(
     double initial_alpha, double negative_sample_rate, bool parallel,
     bool graph_prefiltered, const std::vector<int>* epochs_list,
     std::vector<std::vector<float>>* embedding_list,
-    const DensmapParams* densmap_kwds, const OutputMetricFn* output_metric) {
+    const DensmapParams* densmap_kwds, const OutputMetricFn* output_metric,
+    bool numpy_int64_epochs) {
     // --- densmap additions --------------------------------------------------
     if (densmap_kwds != nullptr && output_metric != nullptr) {
         throw std::invalid_argument(
@@ -614,8 +643,11 @@ std::vector<float> simplicial_set_embedding_from_init(
     }
 
     std::vector<double> epochs_per_sample =
-        make_epochs_per_sample(graph.data.data(), graph.data.size(),
-                               n_epochs_max);
+        numpy_int64_epochs
+            ? make_epochs_per_sample_i64(graph.data.data(), graph.data.size(),
+                                         n_epochs_max)
+            : make_epochs_per_sample(graph.data.data(), graph.data.size(),
+                                     n_epochs_max);
 
     // embedding = (10.0 * (embedding - min0) / (max0 - min0)).astype(f4, "C")
     // per-component, float32 arithmetic, multiplication before division.

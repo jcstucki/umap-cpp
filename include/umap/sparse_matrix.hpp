@@ -31,13 +31,16 @@ public:
 
     SparseMatrix transpose() const;
 
-    // Elementwise binary operations over the union of sparsity patterns.
+    // Elementwise binary operations over the union of sparsity patterns,
+    // with scipy csr_binop_csr semantics: exact-zero results are NOT stored
+    // (scipy prunes them even where both operands store the position).
     SparseMatrix add(const SparseMatrix& other) const;
     SparseMatrix subtract(const SparseMatrix& other) const;
     // Elementwise (Hadamard) product, like scipy's A.multiply(B); the result
-    // pattern is the intersection of the operand patterns.
+    // pattern is the intersection of the operand patterns minus exact-zero
+    // products.
     SparseMatrix multiply(const SparseMatrix& other) const;
-    // Elementwise maximum, like scipy's A.maximum(B).
+    // Elementwise maximum, like scipy's A.maximum(B) (zero maxima pruned).
     SparseMatrix maximum(const SparseMatrix& other) const;
 
     SparseMatrix scaled(float s) const;  // scalar * matrix

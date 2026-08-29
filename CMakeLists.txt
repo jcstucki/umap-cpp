@@ -243,6 +243,12 @@ target_sources(umap_tests PRIVATE
     tests/test_update.cpp)
 # ----------------------------------------------------------------------------
 
+# --- composite additions -----------------------------------------------------
+# Port of test_composite_models.py (UMAP operator* / + / -); goldens from
+# scripts/gen_golden_composite.py -> tests/golden_composite.hpp.
+target_sources(umap_tests PRIVATE tests/test_composite_models.cpp)
+# ----------------------------------------------------------------------------
+
 # --- metal-gpu additions ----------------------------------------------------
 if(UMAP_ENABLE_METAL)
     target_sources(umap_tests PRIVATE tests/test_metal.cpp)

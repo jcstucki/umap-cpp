@@ -84,6 +84,19 @@ SparseMatrix SparseMatrix::binary_op(const SparseMatrix& other, Op op,
     out.indices.reserve(nnz() + other.nnz());
     out.data.reserve(nnz() + other.nnz());
 
+    // scipy csr_binop_csr(_canonical) semantics: evaluate the op over the
+    // union of the sparsity patterns (zero fill for the absent side) and
+    // store an entry ONLY when the result is nonzero. Exact-zero results are
+    // pruned even where both operands store the position (explicit zeros
+    // summing to 0, equal values subtracting to 0, max(0, 0), 0-products) --
+    // matters once operand matrices carry explicit zeros, e.g. a fit graph_
+    // after the epoch filter's write-through.
+    const auto push_nonzero = [&out](int32_t col, float v) {
+        if (v != 0.0f) {
+            out.indices.push_back(col);
+            out.data.push_back(v);
+        }
+    };
     for (int32_t r = 0; r < n_rows; ++r) {
         int32_t ka = indptr[r];
         const int32_t ea = indptr[static_cast<std::size_t>(r) + 1];
@@ -93,22 +106,20 @@ SparseMatrix SparseMatrix::binary_op(const SparseMatrix& other, Op op,
             int32_t ca = ka < ea ? indices[static_cast<std::size_t>(ka)] : n_cols;
             int32_t cb = kb < eb ? other.indices[static_cast<std::size_t>(kb)] : n_cols;
             if (ca == cb) {
-                out.indices.push_back(ca);
-                out.data.push_back(op(data[static_cast<std::size_t>(ka)],
-                                      other.data[static_cast<std::size_t>(kb)]));
+                push_nonzero(ca, op(data[static_cast<std::size_t>(ka)],
+                                    other.data[static_cast<std::size_t>(kb)]));
                 ++ka;
                 ++kb;
             } else if (ca < cb) {
                 if (keep_union) {
-                    out.indices.push_back(ca);
-                    out.data.push_back(op(data[static_cast<std::size_t>(ka)], 0.0f));
+                    push_nonzero(ca,
+                                 op(data[static_cast<std::size_t>(ka)], 0.0f));
                 }
                 ++ka;
             } else {
                 if (keep_union) {
-                    out.indices.push_back(cb);
-                    out.data.push_back(
-                        op(0.0f, other.data[static_cast<std::size_t>(kb)]));
+                    push_nonzero(
+                        cb, op(0.0f, other.data[static_cast<std::size_t>(kb)]));
                 }
                 ++kb;
             }

@@ -215,4 +215,47 @@ SparseMatrix general_simplicial_set_intersection(const SparseMatrix& ss1,
     return result;
 }
 
+// --- composite additions ------------------------------------------------------
+SparseMatrix general_simplicial_set_union(const SparseMatrix& ss1,
+                                          const SparseMatrix& ss2) {
+    // result = (ss1 + ss2).tocoo(); left/right stay the CSR operands.
+    SparseMatrix result = ss1.add(ss2);
+
+    // sparse.py::general_sset_union. left_min / right_min come from float32
+    // .min() reductions, promoted to float64 by the /2.0 division; the union
+    // has no 1e-4 clamp on right_min (unlike the intersection).
+    float d1_min = std::numeric_limits<float>::infinity();
+    for (const float v : ss1.data) d1_min = std::min(d1_min, v);
+    const double left_min =
+        std::max(static_cast<double>(d1_min) / 2.0, 1.0e-8);
+
+    float d2_min = std::numeric_limits<float>::infinity();
+    for (const float v : ss2.data) d2_min = std::min(d2_min, v);
+    const double right_min =
+        std::max(static_cast<double>(d2_min) / 2.0, 1.0e-8);
+
+    for (int32_t i = 0; i < result.n_rows; ++i) {
+        for (int32_t idx = result.indptr[i]; idx < result.indptr[i + 1];
+             ++idx) {
+            const int32_t j = result.indices[idx];
+
+            double left_val = left_min;
+            for (int32_t k = ss1.indptr[i]; k < ss1.indptr[i + 1]; ++k) {
+                if (ss1.indices[k] == j)
+                    left_val = static_cast<double>(ss1.data[k]);
+            }
+            double right_val = right_min;
+            for (int32_t k = ss2.indptr[i]; k < ss2.indptr[i + 1]; ++k) {
+                if (ss2.indices[k] == j)
+                    right_val = static_cast<double>(ss2.data[k]);
+            }
+
+            result.data[idx] = static_cast<float>(
+                left_val + right_val - left_val * right_val);
+        }
+    }
+    return result;
+}
+// ------------------------------------------------------------------------------
+
 }  // namespace umap
