@@ -221,6 +221,34 @@ their layout optimization on the CPU (kNN can still be GPU). Users who need
 seeded bit-exact parity with the Python reference should keep the default
 `Device::CPU`.
 
+### Penalized kNN (auxiliary GPU kernel)
+
+[`include/umap/metal_knn.h`](include/umap/metal_knn.h) exposes an extra
+utility kernel that ships inside the same `umap_kernels.metallib` but is
+**not used by the UMAP pipeline itself**: an exact brute-force kNN whose
+distance is a cosine or euclidean base over F ≤ 8 feature dims plus weighted
+penalties `wt·|dz_i−dz_j| + wp·|cz_i−cz_j| + wr·|rz_i−rz_j| +
+wk·[tid_i≠tid_j]` (z-scored day/close/return columns and a ticker-mismatch
+constant, e.g. for cross-sectional financial panels). The API is global-scope
+C++ (no namespace):
+
+```cpp
+#include <umap/metal_knn.h>
+
+bool gpu_knn_available();
+bool gpu_knn(const float* X, const float* sq, const float* dz, const float* cz,
+             const float* rz, const int32_t* tid, int n, int F, int k,
+             bool cosine, float wt, float wp, float wr, float wk,
+             int32_t* outI, float* outD);
+```
+
+`X` is n×F row-major (rows unit-normalized when `cosine=true`), `sq` the
+squared row norms (euclidean base). Outputs are n×k rows sorted ascending by
+penalized distance, self excluded, padded with index −1 / distance 1e30 past
+the n−1 real neighbours. Requires F ≤ 8 and k ≤ 64; anything else — or no
+Metal device, or an `UMAP_ENABLE_METAL=OFF` build (a CPU stub keeps callers
+linking) — returns `false` and the caller runs its own CPU fallback.
+
 ## Tests
 
 `./build/umap_tests` — doctest port of the entire upstream test suite
@@ -228,10 +256,10 @@ seeded bit-exact parity with the Python reference should keep the default
 suites generated from the real Python implementation
 (`scripts/gen_golden*.py`, `scripts/gen_upstream_fixtures.py`):
 
-* Metal build: **420 test cases / 255,185 assertions**, 0 failures
+* Metal build: **425 test cases / 263,295 assertions**, 0 failures
   (24 skips: version-removed scipy metrics, upstream `@skip` mirrors,
   typed-surface-unrepresentable cases, two hidden GPU timing cases);
-* CPU-only build: **406 cases / 174,683 assertions**, 0 failures (22 skips).
+* CPU-only build: **407 cases / 174,687 assertions**, 0 failures (22 skips).
 
 `scripts/test_install.sh` additionally verifies `cmake --install`, the
 `find_package(umapcpp)` consumer build (C++ and C), and the installed CLI

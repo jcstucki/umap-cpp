@@ -123,10 +123,23 @@ if(UMAP_ENABLE_METAL)
         DEPENDS ${UMAP_METAL_SHADER}
         COMMENT "Compiling Metal shaders (umap_kernels.metal -> .air)"
         VERBATIM)
+    # --- metal-knn additions --------------------------------------------------
+    # Auxiliary penalized-kNN kernel: second shader TU, compiled to its own
+    # .air and linked into the SAME umap_kernels.metallib (no second metallib,
+    # so the existing runtime path resolution / install rule cover it).
+    set(UMAP_KNN_SHADER ${CMAKE_CURRENT_SOURCE_DIR}/src/metal/knn.metal)
+    set(UMAP_KNN_AIR ${CMAKE_CURRENT_BINARY_DIR}/knn.air)
+    add_custom_command(
+        OUTPUT ${UMAP_KNN_AIR}
+        COMMAND xcrun -sdk macosx metal -c ${UMAP_KNN_SHADER} -o ${UMAP_KNN_AIR}
+        DEPENDS ${UMAP_KNN_SHADER}
+        COMMENT "Compiling Metal shaders (knn.metal -> .air)"
+        VERBATIM)
+    # --------------------------------------------------------------------------
     add_custom_command(
         OUTPUT ${UMAP_METALLIB}
-        COMMAND xcrun -sdk macosx metallib ${UMAP_METAL_AIR} -o ${UMAP_METALLIB}
-        DEPENDS ${UMAP_METAL_AIR}
+        COMMAND xcrun -sdk macosx metallib ${UMAP_METAL_AIR} ${UMAP_KNN_AIR} -o ${UMAP_METALLIB}
+        DEPENDS ${UMAP_METAL_AIR} ${UMAP_KNN_AIR}
         COMMENT "Linking Metal library (umap_kernels.metallib)"
         VERBATIM)
     add_custom_target(umap_metallib ALL DEPENDS ${UMAP_METALLIB})
@@ -134,7 +147,8 @@ if(UMAP_ENABLE_METAL)
     target_sources(umapcpp PRIVATE
         src/metal/metal_context.cpp
         src/metal/gpu_knn.cpp
-        src/metal/gpu_layout.cpp)
+        src/metal/gpu_layout.cpp
+        src/metal/metal_knn.cpp)  # metal-knn additions: penalized-kNN host
     add_dependencies(umapcpp umap_metallib)
     # metal-cpp (vendored, Apple's C++ Metal API): SYSTEM to keep -Wpedantic quiet.
     target_include_directories(umapcpp SYSTEM PRIVATE
@@ -148,6 +162,15 @@ if(UMAP_ENABLE_METAL)
         "-framework Metal" "-framework Foundation" "-framework QuartzCore")
 endif()
 # ----------------------------------------------------------------------------
+
+# --- metal-knn additions -----------------------------------------------------
+# Auxiliary penalized-kNN GPU API (include/umap/metal_knn.h): global-scope
+# gpu_knn_available()/gpu_knn() for external callers, not used by the UMAP
+# pipeline itself. UMAP_ENABLE_METAL=OFF builds still compile and link code
+# including the header via the always-false CPU stub (mirrors src/device.cpp;
+# the TU is empty when the Metal host src/metal/metal_knn.cpp provides them).
+target_sources(umapcpp PRIVATE src/metal_knn_stub.cpp)
+# -----------------------------------------------------------------------------
 
 # --- inverse-update additions -----------------------------------------------
 # scipy.spatial.Delaunay port for inverse_transform: the exact qhull sources
@@ -278,6 +301,13 @@ if(UMAP_ENABLE_METAL)
     target_sources(umap_tests PRIVATE tests/test_gpu_knn.cpp)
 endif()
 # ----------------------------------------------------------------------------
+
+# --- metal-knn additions -----------------------------------------------------
+# Auxiliary penalized-kNN kernel: compiled in BOTH configs — GPU parity vs an
+# in-test CPU reference under Metal, the always-false stub contract when
+# UMAP_ENABLE_METAL=OFF (the file gates on the compile definition).
+target_sources(umap_tests PRIVATE tests/test_metal_knn.cpp)
+# -----------------------------------------------------------------------------
 
 # --- phase4 additions --------------------------------------------------------
 # Model persistence round trips + C API coverage (c_api_smoke.c is compiled

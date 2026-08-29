@@ -31,6 +31,7 @@ for f in \
     bin/umap \
     include/umap/umap.hpp \
     include/umap/umap_c.h \
+    include/umap/metal_knn.h \
     lib/cmake/umapcpp/umapcpp-config.cmake \
     lib/cmake/umapcpp/umapcpp-config-version.cmake \
     lib/cmake/umapcpp/umapcpp-targets.cmake; do
