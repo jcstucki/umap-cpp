@@ -7,8 +7,6 @@
 // Skips (see tests/PORTING_NOTES.md):
 //   * test_component_layout_options -- component_layout with
 //     metric="precomputed" + linkage kwds is not ported (euclidean-only).
-//   * test_disconnected_data_precomputed[sparse=True] -- sparse precomputed
-//     distance matrices are not ported (the dense variant runs).
 // Adaptations:
 //   * warning-count assertions in test_disconnected_data are replaced by the
 //     model's vertices_disconnected()/edges_removed() bookkeeping (the C++
@@ -230,8 +228,9 @@ TEST_CASE("test_disconnected_data") {
 }
 
 TEST_CASE("test_disconnected_data_precomputed") {
-    // num_isolates=1; the sparse=True variant is skipped (sparse precomputed
-    // not ported), the dense variant runs.
+    // num_isolates=1; both parametrisations run (hardening additions ported
+    // the sparse precomputed branch; the CSR conversion drops the zero
+    // diagonal and any exact-zero jaccard distances, like csr_matrix(dmat)).
     const int64_t n = 11;
     const std::vector<float> dmat =
         testutil::to_f32(updata::discp_dmat, static_cast<std::size_t>(n) * n);
@@ -251,6 +250,25 @@ TEST_CASE("test_disconnected_data_precomputed") {
                 if (std::isnan(model.embedding()[i * p.n_components + d]))
                     ++number_of_nan;
     CHECK(number_of_nan >= 1 * p.n_components);
+
+    // --- hardening additions: the sparse=True leg -------------------------
+    {
+        const testutil::Csr D = testutil::dense_to_csr(dmat.data(), n, n);
+        UMAP smodel(p);
+        smodel.fit(D.indptr.data(), D.indices.data(), D.data.data(), n, n);
+        const std::vector<bool> sisolated =
+            testutil::disconnected_vertices(smodel.graph());
+        CHECK(sisolated[10] == true);
+        int64_t s_nan = 0;
+        for (int64_t i = 0; i < n; ++i)
+            if (sisolated[i])
+                for (int d = 0; d < p.n_components; ++d)
+                    if (std::isnan(
+                            smodel.embedding()[i * p.n_components + d]))
+                        ++s_nan;
+        CHECK(s_nan >= 1 * p.n_components);
+    }
+    // ----------------------------------------------------------------------
 }
 
 TEST_CASE("test_bad_transform_data") {

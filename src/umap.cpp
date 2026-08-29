@@ -1554,14 +1554,10 @@ UMAP& UMAP::fit(const float* X, int64_t n_samples, int64_t n_features,
 UMAP& UMAP::fit(const int32_t* indptr, const int32_t* indices,
                 const float* data, int64_t n_samples, int64_t n_features,
                 const float* y) {
-    // Branches upstream supports for sparse input but this port does not:
-    if (params_.metric == "precomputed")
-        throw std::invalid_argument(
-            "UMAP: metric='precomputed' with sparse input (the upstream "
-            "sparse precomputed branch) is not ported");
-    if (params_.precomputed_knn.has_value())
-        throw std::invalid_argument(
-            "UMAP: precomputed_knn with sparse input is not ported");
+    // Branches upstream supports for sparse input but this port does not
+    // (hardening additions: metric="precomputed" and precomputed_knn are now
+    // ported; init="pca" remains out -- sklearn's TruncatedSVD randomized
+    // solver is not replicable bit-for-bit):
     if (!params_.init_array.has_value() && params_.init == "pca")
         throw std::invalid_argument(
             "UMAP: init='pca' with sparse input (upstream TruncatedSVD) is "
@@ -1838,6 +1834,134 @@ UMAP& UMAP::fit_impl(const float* X, int64_t n_samples, int64_t n_features,
 
     FuzzySimplicialSetResult fuzzy;
     edges_removed_ = 0;
+    // --- hardening additions -------------------------------------------------
+    // upstream's `if self.metric == "precomputed" and self._sparse_data:`
+    // branch -- BEFORE the small-data elif, so even n < 4096 sparse
+    // precomputed input takes it (upstream never sets _small_data here; the
+    // C++ transform routes on the precomputed branch first, so false keeps
+    // update()/persistence bookkeeping coherent). kNN comes from argsorting
+    // the stored row entries; unstored zeros are NOT neighbour candidates
+    // (the scipy CSR representation quirk, faithfully kept).
+    if (sparse_data_ && params_.metric == "precomputed") {
+        small_data_ = false;
+        knn_index_.reset();
+        sparse_knn_index_.reset();
+        // if sparse_tril(X).getnnz() != sparse_triu(X).getnnz() (both
+        // include the diagonal): structural symmetry proxy.
+        int64_t nnz_tril = 0, nnz_triu = 0;
+        for (int64_t i = 0; i < n_index; ++i) {
+            for (int32_t k = sp_indptr[i]; k < sp_indptr[i + 1]; ++k) {
+                if (sp_indices[k] <= i) ++nnz_tril;
+                if (sp_indices[k] >= i) ++nnz_triu;
+            }
+        }
+        if (nnz_tril != nnz_triu)
+            throw std::invalid_argument(
+                "Sparse precomputed distance matrices should be "
+                "symmetrical!");
+        // if not np.all(X.diagonal() == 0) (unstored diagonal entries are 0).
+        for (int64_t i = 0; i < n_index; ++i)
+            for (int32_t k = sp_indptr[i]; k < sp_indptr[i + 1]; ++k)
+                if (sp_indices[k] == i && sp_values[k] != 0.0f)
+                    throw std::invalid_argument(
+                        "Non-zero distances from samples to themselves!");
+
+        std::vector<double> kdst64;  // _knn_dists is float64 upstream
+        bool dists_are_f64 = false;
+        if (pknn == nullptr) {
+            knn_cols_ = n_neighbors_;
+            knn_indices_.assign(
+                static_cast<std::size_t>(n_index) * n_neighbors_, 0);
+            kdst64.assign(static_cast<std::size_t>(n_index) * n_neighbors_,
+                          0.0);
+            dists_are_f64 = true;
+            std::vector<int64_t> ord;
+            for (int64_t row = 0; row < n_index; ++row) {
+                const int32_t start = sp_indptr[row];
+                const int64_t len = sp_indptr[row + 1] - start;
+                if (len < n_neighbors_)
+                    throw std::invalid_argument(
+                        "Some rows contain fewer than n_neighbors "
+                        "distances!");
+                if (len == n_neighbors_)
+                    throw std::invalid_argument(
+                        "UMAP: sparse precomputed rows need more than "
+                        "n_neighbors stored distances (upstream's "
+                        "np.argpartition(kth=n_neighbors) is out of bounds "
+                        "when a row stores exactly n_neighbors)");
+                // np.argpartition(row_data, k)[:k] then argsort by value.
+                // Ties resolve stably by stored position here where numpy's
+                // introselect + quicksort are unstable (documented
+                // deviation, same as the dense transform k-selection).
+                ord.resize(static_cast<std::size_t>(len));
+                std::iota(ord.begin(), ord.end(), 0);
+                std::stable_sort(ord.begin(), ord.end(),
+                                 [&](int64_t a, int64_t b) {
+                                     return sp_values[start + a] <
+                                            sp_values[start + b];
+                                 });
+                for (int64_t j = 0; j < n_neighbors_; ++j) {
+                    const int64_t pos =
+                        start + ord[static_cast<std::size_t>(j)];
+                    knn_indices_[static_cast<std::size_t>(
+                        row * n_neighbors_ + j)] = sp_indices[pos];
+                    kdst64[static_cast<std::size_t>(row * n_neighbors_ + j)] =
+                        static_cast<double>(sp_values[pos]);
+                }
+            }
+        } else {
+            // Bypass with the user-provided kNN, exactly like the standard
+            // branch (upstream: `else: self._knn_indices = self.knn_indices`).
+            if (prune_pknn) {
+                knn_cols_ = params_.n_neighbors;
+                knn_indices_.resize(static_cast<std::size_t>(n_index) *
+                                    knn_cols_);
+                knn_dists_.resize(static_cast<std::size_t>(n_index) *
+                                  knn_cols_);
+                for (int64_t i = 0; i < n_index; ++i) {
+                    for (int64_t j = 0; j < knn_cols_; ++j) {
+                        knn_indices_[i * knn_cols_ + j] =
+                            pknn->indices[i * pknn->n_neighbors + j];
+                        knn_dists_[i * knn_cols_ + j] =
+                            pknn->dists[i * pknn->n_neighbors + j];
+                    }
+                }
+            } else {
+                knn_cols_ = pknn->n_neighbors;
+                knn_indices_ = pknn->indices;
+                knn_dists_ = pknn->dists;
+            }
+        }
+        // Disconnection mask (float64 for the extracted dists; counted
+        // unconditionally like the standard branch), then the
+        // astype(np.float32) at fuzzy_simplicial_set's boundary.
+        if (dists_are_f64) {
+            knn_dists_.resize(kdst64.size());
+            for (std::size_t i = 0; i < kdst64.size(); ++i) {
+                if (kdst64[i] >= disconnection_distance_) {
+                    knn_indices_[i] = -1;
+                    kdst64[i] = std::numeric_limits<double>::infinity();
+                    ++edges_removed_;
+                }
+                knn_dists_[i] = static_cast<float>(kdst64[i]);
+            }
+        } else {
+            for (std::size_t i = 0; i < knn_dists_.size(); ++i) {
+                if (static_cast<double>(knn_dists_[i]) >=
+                    disconnection_distance_) {
+                    knn_indices_[i] = -1;
+                    knn_dists_[i] = std::numeric_limits<float>::infinity();
+                    ++edges_removed_;
+                }
+            }
+        }
+        fuzzy = fuzzy_simplicial_set(
+            static_cast<int>(n_index), knn_indices_.data(), knn_dists_.data(),
+            params_.n_neighbors, params_.set_op_mix_ratio,
+            params_.local_connectivity, /*apply_set_operations=*/true,
+            /*return_dists=*/want_graph_dists, static_cast<int>(knn_cols_));
+    } else
+    // -------------------------------------------------------------------------
     if (n_index < 4096 && !force_approximation_algorithm_) {
         // Handle small cases efficiently by computing all distances.
         small_data_ = true;
@@ -2560,8 +2684,9 @@ const SparseMatrix& UMAP::fit_transform_graph(const float* X,
 MembershipStrengths UMAP::transform_membership(const float* X_new,
                                                int64_t n_queries) const {
     // #848: raise when a search index would be needed but none exists
-    // (metric="precomputed" standard-branch fits, precomputed_knn without a
-    // search index).
+    // (metric="precomputed" standard-branch fits set _knn_search_index=None
+    // via nearest_neighbors upstream, so their transform raises too;
+    // precomputed_knn without a search index likewise).
     if (!small_data_ && !knn_index_) {
         throw std::runtime_error(
             "No search index available: transforming data"
@@ -3563,6 +3688,60 @@ MembershipStrengths UMAP::transform_membership_sparse(
     int64_t cols;
     std::vector<int32_t> indices;
     std::vector<float> dists;
+    // --- hardening additions -------------------------------------------------
+    // upstream transform's sparse precomputed branch: rows hold distances
+    // from each new point to (a superset of) its nearest training points;
+    // the k smallest *stored* entries per row are selected.
+    if (params_.metric == "precomputed") {
+        warn_msg(
+            "Transforming new data with precomputed metric. "
+            "We are assuming the input data is a matrix of distances from "
+            "the new points to the points in the training set. If the input "
+            "matrix is sparse, it should contain distances from the new "
+            "points to their nearest neighbours or approximate nearest "
+            "neighbours in the training set.");
+        cols = n_neighbors_;
+        indices.assign(static_cast<std::size_t>(n_queries) * cols, -1);
+        dists.assign(static_cast<std::size_t>(n_queries) * cols, -1.0f);
+        std::vector<int64_t> ord;
+        for (int64_t row = 0; row < n_queries; ++row) {
+            const int32_t start = q_indptr[row];
+            const int64_t len = q_indptr[row + 1] - start;
+            if (len < n_neighbors_)
+                throw std::invalid_argument(
+                    "Need at least n_neighbors (" +
+                    std::to_string(params_.n_neighbors) +
+                    ") distances for each row!");
+            if (len == n_neighbors_)
+                throw std::invalid_argument(
+                    "UMAP: sparse precomputed transform rows need more than "
+                    "n_neighbors stored distances (upstream's "
+                    "np.argpartition(kth=n_neighbors) is out of bounds when "
+                    "a row stores exactly n_neighbors)");
+            // np.argpartition(row_data, k)[:k] + argsort by value (stable
+            // tie order here; documented deviation like the fit branch).
+            ord.resize(static_cast<std::size_t>(len));
+            std::iota(ord.begin(), ord.end(), 0);
+            std::stable_sort(ord.begin(), ord.end(),
+                             [&](int64_t a, int64_t b) {
+                                 return q_data[start + a] < q_data[start + b];
+                             });
+            for (int64_t j = 0; j < cols; ++j) {
+                const int64_t pos = start + ord[static_cast<std::size_t>(j)];
+                indices[static_cast<std::size_t>(row * cols + j)] =
+                    q_indices[pos];
+                dists[static_cast<std::size_t>(row * cols + j)] = q_data[pos];
+            }
+        }
+        // assert np.min(indices) >= 0 and np.min(dists) >= 0.0
+        for (float d : dists) {
+            if (!(d >= 0.0f))
+                throw std::invalid_argument(
+                    "transform with metric='precomputed': distances must be "
+                    "non-negative");
+        }
+    } else
+    // -------------------------------------------------------------------------
     if (small_data_) {
         // pairwise_distances(X_new, self._raw_data, metric=self.metric) +
         // argpartition/argsort (== stable k-smallest per row). hardening

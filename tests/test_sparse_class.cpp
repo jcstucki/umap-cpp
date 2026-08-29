@@ -245,6 +245,96 @@ TEST_CASE("sparse class: metric validation replicates the upstream elif "
                         std::invalid_argument);
     }
 }
+TEST_CASE("sparse class: precomputed CSR distance matrix fit+transform "
+          "(p8, bit-exact)") {
+    // upstream's `metric == "precomputed" and self._sparse_data` fit branch
+    // (symmetry + zero-diagonal checks, k smallest stored entries per row,
+    // float64 dists to the astype boundary) and the sparse precomputed
+    // transform branch.
+    UMAPParams p = base_params();
+    p.metric = "precomputed";
+    p.n_neighbors = 10;
+    UMAP model(p);
+    const std::vector<float> emb = model.fit_transform(
+        golden_sparse_class::p8_indptr, golden_sparse_class::p8_indices,
+        golden_sparse_class::p8_data, golden_sparse_class::p8_n,
+        golden_sparse_class::p8_dim);
+    CHECK(model.sparse_data());
+    CHECK_FALSE(model.small_data());
+    CHECK(count_mismatch(emb, golden_sparse_class::p8_embedding) == 0);
+
+    const std::vector<float> temb = model.transform(
+        golden_sparse_class::p8_q_indptr, golden_sparse_class::p8_q_indices,
+        golden_sparse_class::p8_q_data, golden_sparse_class::p8_q_n);
+    CHECK(count_mismatch(temb, golden_sparse_class::p8_t_embedding) == 0);
+}
+
+TEST_CASE("sparse class: precomputed CSR validation errors") {
+    // Asymmetric structure.
+    {
+        const std::vector<int32_t> indptr = {0, 1, 1};
+        const std::vector<int32_t> indices = {1};
+        const std::vector<float> values = {1.0f};
+        UMAPParams p = base_params();
+        p.metric = "precomputed";
+        p.n_neighbors = 2;
+        UMAP model(p);
+        CHECK_THROWS_AS(
+            model.fit(indptr.data(), indices.data(), values.data(), 2, 2),
+            std::invalid_argument);
+    }
+    // Non-zero stored diagonal.
+    {
+        const std::vector<int32_t> indptr = {0, 2, 4};
+        const std::vector<int32_t> indices = {0, 1, 0, 1};
+        const std::vector<float> values = {0.5f, 1.0f, 1.0f, 0.0f};
+        UMAPParams p = base_params();
+        p.metric = "precomputed";
+        p.n_neighbors = 2;
+        UMAP model(p);
+        CHECK_THROWS_AS(
+            model.fit(indptr.data(), indices.data(), values.data(), 2, 2),
+            std::invalid_argument);
+    }
+}
+
+TEST_CASE("sparse class: precomputed_knn bypasses the sparse kNN build") {
+    // Fit the p3 blobs on the standard branch, then refit with the model's
+    // own kNN arrays as precomputed_knn: the fuzzy graph is a deterministic
+    // function of the kNN, so both graphs are bit-identical. Without a
+    // search index, transform raises upstream's #848 message.
+    UMAPParams p = base_params();
+    p.force_approximation_algorithm = true;
+    UMAP source(p);
+    source.fit(golden_sparse_class::p3_indptr, golden_sparse_class::p3_indices,
+               golden_sparse_class::p3_data, golden_sparse_class::p3_n,
+               golden_sparse_class::p3_dim);
+
+    UMAPParams pk = p;
+    umap::PrecomputedKnn knn;
+    knn.indices = source.knn_indices();
+    knn.dists = source.knn_dists();
+    knn.n_samples = golden_sparse_class::p3_n;
+    knn.n_neighbors = 15;
+    pk.precomputed_knn = knn;
+    UMAP model(pk);
+    model.fit(golden_sparse_class::p3_indptr, golden_sparse_class::p3_indices,
+              golden_sparse_class::p3_data, golden_sparse_class::p3_n,
+              golden_sparse_class::p3_dim);
+
+    const SparseMatrix& ga = source.graph();
+    const SparseMatrix& gb = model.graph();
+    CHECK(ga.indptr == gb.indptr);
+    CHECK(ga.indices == gb.indices);
+    CHECK(ga.data == gb.data);
+
+    CHECK_THROWS_AS(
+        model.transform(golden_sparse_class::p3_q_indptr,
+                        golden_sparse_class::p3_q_indices,
+                        golden_sparse_class::p3_q_data,
+                        golden_sparse_class::p3_q_n),
+        std::runtime_error);
+}
 // -----------------------------------------------------------------------------
 
 TEST_CASE("sparse class: unique=True csr_unique fit (p5, bit-exact)") {

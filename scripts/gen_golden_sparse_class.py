@@ -177,6 +177,27 @@ m7 = um.UMAP(init="random", random_state=42, a=ab_a, b=ab_b,
 emit_fit("p7", X1, m7, queries=Q1)
 # -----------------------------------------------------------------------------
 
+# ---- p8: sparse precomputed distance matrix (upstream's dedicated
+# `metric == "precomputed" and self._sparse_data` fit branch + the sparse
+# precomputed transform branch). Distances are scipy-style euclidean of X1 in
+# float64 rounded to float32 before CSR conversion (zero diagonal dropped by
+# csr_matrix, faithfully leaving n-1 stored entries per row); no exact ties,
+# so the numpy argpartition order matches the C++ stable selection.
+from scipy.spatial.distance import cdist as _cdist
+
+X1d = np.asarray(X1.todense(), dtype=np.float32)
+Q1d = np.asarray(Q1.todense(), dtype=np.float32)
+D8 = scipy.sparse.csr_matrix(
+    _cdist(X1d.astype(np.float64), X1d.astype(np.float64)).astype(np.float32))
+D8.sort_indices()
+QD8 = scipy.sparse.csr_matrix(
+    _cdist(Q1d.astype(np.float64), X1d.astype(np.float64)).astype(np.float32))
+QD8.sort_indices()
+m8 = um.UMAP(init="random", random_state=42, a=ab_a, b=ab_b,
+             metric="precomputed", n_neighbors=10)
+emit_fit("p8", D8, m8, queries=QD8)
+# -----------------------------------------------------------------------------
+
 # ---- p5: duplicated rows + unique=True (csr_unique object-row semantics).
 X5 = scipy.sparse.vstack([X1[:60], X1[10:30], X1[:5]]).tocsr()
 X5.sort_indices()

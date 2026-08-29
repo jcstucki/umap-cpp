@@ -5,10 +5,10 @@
 //
 // Scope: dense float32 input, the default path UMAP hits
 // (tree_init=True, low_memory=True, init_graph=None, no metric kwds).
-// UMAP only consumes NNDescent._neighbor_graph (the kNN graph); the search
-// graph / prepare() / diversify machinery is not needed for fit() and is not
-// ported. Querying new points (initialized_nnd_search / search trees), needed
-// by transform(), is likewise not ported yet.
+// UMAP's fit() consumes NNDescent._neighbor_graph (the kNN graph); the
+// search graph / prepare() / query machinery needed by transform() is ported
+// separately as PreparedIndex below (hardening note: this scope comment
+// predates that port).
 //
 // Determinism / seeding:
 //   pynndescent seeds its tau-prng states from a numpy RandomState:

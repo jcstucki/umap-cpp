@@ -7,8 +7,6 @@
 //   * test_umap_transform_on_iris_modified_dtype -- upstream re-casts
 //     embedding_ to float64 and checks transform still works; the C++
 //     embedding is always float32, there is no dtype to modify.
-//   * test_precomputed_sparse_transform_on_iris -- the sparse precomputed
-//     branch is not ported.
 // Adaptations:
 //   * test_umap_inverse_transform_on_iris: sklearn KDTree queries are ported
 //     as exact brute-force kNN (the tree is exact too).
@@ -254,8 +252,43 @@ TEST_CASE("test_precomputed_transform_on_iris") {
     CHECK(trust >= 0.85);
 }
 
-// The sparse precomputed branch is not ported.
-TEST_CASE("test_precomputed_sparse_transform_on_iris" * doctest::skip()) {}
+// --- hardening additions -----------------------------------------------------
+TEST_CASE("test_precomputed_sparse_transform_on_iris") {
+    // distance_matrix = csr_matrix(squareform(pdist(data))) -- the zero
+    // diagonal is dropped by the CSR conversion; fit takes upstream's
+    // dedicated sparse precomputed branch. transform gets
+    // csr_matrix(cdist(new_data, data)).
+    const std::vector<double> data64 = testutil::select_rows(
+        updata::iris_data, kIrisN, kIrisDim, updata::iris_selection, true);
+    const std::vector<double> rest64 = testutil::select_rows(
+        updata::iris_data, kIrisN, kIrisDim, updata::iris_selection, false);
+    const int64_t n = subset_n(), nq = rest_n();
+    const std::vector<double> dmat64 = testutil::pairwise_euclidean_f64(
+        data64.data(), n, data64.data(), n, kIrisDim);
+    const std::vector<float> dmat =
+        testutil::to_f32(dmat64.data(), dmat64.size());
+    const testutil::Csr D = testutil::dense_to_csr(dmat.data(), n, n);
+
+    UMAPParams p = iris_params();
+    p.n_epochs = 100;
+    p.metric = "precomputed";
+    UMAP model(p);
+    model.fit(D.indptr.data(), D.indices.data(), D.data.data(), n, n);
+
+    const std::vector<double> new_dmat64 = testutil::pairwise_euclidean_f64(
+        rest64.data(), nq, data64.data(), n, kIrisDim);
+    const std::vector<float> new_dmat =
+        testutil::to_f32(new_dmat64.data(), new_dmat64.size());
+    const testutil::Csr QD = testutil::dense_to_csr(new_dmat.data(), nq, n);
+    const std::vector<float> emb =
+        model.transform(QD.indptr.data(), QD.indices.data(), QD.data.data(),
+                        nq);
+    const double trust = testutil::trustworthiness(
+        iris_rest().data(), nq, kIrisDim, emb.data(), 2, 10);
+    CAPTURE(trust);
+    CHECK(trust >= 0.85);
+}
+// -----------------------------------------------------------------------------
 
 TEST_CASE("test_umap_clusterability_on_supervised_iris") {
     // conftest::supervised_iris_model = UMAP(n_neighbors=10, min_dist=0.01,
