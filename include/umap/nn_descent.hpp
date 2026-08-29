@@ -228,6 +228,17 @@ MetricInfo resolve_metric(const std::string& name);
 MetricInfo resolve_metric(const std::string& name, const MetricKwds& kwds);
 // ----------------------------------------------------------------------------
 
+// --- hardening additions -----------------------------------------------------
+// Callable-metric flavour: name == "custom" with a non-null `custom` builds
+// the MetricInfo from the user function exactly like pynndescent treats a
+// callable metric -- no fast alternative (the metric runs raw inside
+// NN-descent, correction = identity) and euclidean rp-trees (a callable is
+// never in pynndescent's angular metric list). Other names delegate to the
+// kwds-aware overload above.
+MetricInfo resolve_metric(const std::string& name, const MetricKwds& kwds,
+                          const DistanceF32Fn* custom);
+// -----------------------------------------------------------------------------
+
 // ------------------------------------------------------------------ RP trees
 
 struct LeafArray {
@@ -351,6 +362,16 @@ void nearest_neighbors(const float* data, int64_t n, int64_t dim,
                        float* knn_dists, bool verbose = false);
 // ----------------------------------------------------------------------------
 
+// --- hardening additions -----------------------------------------------------
+// Callable-metric overload (upstream: nearest_neighbors(X, k, <callable>,
+// {}, ...)): the function runs raw inside NN-descent with euclidean rp-trees,
+// exactly like pynndescent handles a callable metric.
+void nearest_neighbors(const float* data, int64_t n, int64_t dim,
+                       int64_t n_neighbors, const DistanceF32Fn& custom,
+                       NumpyRandomState& numpy_rs, int32_t* knn_indices,
+                       float* knn_dists, bool verbose = false);
+// -----------------------------------------------------------------------------
+
 // Same, but with explicit tau-prng states (for tests / callers that extracted
 // states from Python): `rng_state` is NNDescent.rng_state and
 // `tree_rng_states` the per-tree states drawn in make_forest.
@@ -439,11 +460,15 @@ class PreparedIndex {
     // --- densmap additions --------------------------------------------------
     // metric_kwds-aware overload (kwds bound into the distance closure like
     // pynndescent's _partial_dist_func; see resolve_metric(name, kwds)).
+    // hardening additions: `custom` (used when metric == "custom") is the
+    // C++ callable-metric equivalent, routed through
+    // resolve_metric(name, kwds, custom).
     static PreparedIndex build(const float* data, int64_t n, int64_t dim,
                                int64_t n_neighbors, const std::string& metric,
                                const MetricKwds& metric_kwds,
                                NumpyRandomState& numpy_rs,
-                               bool verbose = false);
+                               bool verbose = false,
+                               const DistanceF32Fn* custom = nullptr);
     // ------------------------------------------------------------------------
 
     // NNDescent.query(query_data, k, epsilon). Outputs are (n_queries, k)

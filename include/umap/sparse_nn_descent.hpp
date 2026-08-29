@@ -88,6 +88,7 @@
 #pragma once
 
 #include <cstdint>
+#include <iosfwd>  // hardening additions: serialize/deserialize streams
 #include <string>
 #include <vector>
 
@@ -327,6 +328,17 @@ class SparsePreparedIndex {
     // corrected distances), (n, n_neighbors) row-major.
     const std::vector<int32_t>& knn_indices() const { return knn_indices_; }
     const std::vector<float>& knn_dists() const { return knn_dists_; }
+
+    // --- hardening additions ------------------------------------------------
+    // Model persistence (mirrors nnd::PreparedIndex::serialize/deserialize;
+    // implemented in src/model_io.cpp). The distance closure is not stored:
+    // deserialize rebuilds it from the metric name + kwds exactly as build()
+    // did (dim binds n_features-requiring metrics).
+    void serialize(std::ostream& os) const;
+    static SparsePreparedIndex deserialize(
+        std::istream& is, const std::string& metric,
+        const spdist::SparseMetricKwds& kwds = spdist::SparseMetricKwds());
+    // ------------------------------------------------------------------------
 
     // Introspection (parity tests against the Python reference).
     const std::vector<int32_t>& vertex_order() const { return vertex_order_; }

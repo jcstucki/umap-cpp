@@ -399,7 +399,7 @@ void optimize_layout_euclidean(
     double initial_alpha, double negative_sample_rate, bool parallel,
     bool densmap, bool move_other, const std::vector<int>* epochs_list,
     std::vector<std::vector<float>>* embedding_list,
-    const DensmapParams* densmap_kwds) {
+    const DensmapParams* densmap_kwds, int n_threads_cap) {
     // layouts.py: if isinstance(n_epochs, list): epochs_list = n_epochs;
     //             n_epochs = max(epochs_list)
     if (epochs_list != nullptr) {
@@ -470,8 +470,16 @@ void optimize_layout_euclidean(
 
     unsigned n_threads = 1;
     if (parallel) {
-        n_threads = std::thread::hardware_concurrency();
-        if (n_threads == 0) n_threads = 4;
+        // --- hardening additions: n_jobs caps the pool (upstream calls
+        // numba.set_num_threads(n_jobs) before the prange loop); <= 0 keeps
+        // the all-cores default. ------------------------------------------
+        if (n_threads_cap > 0) {
+            n_threads = static_cast<unsigned>(n_threads_cap);
+        } else {
+            n_threads = std::thread::hardware_concurrency();
+            if (n_threads == 0) n_threads = 4;
+        }
+        // ------------------------------------------------------------------
         if (static_cast<std::size_t>(n_threads) > n_edges && n_edges > 0) {
             n_threads = static_cast<unsigned>(n_edges);
         }
@@ -606,7 +614,7 @@ std::vector<float> simplicial_set_embedding_from_init(
     bool graph_prefiltered, const std::vector<int>* epochs_list,
     std::vector<std::vector<float>>* embedding_list,
     const DensmapParams* densmap_kwds, const OutputMetricFn* output_metric,
-    bool numpy_int64_epochs, Device device) {
+    bool numpy_int64_epochs, Device device, int n_threads) {
     // --- densmap additions --------------------------------------------------
     if (densmap_kwds != nullptr && output_metric != nullptr) {
         throw std::invalid_argument(
@@ -717,7 +725,7 @@ std::vector<float> simplicial_set_embedding_from_init(
                 head, tail, n_epochs, n_vertices, epochs_per_sample, a, b,
                 rng_state, gamma, initial_alpha, negative_sample_rate, parallel,
                 /*densmap=*/densmap_kwds != nullptr, /*move_other=*/true,
-                epochs_list, embedding_list, densmap_kwds);
+                epochs_list, embedding_list, densmap_kwds, n_threads);
         }
         // ---------------------------------------------------------------------
     }

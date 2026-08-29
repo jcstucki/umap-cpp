@@ -62,7 +62,8 @@ std::vector<float> pairwise_distances_sklearn(const float* X, int64_t nx,
                                               int64_t dim,
                                               const std::string& metric,
                                               bool x_is_y,
-                                              const MetricKwds& kwds) {
+                                              const MetricKwds& kwds,
+                                              const DistanceF32Fn* custom) {
     // Upstream's small-data branch calls sklearn's pairwise_distances with
     // metric = self._input_distance_func, a *callable* (umap's numba kernel),
     // which routes to sklearn's _pairwise_callable: a float32 output matrix
@@ -90,13 +91,25 @@ std::vector<float> pairwise_distances_sklearn(const float* X, int64_t nx,
     // via the double-precision registry in distances.hpp (documented: matches
     // the numba float32 kernels only to float32 rounding of the double
     // result). metric_kwds are bound positionally like upstream.
+    // --- hardening additions: metric == "custom" evaluates the user function
+    // through the identical _pairwise_callable loop (a Python callable takes
+    // exactly this route upstream). ------------------------------------------
     DistanceF32Fn fn;
+    if (metric == "custom") {
+        if (custom == nullptr || !*custom)
+            throw std::invalid_argument(
+                "pairwise_distances_sklearn: metric 'custom' requires a "
+                "custom metric function");
+        fn = *custom;
+    } else {
+    // -------------------------------------------------------------------------
     try {
         fn = make_metric_f32(metric, kwds);
     } catch (const std::invalid_argument&) {
         throw std::invalid_argument(
             "pairwise_distances_sklearn: unsupported metric '" + metric + "'");
     }
+    }  // hardening additions: close the non-custom branch
     for (int64_t i = 0; i < nx; ++i) {
         const float* xi = X + i * dim;
         const int64_t j0 = x_is_y ? i : 0;
@@ -216,6 +229,25 @@ void fast_knn_from_dmat(const std::vector<float>& dmat, int64_t n, int64_t m,
                      knn_dists + row * n_neighbors);
     }
 }
+
+// --- hardening additions -----------------------------------------------------
+// float64 instantiation of utils.py::fast_knn_indices (numba compiles a
+// float64 version for the float64 distance matrices sklearn's sparse
+// manhattan kernel and _pairwise_callable produce). Distances stay float64 so
+// the caller can apply upstream's astype(np.float32) at the same point the
+// reference does (fuzzy_simplicial_set / transform's dists.astype).
+void fast_knn_from_dmat_f64(const std::vector<double>& dmat, int64_t n,
+                            int64_t m, int64_t n_neighbors,
+                            int32_t* knn_indices, double* knn_dists) {
+    std::vector<double> vals;
+    std::vector<int64_t> idx;
+    for (int64_t row = 0; row < n; ++row) {
+        fast_knn_row(dmat.data() + row * m, m, n_neighbors, vals, idx,
+                     knn_indices + row * n_neighbors,
+                     knn_dists + row * n_neighbors);
+    }
+}
+// -----------------------------------------------------------------------------
 
 // ------------------------------------------------------ init_graph_transform
 
@@ -629,8 +661,22 @@ double numpy_mean_f64(const double* a, int64_t n) {
     return numpy_pairwise_sum_f64(a, n) / static_cast<double>(n);
 }
 
+// --- hardening additions -----------------------------------------------------
+// Optional warning sink (tests install one to count warnings like
+// pytest.warns); default remains stderr.
+std::function<void(const std::string&)>& warning_handler_slot() {
+    static std::function<void(const std::string&)> handler;
+    return handler;
+}
+// -----------------------------------------------------------------------------
+
 // warn() / verbose prints go to stderr (no warnings module in C++).
 void warn_msg(const std::string& msg) {
+    const auto& handler = warning_handler_slot();
+    if (handler) {
+        handler(msg);
+        return;
+    }
     std::fprintf(stderr, "%s\n", msg.c_str());
 }
 
@@ -640,43 +686,53 @@ void raise_disconnected_warning(int64_t edges_removed,
                                 double disconnection_distance,
                                 int64_t total_rows, bool verbose) {
     const double threshold = 0.1;
+    char buf[512];
     char dd_buf[64];
     std::snprintf(dd_buf, sizeof(dd_buf), "%g", disconnection_distance);
     if (verbose && vertices_disconnected == 0 && edges_removed > 0) {
-        std::fprintf(stderr,
-                     "Disconnection_distance = %s has removed %lld edges.  "
-                     "This is not a problem as no vertices were "
-                     "disconnected.\n",
-                     dd_buf, static_cast<long long>(edges_removed));
+        std::snprintf(buf, sizeof(buf),
+                      "Disconnection_distance = %s has removed %lld edges.  "
+                      "This is not a problem as no vertices were "
+                      "disconnected.",
+                      dd_buf, static_cast<long long>(edges_removed));
+        warn_msg(buf);
     } else if (vertices_disconnected > 0 &&
                static_cast<double>(vertices_disconnected) <=
                    threshold * static_cast<double>(total_rows)) {
-        std::fprintf(
-            stderr,
+        std::snprintf(
+            buf, sizeof(buf),
             "A few of your vertices were disconnected from the manifold.  "
             "This shouldn't cause problems.\n"
             "Disconnection_distance = %s has removed %lld edges.\n"
             "It has only fully disconnected %lld vertices.\n"
-            "Use umap.utils.disconnected_vertices() to identify them.\n",
+            "Use umap.utils.disconnected_vertices() to identify them.",
             dd_buf, static_cast<long long>(edges_removed),
             static_cast<long long>(vertices_disconnected));
+        warn_msg(buf);
     } else if (static_cast<double>(vertices_disconnected) >
                threshold * static_cast<double>(total_rows)) {
-        std::fprintf(
-            stderr,
+        std::snprintf(
+            buf, sizeof(buf),
             "A large number of your vertices were disconnected from the "
             "manifold.\n"
             "Disconnection_distance = %s has removed %lld edges.\n"
             "It has fully disconnected %lld vertices.\n"
             "You might consider using find_disconnected_points() to find and "
             "remove these points from your data.\n"
-            "Use umap.utils.disconnected_vertices() to identify them.\n",
+            "Use umap.utils.disconnected_vertices() to identify them.",
             dd_buf, static_cast<long long>(edges_removed),
             static_cast<long long>(vertices_disconnected));
+        warn_msg(buf);
     }
 }
 
 }  // namespace
+
+// --- hardening additions -----------------------------------------------------
+void set_warning_handler(std::function<void(const std::string&)> handler) {
+    warning_handler_slot() = std::move(handler);
+}
+// -----------------------------------------------------------------------------
 
 std::vector<float> pca_fit_transform(const float* X, int64_t n, int64_t dim,
                                      int n_components) {

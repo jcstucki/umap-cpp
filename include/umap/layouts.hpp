@@ -126,6 +126,12 @@ struct DensmapParams {
 //                  final copy after the last epoch. The reference then returns
 //                  the list instead of the embedding; here head_embedding
 //                  still holds the final state (== embedding_list->back()).
+//  n_threads:      hardening additions -- thread cap for the parallel path
+//                  (upstream: numba.set_num_threads(n_jobs) before the
+//                  prange loop). <= 0 means "all cores"
+//                  (hardware_concurrency); ignored when parallel is false.
+//                  parallel && n_threads == 1 runs the sequential loop, like
+//                  numba's parallel build on a 1-thread pool.
 void optimize_layout_euclidean(
     float* head_embedding, int n_head_vertices, float* tail_embedding, int dim,
     const std::vector<int32_t>& head, const std::vector<int32_t>& tail,
@@ -135,7 +141,7 @@ void optimize_layout_euclidean(
     bool parallel = false, bool densmap = false, bool move_other = false,
     const std::vector<int>* epochs_list = nullptr,
     std::vector<std::vector<float>>* embedding_list = nullptr,
-    const DensmapParams* densmap_kwds = nullptr);
+    const DensmapParams* densmap_kwds = nullptr, int n_threads = 0);
 
 // The non-initialisation glue of umap_.py::simplicial_set_embedding:
 //   - n_epochs default: 500 if n_samples <= 10000 else 200, +200 when densmap
@@ -184,6 +190,8 @@ void optimize_layout_euclidean(
 // otherwise. densmap / epochs_list / non-euclidean output requests always run
 // on the CPU regardless of device (the kernel does not cover them; UMAP::fit
 // warns before asking).
+// n_threads (hardening additions): thread cap for the parallel euclidean SGD
+// (n_jobs semantics; <= 0 = all cores; only meaningful when parallel=true).
 std::vector<float> simplicial_set_embedding_from_init(
     const SparseMatrix& graph, const float* init_embedding, int n_components,
     double a, double b, const int64_t rng_state[3], int n_epochs = -1,
@@ -194,7 +202,8 @@ std::vector<float> simplicial_set_embedding_from_init(
     std::vector<std::vector<float>>* embedding_list = nullptr,
     const DensmapParams* densmap_kwds = nullptr,
     const OutputMetricFn* output_metric = nullptr,
-    bool numpy_int64_epochs = false, Device device = Device::CPU);
+    bool numpy_int64_epochs = false, Device device = Device::CPU,
+    int n_threads = 0);
 
 // --- umap-class additions ---------------------------------------------------
 // The n_epochs-resolution + weight-filtering prologue of

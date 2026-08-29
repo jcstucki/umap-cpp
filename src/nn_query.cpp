@@ -533,17 +533,20 @@ PreparedIndex PreparedIndex::build(const float* data, int64_t n, int64_t dim,
 
 // --- densmap additions ------------------------------------------------------
 // metric_kwds-aware build (generic-metric hook; see nn_descent.hpp).
+// hardening additions: `custom` carries the callable-metric equivalent
+// (metric == "custom"), resolved like pynndescent's callable branch.
 PreparedIndex PreparedIndex::build(const float* data, int64_t n, int64_t dim,
                                    int64_t n_neighbors,
                                    const std::string& metric,
                                    const MetricKwds& metric_kwds,
-                                   NumpyRandomState& numpy_rs, bool verbose) {
+                                   NumpyRandomState& numpy_rs, bool verbose,
+                                   const DistanceF32Fn* custom) {
     // ------------------------------------------------------------------------
     PreparedIndex idx;
     idx.n_ = n;
     idx.dim_ = dim;
     idx.n_neighbors_ = n_neighbors;
-    idx.metric_ = resolve_metric(metric, metric_kwds);
+    idx.metric_ = resolve_metric(metric, metric_kwds, custom);
     idx.normalize_query_ = (metric == "cosine" || metric == "dot");
 
     // umap_.py::nearest_neighbors "hacked values"

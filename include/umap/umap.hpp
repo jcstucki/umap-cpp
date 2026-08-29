@@ -65,12 +65,18 @@
 //     The disconnected-vertex NaN mask is recomputed from the intersected
 //     graph, as upstream does inside the embedding block.
 //   * Sparse (CSR) input wiring: fit/fit_transform/transform overloads taking
-//     scipy-layout CSR arrays. Small data (n < 4096) replicates sklearn's
-//     sparse pairwise_distances float32 semantics for euclidean/l2
-//     (_euclidean_distances_upcast: float64 chunks over float32 data) and
-//     cosine (inplace_csr_row_normalize_l2 with a float64 accumulator +
-//     scipy's fmaf-contracted float32 sparse matmul); other metrics raise
-//     (upstream densifies via pairwise_special_metric -- not ported). The
+//     scipy-layout CSR arrays. Small data (n < 4096) replicates upstream's
+//     full metric routing (hardening additions): sklearn's sparse float32
+//     kernels for euclidean (_euclidean_distances_upcast) and cosine
+//     (inplace_csr_row_normalize_l2 + fmaf sparse matmul), sklearn's float64
+//     _sparse_manhattan for manhattan/l1, and the densify fallback
+//     (X.toarray() -> pairwise_special_metric via _pairwise_callable) for
+//     every other metric umap's sparse registry admits; names only
+//     pynndescent's sparse registry admits (sqeuclidean, jensen-shannon,
+//     kantorovich/wasserstein, symmetric-kl spellings) KeyError upstream on
+//     this branch and throw here. Metric validation replicates
+//     _validate_parameters' sparse elif chain ("Metric {} is not supported
+//     for sparse data" -- e.g. "l2" and "symmetric_kl" raise for sparse). The
 //     standard branch builds a SparsePreparedIndex (continuing the numpy
 //     RandomState stream) whose query() serves transform at epsilon 0.12 /
 //     0.24 (angular). unique=True uses csr_unique object-row semantics.
@@ -126,6 +132,7 @@
 
 #include "umap/device.hpp"
 #include "umap/fuzzy_simplicial_set.hpp"
+#include "umap/layouts_generic.hpp"  // OutputMetricFn (custom output metrics)
 #include "umap/nn_descent.hpp"
 #include "umap/sparse_matrix.hpp"
 
@@ -251,6 +258,48 @@ struct UMAPParams {
     // or device. Seeded-parity users should keep Device::CPU (the default):
     // every bit-exact golden holds on the CPU path only.
     Device device = Device::CPU;
+    // ------------------------------------------------------------------------
+    // --- hardening additions ------------------------------------------------
+    // n_jobs: upstream's parallelism knob (default -1 = all cores). Mirrors
+    // umap.UMAP semantics exactly:
+    //   * validation raises for n_jobs < -1 or n_jobs == 0 (upstream's
+    //     message, including the "postive" typo);
+    //   * a seeded fit (random_state set) forces n_jobs back to 1 with
+    //     upstream's warning -- which, like the reference f-string, reports
+    //     the value *after* the override ("n_jobs value 1 overridden to 1");
+    //   * the layout SGD runs the hogwild parallel path whenever random_state
+    //     is None (upstream passes parallel=self.random_state is None), with
+    //     the thread count capped at n_jobs when n_jobs > 0 (upstream:
+    //     numba.set_num_threads(self.n_jobs)); n_jobs == -1 uses all cores.
+    // Deviation (documented): upstream's numba thread pool also parallelises
+    // NN-descent and the numba-jitted helpers; the C++ kNN construction stays
+    // single-threaded (bit-exact with NUMBA_NUM_THREADS=1) regardless of
+    // n_jobs -- a performance-only difference.
+    int n_jobs = -1;
+    // C++ equivalent of upstream's *callable* metrics. Set metric = "custom"
+    // and provide custom_metric (distance only) and/or custom_metric_grad
+    // (distance + gradient, the upstream "returns a tuple" flavour; enables
+    // inverse_transform). When only custom_metric_grad is given the distance
+    // is derived from it, mirroring upstream's _dist_only wrapper; when only
+    // custom_metric is given, fit warns like upstream ("custom distance
+    // metric does not return gradient; inverse_transform will be
+    // unavailable"). The custom metric takes the exact routes a named metric
+    // takes: small-data sklearn _pairwise_callable replication, the
+    // NN-descent generic-metric hook (euclidean rp-trees, no fast
+    // alternative -- like any pynndescent callable), transform's brute-force
+    // or prepared-index query (epsilon 0.12: callables are never angular
+    // upstream), and update(). Restrictions (documented): dense input only
+    // (upstream sparse callables must be numba-jittable over CSR row pieces
+    // -- a different signature), no model save() (std::function is not
+    // serialisable), metric_kwds are NOT forwarded (bind state in the
+    // closure instead, which is strictly more general).
+    // For output_metric = "custom", custom_output_metric must be provided
+    // (distance + gradient) or fit raises upstream's ValueError text; it runs
+    // through the same optimize_layout_generic path as named non-euclidean
+    // output metrics.
+    DistanceF32Fn custom_metric;          // used when metric == "custom"
+    OutputMetricFn custom_metric_grad;    // optional dist+grad (inverse)
+    OutputMetricFn custom_output_metric;  // used when output_metric=="custom"
     // ------------------------------------------------------------------------
 };
 
@@ -396,13 +445,14 @@ class UMAP {
     // --- phase4 additions: model persistence --------------------------------
     // Versioned binary model format: magic "UMAPCPP1", little-endian,
     // length-prefixed sections (params, fitted scalars, raw data, kNN arrays,
-    // graph CSR, embedding, PreparedIndex state, RandomState bookkeeping;
-    // layout in src/model_io.cpp). save() requires a fitted model; load()
-    // restores everything transform() / transform_graph() /
-    // inverse_transform() / update() need without refitting -- including the
-    // prepared search index and the persisted numpy RandomState stream.
-    // Not serialisable (throws): standard-branch *sparse* fits (the
-    // SparsePreparedIndex is not covered). Reloaded params drop
+    // graph CSR, embedding, PreparedIndex / SparsePreparedIndex state,
+    // RandomState bookkeeping; layout in src/model_io.cpp). save() requires a
+    // fitted model; load() restores everything transform() /
+    // transform_graph() / inverse_transform() / update() need without
+    // refitting -- including the prepared (sparse) search index and the
+    // persisted numpy RandomState stream.
+    // Not serialisable (throws): models using "custom" (std::function)
+    // metrics. Reloaded params drop
     // precomputed_knn's input arrays (the derived kNN + search index are
     // stored instead), and a model fit with an ndarray init keeps the init
     // only as fit_init(). Composite-operator results round trip (no raw
@@ -587,12 +637,16 @@ class UMAP {
 // euclidean/l2, manhattan, minkowski and seuclidean, other named metrics
 // evaluate the double-precision registry rounded to float32 (may differ from
 // numba's float32 kernels in the last ulp).
+// --- hardening additions: metric == "custom" evaluates `custom` (the C++
+// callable-metric equivalent) through the identical _pairwise_callable route.
 std::vector<float> pairwise_distances_sklearn(const float* X, int64_t nx,
                                               const float* Y, int64_t ny,
                                               int64_t dim,
                                               const std::string& metric,
                                               bool x_is_y,
-                                              const MetricKwds& kwds = {});
+                                              const MetricKwds& kwds = {},
+                                              const DistanceF32Fn* custom =
+                                                  nullptr);
 
 // utils.py::fast_knn_indices semantics: per row of the (n x m) distance
 // matrix, candidates = np.argpartition(row, n_neighbors - 1)[:n_neighbors]
@@ -603,6 +657,29 @@ std::vector<float> pairwise_distances_sklearn(const float* X, int64_t nx,
 void fast_knn_from_dmat(const std::vector<float>& dmat, int64_t n, int64_t m,
                         int64_t n_neighbors, int32_t* knn_indices,
                         float* knn_dists);
+
+// --- hardening additions -----------------------------------------------------
+// float64 flavour (numba instantiates fast_knn_indices on the float64 distance
+// matrices sklearn's sparse manhattan kernel produces); distances stay f64 so
+// the caller can apply upstream's astype(np.float32) at the same point the
+// reference does.
+void fast_knn_from_dmat_f64(const std::vector<double>& dmat, int64_t n,
+                            int64_t m, int64_t n_neighbors,
+                            int32_t* knn_indices, double* knn_dists);
+
+// sklearn manhattan_distances on CSR float32 input: the cython
+// _sparse_manhattan kernel -- float32 subtraction on shared columns, float64
+// fabs-accumulation, float64 output (verified against the reference sklearn
+// bit for bit). Row-major nx x ny.
+std::vector<double> sparse_manhattan_sklearn(
+    const int32_t* x_indptr, const int32_t* x_indices, const float* x_data,
+    int64_t nx, const int32_t* y_indptr, const int32_t* y_indices,
+    const float* y_data, int64_t ny);
+
+// Warning sink: warnings.warn equivalents print to stderr by default; tests
+// install a handler to count/inspect them (upstream tests use pytest.warns).
+// Pass nullptr/empty to restore the stderr default.
+void set_warning_handler(std::function<void(const std::string&)> handler);
 
 // umap_.py::init_graph_transform: weighted-mean initialisation of new points
 // from a bipartite membership CSR (n_new x n_train) and the training
@@ -653,8 +730,10 @@ void csr_unique_rows(const int32_t* indptr, const int32_t* indices,
 //     float64, float64 divide rounded to float32), scipy's float32 sparse
 //     matmul with fmaf contraction (ascending-column merge), S = 1 - S,
 //     clip(0, 2), zero diagonal when X is Y.
-// Everything else throws (upstream falls back to densified
-// pairwise_special_metric -- not ported). Row-major nx x ny float32 output.
+// Everything else throws; manhattan/l1 use sparse_manhattan_sklearn (float64)
+// and the remaining metrics densify (both handled by the UMAP class, which
+// replicates upstream's try/except routing). Row-major nx x ny float32
+// output.
 std::vector<float> sparse_pairwise_distances_sklearn(
     const int32_t* x_indptr, const int32_t* x_indices, const float* x_data,
     int64_t nx, const int32_t* y_indptr, const int32_t* y_indices,

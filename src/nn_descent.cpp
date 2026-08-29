@@ -417,6 +417,28 @@ MetricInfo resolve_metric(const std::string& name, const MetricKwds& kwds) {
 }
 // ----------------------------------------------------------------------------
 
+// --- hardening additions -----------------------------------------------------
+// Callable-metric flavour (metric == "custom"): pynndescent treats a callable
+// exactly like a no-fast-alternative metric -- the function runs raw inside
+// NN-descent with no correction, and `metric in (...)` is False for the
+// angular list, so euclidean rp-trees are used.
+MetricInfo resolve_metric(const std::string& name, const MetricKwds& kwds,
+                          const DistanceF32Fn* custom) {
+    if (name != "custom" || custom == nullptr || !*custom)
+        return resolve_metric(name, kwds);
+    MetricInfo m;
+    DistanceF32Fn f = *custom;
+    DistFn wrapped = [f](const float* x, const float* y, int64_t dim) {
+        return f(x, y, static_cast<std::size_t>(dim));
+    };
+    m.dist = wrapped;
+    m.true_dist = wrapped;
+    m.correction = nullptr;
+    m.angular_trees = false;  // callables are never in the angular list
+    return m;
+}
+// -----------------------------------------------------------------------------
+
 // ------------------------------------------------------------------ RP trees
 
 void euclidean_random_projection_split(
@@ -1107,6 +1129,39 @@ void nearest_neighbors_with_state(
     run_nearest_neighbors(data, n, dim, n_neighbors, m, rng_state,
                           leaf_array, n_iters, knn_indices, knn_dists, verbose);
 }
+
+// --- hardening additions -----------------------------------------------------
+// Callable-metric overload: identical routing to the kwds-aware overload with
+// the MetricInfo built from the user function (euclidean trees, no fast
+// alternative -- pynndescent's callable branch).
+void nearest_neighbors(const float* data, int64_t n, int64_t dim,
+                       int64_t n_neighbors, const DistanceF32Fn& custom,
+                       NumpyRandomState& numpy_rs, int32_t* knn_indices,
+                       float* knn_dists, bool verbose) {
+    MetricInfo m = resolve_metric("custom", MetricKwds{}, &custom);
+
+    // umap_.py::nearest_neighbors "hacked values"
+    const int64_t n_trees = std::min<int64_t>(
+        64, 5 + static_cast<int64_t>(
+                    std::nearbyint(std::sqrt(static_cast<double>(n)) / 20.0)));
+    const int64_t n_iters = std::max<int64_t>(
+        5,
+        static_cast<int64_t>(std::nearbyint(std::log2(static_cast<double>(n)))));
+
+    std::array<int64_t, 3> rng_state_arr = numpy_rs.rng_state3();
+    std::array<int64_t, 3> search_rng_state = numpy_rs.rng_state3();
+    (void)search_rng_state;  // draw-order parity; search index not built here
+
+    LeafArray leaf_array = make_forest_leaf_array(
+        data, n, dim, n_neighbors, n_trees, /*leaf_size=*/-1, m.angular_trees,
+        /*max_depth=*/200, numpy_rs);
+
+    int64_t rng_state[3] = {rng_state_arr[0], rng_state_arr[1],
+                            rng_state_arr[2]};
+    run_nearest_neighbors(data, n, dim, n_neighbors, m, rng_state, leaf_array,
+                          n_iters, knn_indices, knn_dists, verbose);
+}
+// -----------------------------------------------------------------------------
 
 }  // namespace nnd
 }  // namespace umap
