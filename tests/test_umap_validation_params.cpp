@@ -7,9 +7,12 @@
 // numeric metric/init objects, y length mismatches against the pointer-typed
 // y), n_jobs, callable metrics, and unported features (update(),
 // inverse_transform()).
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <random>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "doctest.h"
@@ -225,8 +228,65 @@ TEST_CASE("test_umap_unique_and_precomputed") {
 // Typed n_components / metric objects are unrepresentable in C++.
 TEST_CASE("test_umap_bad_n_components" * doctest::skip()) {}
 TEST_CASE("test_umap_bad_metrics" * doctest::skip()) {}
-// n_jobs is not part of the ported params surface.
-TEST_CASE("test_umap_bad_n_jobs" * doctest::skip()) {}
+
+// --- hardening additions -----------------------------------------------------
+TEST_CASE("test_umap_bad_n_jobs") {
+    // u = UMAP(n_jobs=-2) / UMAP(n_jobs=0): both raise in
+    // _validate_parameters.
+    UMAPParams p;
+    p.n_jobs = -2;
+    check_fit_raises(p);
+    p = UMAPParams();
+    p.n_jobs = 0;
+    check_fit_raises(p);
+}
+
+TEST_CASE("n_jobs seeded override warns and stays deterministic"
+          "  [hardening]") {
+    // Upstream: n_jobs != 1 with a random_state forces n_jobs back to 1 and
+    // warns with the post-override value ("n_jobs value 1 overridden to 1").
+    std::vector<std::string> warnings;
+    umap::set_warning_handler(
+        [&warnings](const std::string& m) { warnings.push_back(m); });
+    UMAPParams p;
+    p.n_jobs = 8;
+    p.random_state = 42u;
+    p.n_epochs = 11;
+    UMAP u(p);
+    u.fit(nn_data_f32().data(), 100, kNnDim);
+    umap::set_warning_handler(nullptr);
+    REQUIRE(!warnings.empty());
+    CHECK(warnings.front() ==
+          "n_jobs value 1 overridden to 1 by setting random_state. Use no "
+          "seed for parallelism.");
+    CHECK(u.params().n_jobs == 1);
+
+    // The override keeps a seeded fit bit-identical to an explicit n_jobs=1.
+    UMAPParams p1;
+    p1.n_jobs = 1;
+    p1.random_state = 42u;
+    p1.n_epochs = 11;
+    UMAP u1(p1);
+    u1.fit(nn_data_f32().data(), 100, kNnDim);
+    REQUIRE(u.embedding().size() == u1.embedding().size());
+    CHECK(std::memcmp(u.embedding().data(), u1.embedding().data(),
+                      u.embedding().size() * sizeof(float)) == 0);
+}
+
+TEST_CASE("n_jobs caps the unseeded parallel SGD  [hardening]") {
+    // random_state=None -> parallel hogwild layout; n_jobs=2 caps the pool
+    // (upstream numba.set_num_threads). Only sanity: finite embedding out.
+    UMAPParams p;
+    p.n_jobs = 2;
+    p.n_epochs = 11;
+    UMAP u(p);
+    u.fit(nn_data_f32().data(), 100, kNnDim);
+    REQUIRE(u.embedding().size() ==
+            static_cast<std::size_t>(100) * p.n_components);
+    for (float v : u.embedding()) CHECK(std::isfinite(v));
+}
+// -----------------------------------------------------------------------------
+
 // Callable metrics are not portable to C++.
 TEST_CASE("test_umap_custom_distance_w_grad" * doctest::skip()) {}
 TEST_CASE("test_umap_bad_output_metric_no_grad" * doctest::skip()) {}

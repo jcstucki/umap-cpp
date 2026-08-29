@@ -858,6 +858,14 @@ void UMAP::validate_parameters() const {
         throw std::invalid_argument(
             "output_metric is neither callable nor a recognised string");
     }
+    // --- hardening additions ------------------------------------------------
+    // n_jobs validation (upstream's message, including the "postive" typo);
+    // sits before the dens_* checks exactly like _validate_parameters. The
+    // seeded-fit override + warning runs in fit_impl (it mutates params_).
+    if (p.n_jobs < -1 || p.n_jobs == 0)
+        throw std::invalid_argument(
+            "n_jobs must be a postive integer, or -1 (for all cores)");
+    // ------------------------------------------------------------------------
     if (p.dens_lambda < 0.0)
         throw std::invalid_argument("dens_lambda cannot be negative");
     if (p.dens_frac < 0.0 || p.dens_frac > 1.0)
@@ -1331,6 +1339,17 @@ UMAP& UMAP::fit(const int32_t* indptr, const int32_t* indices,
 UMAP& UMAP::fit_impl(const float* X, int64_t n_samples, int64_t n_features,
                      const float* y) {
     validate_parameters();
+    // --- hardening additions ------------------------------------------------
+    // _validate_parameters' n_jobs override: a seeded fit forces n_jobs back
+    // to 1 with upstream's warning, whose f-string reports the value *after*
+    // the override ("n_jobs value 1 overridden to 1") -- bug-faithful.
+    if (params_.n_jobs != 1 && params_.random_state.has_value()) {
+        params_.n_jobs = 1;
+        warn_msg(
+            "n_jobs value 1 overridden to 1 by setting random_state. Use no "
+            "seed for parallelism.");
+    }
+    // ------------------------------------------------------------------------
     // --- tests-port additions: upstream's hellinger negative-data guard
     // (umap_.py::fit "Metric 'hellinger' does not support negative values"),
     // required by test_umap_validation_params.py::test_umap_bad_hellinger_data.
@@ -1866,7 +1885,11 @@ UMAP& UMAP::fit_impl(const float* X, int64_t n_samples, int64_t n_features,
             epochs_list != nullptr ? &emb_list : nullptr,
             params_.densmap ? &dens_kwds : nullptr,
             euclidean_output ? nullptr : &out_metric,
-            /*numpy_int64_epochs=*/false, sgd_device);
+            /*numpy_int64_epochs=*/false, sgd_device,
+            // hardening additions: numba.set_num_threads(self.n_jobs) caps
+            // only *fit*'s SGD upstream (the original thread count is
+            // restored before transform()/update() ever run their layouts).
+            /*n_threads=*/params_.n_jobs > 0 ? params_.n_jobs : 0);
 
         // --- densmap additions ----------------------------------------------
         // simplicial_set_embedding's `if output_dens:` epilogue (runs on the
