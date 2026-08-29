@@ -250,6 +250,377 @@ void fast_knn_from_dmat_f64(const std::vector<double>& dmat, int64_t n,
 }
 // -----------------------------------------------------------------------------
 
+// --- numpy k-selection (audit 2026-08-29 fix, c09/c11) -----------------------
+// Upstream's TRANSFORM-side brute-force kNN and the precomputed row selection
+// use NUMPY's np.argpartition + np.argsort -- NOT numba's fast_knn_indices
+// (that quickselect, replicated above, applies only to the fit-side kNN).
+// The two pick DIFFERENT tied neighbours when exactly-equal distances
+// straddle the k boundary, so the numpy machinery is replicated here
+// verbatim from numpy 2.5.2 npysort (selection.cpp introselect_<arg>,
+// quicksort.hpp aquicksort_ / npysort_heapsort.h aheapsort_). On the
+// reference platform (macOS arm64) numpy dispatches these to the scalar
+// paths (x86-simd argselect/argsort compile out; highway is disabled on
+// aarch64), which is exactly what is ported.
+namespace {
+
+// npy::float_tag::less -- NaN sorts to the end.
+template <typename T>
+inline bool np_sort_lt(T a, T b) {
+    return a < b || (b != b && a == a);
+}
+
+inline int np_get_msb(int64_t unum) {
+    int depth_limit = 0;
+    while (unum >>= 1) ++depth_limit;
+    return depth_limit;
+}
+
+// median3_swap_: min -> low + 1, median (the pivot) -> low, max -> high.
+template <typename T>
+inline void np_arg_median3_swap(const T* v, int64_t* tosort, int64_t low,
+                                int64_t mid, int64_t high) {
+    if (np_sort_lt(v[tosort[high]], v[tosort[mid]]))
+        std::swap(tosort[high], tosort[mid]);
+    if (np_sort_lt(v[tosort[high]], v[tosort[low]]))
+        std::swap(tosort[high], tosort[low]);
+    if (np_sort_lt(v[tosort[low]], v[tosort[mid]]))
+        std::swap(tosort[low], tosort[mid]);
+    std::swap(tosort[mid], tosort[low + 1]);
+}
+
+// median5_: median of tosort[0..4] by numpy's exact comparison sequence;
+// returns the position (0..4, into tosort) holding the median.
+template <typename T>
+int64_t np_arg_median5(const T* v, int64_t* tosort) {
+    if (np_sort_lt(v[tosort[1]], v[tosort[0]]))
+        std::swap(tosort[1], tosort[0]);
+    if (np_sort_lt(v[tosort[4]], v[tosort[3]]))
+        std::swap(tosort[4], tosort[3]);
+    if (np_sort_lt(v[tosort[3]], v[tosort[0]]))
+        std::swap(tosort[3], tosort[0]);
+    if (np_sort_lt(v[tosort[4]], v[tosort[1]]))
+        std::swap(tosort[4], tosort[1]);
+    if (np_sort_lt(v[tosort[2]], v[tosort[1]]))
+        std::swap(tosort[2], tosort[1]);
+    if (np_sort_lt(v[tosort[3]], v[tosort[2]])) {
+        if (np_sort_lt(v[tosort[3]], v[tosort[1]])) return 1;
+        return 3;
+    }
+    return 2;
+}
+
+// unguarded_partition_: sentinels at low+1 / high make bound checks
+// unnecessary (median3_swap_ guarantees them).
+template <typename T>
+inline void np_arg_unguarded_partition(const T* v, int64_t* tosort,
+                                       const T pivot, int64_t* ll,
+                                       int64_t* hh) {
+    for (;;) {
+        do {
+            ++*ll;
+        } while (np_sort_lt(v[tosort[*ll]], pivot));
+        do {
+            --*hh;
+        } while (np_sort_lt(pivot, v[tosort[*hh]]));
+        if (*hh < *ll) break;
+        std::swap(tosort[*ll], tosort[*hh]);
+    }
+}
+
+template <typename T>
+void np_arg_introselect(const T* v, int64_t* tosort, int64_t num, int64_t kth);
+
+// median_of_median5_: block-of-5 medians moved to the front, then
+// introselect for the median of those (upstream recurses with a NULL pivot
+// stack). Returns nmed / 2 like numpy.
+template <typename T>
+int64_t np_arg_median_of_median5(const T* v, int64_t* tosort, int64_t num) {
+    const int64_t right = num - 1;
+    const int64_t nmed = (right + 1) / 5;
+    for (int64_t i = 0, subleft = 0; i < nmed; ++i, subleft += 5) {
+        const int64_t m = np_arg_median5(v, tosort + subleft);
+        std::swap(tosort[subleft + m], tosort[i]);
+    }
+    if (nmed > 2) np_arg_introselect(v, tosort, nmed, nmed / 2);
+    return nmed / 2;
+}
+
+// dumb_select_: N^2 partial selection sort for very small kth.
+template <typename T>
+void np_arg_dumb_select(const T* v, int64_t* tosort, int64_t num,
+                        int64_t kth) {
+    for (int64_t i = 0; i <= kth; ++i) {
+        int64_t minidx = i;
+        T minval = v[tosort[i]];
+        for (int64_t k = i + 1; k < num; ++k) {
+            if (np_sort_lt(v[tosort[k]], minval)) {
+                minidx = k;
+                minval = v[tosort[k]];
+            }
+        }
+        std::swap(tosort[i], tosort[minidx]);
+    }
+}
+
+// introselect_<Tag, /*arg=*/true> for a SINGLE kth: numpy's pivot stack is
+// inert here (the prologue reads *npiv == 0 and store_pivot only writes),
+// so it is omitted. Everything else is verbatim: the kth-low < 3 dumb
+// select, the inexact kth == num-1 max-scan (which takes the LAST maximum,
+// i.e. ties resolve to the highest index), the med3 pivot with a
+// median-of-median5 fallback once depth_limit runs out, and the final
+// two-element ordering.
+template <typename T>
+void np_arg_introselect(const T* v, int64_t* tosort, int64_t num,
+                        int64_t kth) {
+    int64_t low = 0;
+    int64_t high = num - 1;
+    int depth_limit;
+
+    if (kth - low < 3) {
+        np_arg_dumb_select(v, tosort + low, high - low + 1, kth - low);
+        return;
+    }
+    if (kth == num - 1) {  // inexact<type>() holds: T is float/double
+        int64_t maxidx = low;
+        T maxval = v[tosort[low]];
+        for (int64_t k = low + 1; k < num; ++k) {
+            if (!np_sort_lt(v[tosort[k]], maxval)) {
+                maxidx = k;
+                maxval = v[tosort[k]];
+            }
+        }
+        std::swap(tosort[kth], tosort[maxidx]);
+        return;
+    }
+
+    depth_limit = np_get_msb(num) * 2;
+
+    /* guarantee three elements */
+    for (; low + 1 < high;) {
+        int64_t ll = low + 1;
+        int64_t hh = high;
+
+        if (depth_limit > 0 || hh - ll < 5) {
+            const int64_t mid = low + (high - low) / 2;
+            np_arg_median3_swap(v, tosort, low, mid, high);
+        } else {
+            const int64_t mid =
+                ll + np_arg_median_of_median5(v, tosort + ll, hh - ll);
+            std::swap(tosort[mid], tosort[low]);
+            /* adapt for the larger partition than med3 pivot */
+            --ll;
+            ++hh;
+        }
+
+        --depth_limit;
+
+        np_arg_unguarded_partition(v, tosort, v[tosort[low]], &ll, &hh);
+
+        /* move pivot into position */
+        std::swap(tosort[low], tosort[hh]);
+
+        if (hh >= kth) high = hh - 1;
+        if (hh <= kth) low = ll;
+    }
+
+    /* two elements */
+    if (high == low + 1) {
+        if (np_sort_lt(v[tosort[high]], v[tosort[low]]))
+            std::swap(tosort[high], tosort[low]);
+    }
+}
+
+// npysort_heapsort.h aheapsort_ (the aquicksort depth-limit fallback).
+template <typename T>
+void np_aheapsort(const T* vv, int64_t* tosort, int64_t n) {
+    const T* v = vv;
+    int64_t* a = tosort - 1;  // heapsort uses 1-based indexing
+    int64_t i, j, l, tmp;
+
+    for (l = n >> 1; l > 0; --l) {
+        tmp = a[l];
+        for (i = l, j = l << 1; j <= n;) {
+            if (j < n && np_sort_lt(v[a[j]], v[a[j + 1]])) j += 1;
+            if (np_sort_lt(v[tmp], v[a[j]])) {
+                a[i] = a[j];
+                i = j;
+                j += j;
+            } else {
+                break;
+            }
+        }
+        a[i] = tmp;
+    }
+
+    for (; n > 1;) {
+        tmp = a[n];
+        a[n] = a[1];
+        n -= 1;
+        for (i = 1, j = 2; j <= n;) {
+            if (j < n && np_sort_lt(v[a[j]], v[a[j + 1]])) j++;
+            if (np_sort_lt(v[tmp], v[a[j]])) {
+                a[i] = a[j];
+                i = j;
+                j += j;
+            } else {
+                break;
+            }
+        }
+        a[i] = tmp;
+    }
+}
+
+// quicksort.hpp aquicksort_: introsort over an index array. Partitions
+// larger than SMALL_QUICKSORT (15) use the med3 Hoare partition (largest
+// side pushed on an explicit stack); the leaves are a STABLE insertion
+// sort, so tie order for short arrays follows the input order.
+template <typename T>
+void np_aquicksort(const T* vv, int64_t* tosort, int64_t num) {
+    constexpr int kSmallQuicksort = 15;
+    constexpr int kQsStack = 128;  // PYA_QS_STACK = NPY_BITSOF_INTP * 2
+    const T* v = vv;
+    T vp;
+    int64_t* pl = tosort;
+    int64_t* pr = tosort + num - 1;
+    int64_t* stack[kQsStack];
+    int64_t** sptr = stack;
+    int64_t *pm, *pi, *pj, *pk, vi;
+    int depth[kQsStack];
+    int* psdepth = depth;
+    int cdepth = np_get_msb(num) * 2;
+
+    for (;;) {
+        if (cdepth < 0) {
+            np_aheapsort(vv, pl, pr - pl + 1);
+            goto stack_pop;
+        }
+        while ((pr - pl) > kSmallQuicksort) {
+            /* quicksort partition */
+            pm = pl + ((pr - pl) >> 1);
+            if (np_sort_lt(v[*pm], v[*pl])) std::swap(*pm, *pl);
+            if (np_sort_lt(v[*pr], v[*pm])) std::swap(*pr, *pm);
+            if (np_sort_lt(v[*pm], v[*pl])) std::swap(*pm, *pl);
+            vp = v[*pm];
+            pi = pl;
+            pj = pr - 1;
+            std::swap(*pm, *pj);
+            for (;;) {
+                do {
+                    ++pi;
+                } while (np_sort_lt(v[*pi], vp));
+                do {
+                    --pj;
+                } while (np_sort_lt(vp, v[*pj]));
+                if (pi >= pj) break;
+                std::swap(*pi, *pj);
+            }
+            pk = pr - 1;
+            std::swap(*pi, *pk);
+            /* push largest partition on stack */
+            if (pi - pl < pr - pi) {
+                *sptr++ = pi + 1;
+                *sptr++ = pr;
+                pr = pi - 1;
+            } else {
+                *sptr++ = pl;
+                *sptr++ = pi - 1;
+                pl = pi + 1;
+            }
+            *psdepth++ = --cdepth;
+        }
+
+        /* insertion sort */
+        for (pi = pl + 1; pi <= pr; ++pi) {
+            vi = *pi;
+            vp = v[vi];
+            pj = pi;
+            pk = pi - 1;
+            while (pj > pl && np_sort_lt(vp, v[*pk])) {
+                *pj-- = *pk--;
+            }
+            *pj = vi;
+        }
+    stack_pop:
+        if (sptr == stack) break;
+        pr = *(--sptr);
+        pl = *(--sptr);
+        cdepth = *(--psdepth);
+    }
+}
+
+// One transform row:
+//   part  = np.argpartition(row, k)[:k]      (kth = k, NOT k - 1)
+//   bd    = row[part]
+//   order = np.argsort(bd)                   (kind="quicksort")
+//   out_positions = part[order]; out_dists = bd[order]
+// This is exactly umap_.py's transform block (and, per row slice, the
+// sparse/dense precomputed selections).
+template <typename T, typename OutDist>
+void numpy_knn_row(const T* d, int64_t m, int64_t k,
+                   std::vector<int64_t>& tosort, std::vector<T>& bd,
+                   std::vector<int64_t>& order, int64_t* out_positions,
+                   OutDist* out_dists) {
+    if (k >= m) {
+        // np.argpartition's bounds check.
+        throw std::invalid_argument("kth(=" + std::to_string(k) +
+                                    ") out of bounds (" + std::to_string(m) +
+                                    ")");
+    }
+    tosort.resize(static_cast<std::size_t>(m));
+    std::iota(tosort.begin(), tosort.end(), int64_t{0});
+    np_arg_introselect(d, tosort.data(), m, k);
+    bd.resize(static_cast<std::size_t>(k));
+    for (int64_t j = 0; j < k; ++j)
+        bd[static_cast<std::size_t>(j)] = d[tosort[static_cast<std::size_t>(j)]];
+    order.resize(static_cast<std::size_t>(k));
+    std::iota(order.begin(), order.end(), int64_t{0});
+    np_aquicksort(bd.data(), order.data(), k);
+    for (int64_t j = 0; j < k; ++j) {
+        const int64_t o = order[static_cast<std::size_t>(j)];
+        out_positions[j] = tosort[static_cast<std::size_t>(o)];
+        out_dists[j] = static_cast<OutDist>(bd[static_cast<std::size_t>(o)]);
+    }
+}
+
+}  // namespace
+
+void numpy_knn_from_dmat(const std::vector<float>& dmat, int64_t n, int64_t m,
+                         int64_t n_neighbors, int32_t* knn_indices,
+                         float* knn_dists) {
+    std::vector<int64_t> tosort, order, pos(static_cast<std::size_t>(n_neighbors));
+    std::vector<float> bd;
+    for (int64_t row = 0; row < n; ++row) {
+        numpy_knn_row(dmat.data() + row * m, m, n_neighbors, tosort, bd,
+                      order, pos.data(), knn_dists + row * n_neighbors);
+        for (int64_t j = 0; j < n_neighbors; ++j)
+            knn_indices[row * n_neighbors + j] =
+                static_cast<int32_t>(pos[static_cast<std::size_t>(j)]);
+    }
+}
+
+void numpy_knn_from_dmat_f64(const std::vector<double>& dmat, int64_t n,
+                             int64_t m, int64_t n_neighbors,
+                             int32_t* knn_indices, double* knn_dists) {
+    std::vector<int64_t> tosort, order, pos(static_cast<std::size_t>(n_neighbors));
+    std::vector<double> bd;
+    for (int64_t row = 0; row < n; ++row) {
+        numpy_knn_row(dmat.data() + row * m, m, n_neighbors, tosort, bd,
+                      order, pos.data(), knn_dists + row * n_neighbors);
+        for (int64_t j = 0; j < n_neighbors; ++j)
+            knn_indices[row * n_neighbors + j] =
+                static_cast<int32_t>(pos[static_cast<std::size_t>(j)]);
+    }
+}
+
+void numpy_knn_row_positions(const float* row_data, int64_t len, int64_t k,
+                             int64_t* out_positions, float* out_dists) {
+    std::vector<int64_t> tosort, order;
+    std::vector<float> bd;
+    numpy_knn_row(row_data, len, k, tosort, bd, order, out_positions,
+                  out_dists);
+}
+// -----------------------------------------------------------------------------
+
 // ------------------------------------------------------ init_graph_transform
 
 namespace {
@@ -1876,6 +2247,7 @@ UMAP& UMAP::fit_impl(const float* X, int64_t n_samples, int64_t n_features,
                           0.0);
             dists_are_f64 = true;
             std::vector<int64_t> ord;
+            std::vector<float> rowd;
             for (int64_t row = 0; row < n_index; ++row) {
                 const int32_t start = sp_indptr[row];
                 const int64_t len = sp_indptr[row + 1] - start;
@@ -1889,24 +2261,23 @@ UMAP& UMAP::fit_impl(const float* X, int64_t n_samples, int64_t n_features,
                         "n_neighbors stored distances (upstream's "
                         "np.argpartition(kth=n_neighbors) is out of bounds "
                         "when a row stores exactly n_neighbors)");
-                // np.argpartition(row_data, k)[:k] then argsort by value.
-                // Ties resolve stably by stored position here where numpy's
-                // introselect + quicksort are unstable (documented
-                // deviation, same as the dense transform k-selection).
-                ord.resize(static_cast<std::size_t>(len));
-                std::iota(ord.begin(), ord.end(), 0);
-                std::stable_sort(ord.begin(), ord.end(),
-                                 [&](int64_t a, int64_t b) {
-                                     return sp_values[start + a] <
-                                            sp_values[start + b];
-                                 });
+                // np.argpartition(row_data, k)[:k] then
+                // np.argsort(row_data[candidates]): numpy's introselect +
+                // introsort on the stored row slice (exact-tie faithful --
+                // audit 2026-08-29 closed the earlier stable-sort
+                // stand-in).
+                ord.resize(static_cast<std::size_t>(n_neighbors_));
+                rowd.resize(static_cast<std::size_t>(n_neighbors_));
+                numpy_knn_row_positions(sp_values + start, len, n_neighbors_,
+                                        ord.data(), rowd.data());
                 for (int64_t j = 0; j < n_neighbors_; ++j) {
                     const int64_t pos =
                         start + ord[static_cast<std::size_t>(j)];
                     knn_indices_[static_cast<std::size_t>(
                         row * n_neighbors_ + j)] = sp_indices[pos];
                     kdst64[static_cast<std::size_t>(row * n_neighbors_ + j)] =
-                        static_cast<double>(sp_values[pos]);
+                        static_cast<double>(
+                            rowd[static_cast<std::size_t>(j)]);
                 }
             }
         } else {
@@ -2720,12 +3091,13 @@ MembershipStrengths UMAP::transform_membership(const float* X_new,
         cols = n_neighbors_;
         indices.resize(static_cast<std::size_t>(n_queries) * cols);
         dists.resize(static_cast<std::size_t>(n_queries) * cols);
-        // argpartition + take_along_axis + argsort == k smallest per row
-        // sorted by distance.
+        // np.argpartition(X, k, axis=1)[:, :k] + take_along_axis + argsort:
+        // numpy's introselect/introsort (transform-side selection -- NOT
+        // numba's fit-side quickselect; they differ on exact ties).
         const std::vector<float> dmat(
             X_new, X_new + static_cast<std::size_t>(n_queries) * n_);
-        fast_knn_from_dmat(dmat, n_queries, n_, cols, indices.data(),
-                           dists.data());
+        numpy_knn_from_dmat(dmat, n_queries, n_, cols, indices.data(),
+                            dists.data());
         // assert np.min(indices) >= 0 and np.min(dists) >= 0.0
         for (float d : dists) {
             if (!(d >= 0.0f)) {
@@ -2775,10 +3147,13 @@ MembershipStrengths UMAP::transform_membership(const float* X_new,
         const std::vector<float> dmat = pairwise_distances_sklearn(
             X_new, n_queries, raw_data_.data(), n_, dim_, params_.metric,
             /*x_is_y=*/false, params_.metric_kwds, &cid);
-        // argpartition + argsort: k smallest per row, sorted by distance
-        // (ties by ascending index).
-        fast_knn_from_dmat(dmat, n_queries, n_, cols, indices.data(),
-                           dists.data());
+        // np.argpartition(d_block, k, axis=1)[:, :k] + argsort: numpy's
+        // introselect/introsort. The transform-side kNN is NUMPY selection
+        // upstream (fit uses numba's fast_knn_indices); exact ties at the k
+        // boundary resolve differently between the two (audit 2026-08-29,
+        // c09/c11).
+        numpy_knn_from_dmat(dmat, n_queries, n_, cols, indices.data(),
+                            dists.data());
         // --- phase4 additions ------------------------------------------------
         }  // if (!gpu_knn_done)
         // ---------------------------------------------------------------------
@@ -3721,6 +4096,7 @@ MembershipStrengths UMAP::transform_membership_sparse(
         indices.assign(static_cast<std::size_t>(n_queries) * cols, -1);
         dists.assign(static_cast<std::size_t>(n_queries) * cols, -1.0f);
         std::vector<int64_t> ord;
+        std::vector<float> rowd;
         for (int64_t row = 0; row < n_queries; ++row) {
             const int32_t start = q_indptr[row];
             const int64_t len = q_indptr[row + 1] - start;
@@ -3735,19 +4111,20 @@ MembershipStrengths UMAP::transform_membership_sparse(
                     "n_neighbors stored distances (upstream's "
                     "np.argpartition(kth=n_neighbors) is out of bounds when "
                     "a row stores exactly n_neighbors)");
-            // np.argpartition(row_data, k)[:k] + argsort by value (stable
-            // tie order here; documented deviation like the fit branch).
-            ord.resize(static_cast<std::size_t>(len));
-            std::iota(ord.begin(), ord.end(), 0);
-            std::stable_sort(ord.begin(), ord.end(),
-                             [&](int64_t a, int64_t b) {
-                                 return q_data[start + a] < q_data[start + b];
-                             });
+            // np.argpartition(row_data, k)[:k] +
+            // np.argsort(row_data[candidates]): numpy's introselect +
+            // introsort on the stored row slice (exact-tie faithful --
+            // audit 2026-08-29 closed the earlier stable-sort stand-in).
+            ord.resize(static_cast<std::size_t>(cols));
+            rowd.resize(static_cast<std::size_t>(cols));
+            numpy_knn_row_positions(q_data + start, len, cols, ord.data(),
+                                    rowd.data());
             for (int64_t j = 0; j < cols; ++j) {
                 const int64_t pos = start + ord[static_cast<std::size_t>(j)];
                 indices[static_cast<std::size_t>(row * cols + j)] =
                     q_indices[pos];
-                dists[static_cast<std::size_t>(row * cols + j)] = q_data[pos];
+                dists[static_cast<std::size_t>(row * cols + j)] =
+                    rowd[static_cast<std::size_t>(j)];
             }
         }
         // assert np.min(indices) >= 0 and np.min(dists) >= 0.0
@@ -3761,7 +4138,8 @@ MembershipStrengths UMAP::transform_membership_sparse(
     // -------------------------------------------------------------------------
     if (small_data_) {
         // pairwise_distances(X_new, self._raw_data, metric=self.metric) +
-        // argpartition/argsort (== stable k-smallest per row). hardening
+        // np.argpartition/np.argsort (numpy's introselect/introsort --
+        // transform-side selection, exact-tie faithful). hardening
         // additions: upstream's full metric routing (float64 manhattan
         // kernel, densify fallback); dists.astype(np.float32) happens after
         // the k-selection, exactly like transform().
@@ -3775,13 +4153,13 @@ MembershipStrengths UMAP::transform_membership_sparse(
         if (sd.is_f64) {
             std::vector<double> kdst(static_cast<std::size_t>(n_queries) *
                                      cols);
-            fast_knn_from_dmat_f64(sd.f64, n_queries, n_, cols,
-                                   indices.data(), kdst.data());
+            numpy_knn_from_dmat_f64(sd.f64, n_queries, n_, cols,
+                                    indices.data(), kdst.data());
             for (std::size_t i = 0; i < kdst.size(); ++i)
                 dists[i] = static_cast<float>(kdst[i]);
         } else {
-            fast_knn_from_dmat(sd.f32, n_queries, n_, cols, indices.data(),
-                               dists.data());
+            numpy_knn_from_dmat(sd.f32, n_queries, n_, cols, indices.data(),
+                                dists.data());
         }
     } else {
         if (!sparse_knn_index_) {

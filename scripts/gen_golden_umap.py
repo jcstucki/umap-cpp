@@ -207,6 +207,32 @@ out.append("static const double cd_b = %.17g;" % ab_b)
 model_d = um.UMAP(init="random", random_state=42, a=ab_a, b=ab_b)
 emit_fit("cd", Xc, model_d, queries=Qc)
 
+# ---- case e: TIE-HEAVY transform (audit 2026-08-29, c09/c11). Integer-grid
+# data with duplicate rows: query-to-training euclidean distances tie
+# EXACTLY, including at the k = n_neighbors boundary, so the transform-side
+# selection (numpy np.argpartition introselect + np.argsort) picks tied
+# neighbours differently from numba's fit-side quickselect / any stable
+# "ties by ascending index" stand-in. Same fully deterministic path as case
+# d (small data, random init, explicit a/b) -> bit-exact end to end.
+rng_e = np.random.RandomState(31337)
+Xe = rng_e.randint(0, 4, size=(140, 4)).astype(np.float32)
+Qe = rng_e.randint(0, 4, size=(35, 4)).astype(np.float32)
+ke = 15  # default n_neighbors
+dm_e = np.sqrt(((Qe[:, None, :].astype(np.float64) -
+                 Xe[None, :, :].astype(np.float64)) ** 2).sum(-1))
+srt_e = np.sort(dm_e, axis=1)
+n_tied_e = int((srt_e[:, ke - 1] == srt_e[:, ke]).sum())
+assert n_tied_e >= 8, "tie-heavy case must straddle the k boundary: %d" % \
+    n_tied_e
+part_e = np.argpartition(dm_e, ke, axis=1)[:, :ke]
+stable_e = np.argsort(dm_e, axis=1, kind="stable")[:, :ke]
+assert any(set(part_e[i]) != set(stable_e[i]) for i in range(dm_e.shape[0])), \
+    "numpy introselect must pick a different tied subset than a stable sort"
+out.append("// case ce: %d/%d query rows have an exact tie at the k=%d "
+           "boundary" % (n_tied_e, Qe.shape[0], ke))
+model_e = um.UMAP(init="random", random_state=42, a=ab_a, b=ab_b)
+emit_fit("ce", Xe, model_e, queries=Qe)
+
 # ---- iris-like 150x4 dataset for the trustworthiness test
 centers4 = [[5.0, 3.4, 1.5, 0.2], [5.9, 2.8, 4.3, 1.3], [6.6, 3.0, 5.6, 2.0]]
 Xt = make_blobs(np.random.RandomState(2024), 150, 4, centers4, 0.35)

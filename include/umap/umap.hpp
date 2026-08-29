@@ -674,6 +674,27 @@ void fast_knn_from_dmat_f64(const std::vector<double>& dmat, int64_t n,
                             int64_t m, int64_t n_neighbors,
                             int32_t* knn_indices, double* knn_dists);
 
+// --- numpy k-selection (audit 2026-08-29 fix, c09/c11) -----------------------
+// umap_.py's TRANSFORM brute-force block and the precomputed row selections:
+//   part = np.argpartition(row, k)[:k]; bd = row[part]; order = np.argsort(bd)
+// replicated with NUMPY's introselect (npysort selection.cpp) and argsort
+// introsort (quicksort.hpp aquicksort_ + aheapsort_ fallback), numpy 2.5.2
+// scalar paths (what the reference platform dispatches to). On exact-tie
+// rows these pick DIFFERENT candidates than numba's fast_knn_indices above
+// -- both are replicated so each side of the fit/transform split is
+// bit-faithful. kth = k (not k-1); k >= m throws numpy's bounds error.
+void numpy_knn_from_dmat(const std::vector<float>& dmat, int64_t n, int64_t m,
+                         int64_t n_neighbors, int32_t* knn_indices,
+                         float* knn_dists);
+void numpy_knn_from_dmat_f64(const std::vector<double>& dmat, int64_t n,
+                             int64_t m, int64_t n_neighbors,
+                             int32_t* knn_indices, double* knn_dists);
+// Single-row flavour for the sparse precomputed paths: fills the k selected
+// row POSITIONS (into row_data) and their values.
+void numpy_knn_row_positions(const float* row_data, int64_t len, int64_t k,
+                             int64_t* out_positions, float* out_dists);
+// -----------------------------------------------------------------------------
+
 // sklearn manhattan_distances on CSR float32 input: the cython
 // _sparse_manhattan kernel -- float32 subtraction on shared columns, float64
 // fabs-accumulation, float64 output (verified against the reference sklearn

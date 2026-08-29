@@ -212,6 +212,32 @@ TEST_CASE("umap: BIT-EXACT transform (case d: small data, random init)") {
 }
 
 // ---------------------------------------------------------------------------
+// Case e: TIE-HEAVY transform. Integer-grid data with duplicate rows: 28/35
+// query rows have an EXACT distance tie at the k = n_neighbors boundary, so
+// the transform-side k-selection must follow numpy's np.argpartition
+// introselect + np.argsort (upstream transform) -- numba's fit-side
+// quickselect or a stable "ties by ascending index" selection picks
+// different tied neighbours and diverges (audit 2026-08-29, c09/c11).
+TEST_CASE("umap: BIT-EXACT tie-heavy transform (case e: numpy argpartition)") {
+    UMAPParams p;
+    p.init = "random";
+    p.random_state = 42;
+    p.a = golden_umap::cd_a;
+    p.b = golden_umap::cd_b;
+    UMAP model(p);
+    const std::vector<float> emb = model.fit_transform(
+        golden_umap::ce_X, golden_umap::ce_n, golden_umap::ce_dim);
+    CHECK(model.small_data());
+    REQUIRE(emb.size() == static_cast<std::size_t>(golden_umap::ce_n) * 2);
+    CHECK(count_mismatch(emb, golden_umap::ce_embedding) == 0);
+
+    const std::vector<float> temb =
+        model.transform(golden_umap::ce_queries, golden_umap::ce_nq);
+    REQUIRE(temb.size() == static_cast<std::size_t>(golden_umap::ce_nq) * 2);
+    CHECK(count_mismatch(temb, golden_umap::ce_t_embedding) == 0);
+}
+
+// ---------------------------------------------------------------------------
 // Case a: NN-descent path + init="random". kNN indices / graph structure /
 // RandomState stream / init are exact; the fastmath ~1 ulp distance wobble
 // makes the SGD trajectory diverge, so the embedding is quality-checked.
