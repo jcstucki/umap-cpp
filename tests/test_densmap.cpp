@@ -18,6 +18,10 @@
 //    identical; distances and embedding checked bit-exact here too (the
 //    minkowski kernel's pow() chain came out reproducible, unlike the
 //    fastmath euclidean kernels).
+//
+// TEST_SUITE("test_densmap.py") at the bottom of this file is the port of
+// reference/umap/umap/tests/test_densmap.py (upstream test names +
+// thresholds verbatim); see tests/PORTING_NOTES.md.
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
@@ -26,7 +30,10 @@
 
 #include "doctest.h"
 #include "golden_densmap.hpp"
+#include "trustworthiness.hpp"
 #include "umap/umap.hpp"
+#include "upstream_data.hpp"
+#include "upstream_helpers.hpp"
 
 using umap::UMAP;
 using umap::UMAPParams;
@@ -243,3 +250,80 @@ TEST_CASE("densmap default epochs: 500 + 200") {
                   "output_dens alone must not boost the epoch default");
     CHECK(true);
 }
+
+// ============================================================================
+// Port of reference/umap/umap/tests/test_densmap.py (upstream test names +
+// thresholds verbatim). nn_data / iris are the conftest fixtures baked in
+// tests/upstream_data.hpp.
+// ============================================================================
+TEST_SUITE("test_densmap.py") {
+
+TEST_CASE("test_densmap_trustworthiness") {
+    // data = nn_data[:50]
+    const std::vector<float> data = testutil::to_f32(updata::nn_data, 50 * 5);
+    UMAPParams p;
+    p.n_neighbors = 10;
+    p.min_dist = 0.01;
+    p.random_state = 42;
+    p.n_epochs = 100;
+    p.densmap = true;
+    p.output_dens = true;
+    UMAP model(p);
+    // Upstream unpacks (embedding, rad_h, rad_l) from fit_transform; the C++
+    // fit_transform returns the embedding, radii come from the accessors.
+    const std::vector<float> emb = model.fit_transform(data.data(), 50, 5);
+    CHECK(model.rad_orig().size() == 50);
+    CHECK(model.rad_emb().size() == 50);
+    const double trust =
+        testutil::trustworthiness(data.data(), 50, 5, emb.data(), 2, 10);
+    CAPTURE(trust);
+    CHECK(trust >= 0.72);
+}
+
+// @pytest.mark.skip upstream; mirrored.
+TEST_CASE("test_densmap_trustworthiness_random_init" * doctest::skip()) {}
+
+TEST_CASE("test_densmap_trustworthiness_on_iris") {
+    const std::vector<float> iris =
+        testutil::to_f32(updata::iris_data, 150 * 4);
+    UMAPParams p;
+    p.n_neighbors = 10;
+    p.min_dist = 0.01;
+    p.random_state = 42;
+    p.densmap = true;
+    UMAP model(p);
+    model.fit(iris.data(), 150, 4);
+    const std::vector<float>& emb = model.embedding();
+    const double trust =
+        testutil::trustworthiness(iris.data(), 150, 4, emb.data(), 2, 10);
+    CAPTURE(trust);
+    CHECK(trust >= 0.97);
+
+    // with pytest.raises(NotImplementedError): model.transform(iris[:10])
+    // (C++ throws std::runtime_error carrying the upstream message).
+    CHECK_THROWS_AS(model.transform(iris.data(), 10), std::runtime_error);
+
+    // The inverse_transform(ValueError) leg needs inverse_transform, which
+    // is not ported yet (in progress on main) -- omitted.
+}
+
+TEST_CASE("test_densmap_trustworthiness_on_iris_supervised") {
+    const std::vector<float> iris =
+        testutil::to_f32(updata::iris_data, 150 * 4);
+    std::vector<float> y(150);
+    for (int i = 0; i < 150; ++i)
+        y[i] = static_cast<float>(updata::iris_target[i]);
+    UMAPParams p;
+    p.n_neighbors = 10;
+    p.min_dist = 0.01;
+    p.random_state = 42;
+    p.densmap = true;
+    UMAP model(p);
+    model.fit(iris.data(), 150, 4, y.data());
+    const double trust = testutil::trustworthiness(
+        iris.data(), 150, 4, model.embedding().data(), 2, 10);
+    CAPTURE(trust);
+    CHECK(trust >= 0.97);
+}
+
+}  // TEST_SUITE

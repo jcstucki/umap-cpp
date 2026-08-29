@@ -191,6 +191,9 @@ h.comment("conftest.py::binary_data -- 12 x 20 bool")
 h.arr("binary_data", binary_data.astype(np.uint8), "std::uint8_t")
 h.comment("conftest.py::nn_data -- 1002 x 5 (1000 uniform rows + 2 zero rows)")
 h.arr("nn_data", nn_data, "double")
+h.comment("conftest.py::binary_nn_data -- 1002 x 5 bool "
+          "(sparse_test_data = csr(nn_data * binary_nn_data))")
+h.arr("binary_nn_data", binary_nn_data.astype(np.uint8), "std::uint8_t")
 h.comment("conftest.py::sparse_nn_data -- scipy.sparse.random(1000, 50, 0.5) CSR")
 h.arr("sparse_nn_indptr", sparse_nn_data.indptr.astype(np.int64), "std::int32_t")
 h.arr("sparse_nn_indices", sparse_nn_data.indices.astype(np.int64), "std::int32_t")
@@ -211,6 +214,7 @@ h.arr("iris_target", iris.target.astype(np.int64), "std::int32_t")
 
 h.comment("make_blobs(50, cluster_std=0.5, random_state=42) -- 50 x 2")
 h.arr("blobs50", blobs50, "double")
+h.arr("blobs50_labels", blobs50_labels.astype(np.int64), "std::int32_t")
 h.comment("make_blobs(500, 10, centers=5) -- upstream UNSEEDED; baked with "
           "random_state=42 (documented fixed-seed variant)")
 h.arr("blobs500", blobs500, "double")
@@ -297,18 +301,44 @@ for m in binary_metrics:
     g.comment("binary %s (12 x 12)" % m)
     g.arr("binary_" + m, dm, "double")
 
-# sparse metrics: only the subset our sparse registry implements
+# sparse spatial metrics (test_umap_metrics.py::sparse_spatial_check
+# corrections: braycurtis/dice/sokalsneath/yule -> 0.0 fill;
+# cosine/correlation/kulsinski/russellrao -> 1.0 fill + zero diag 10/11)
 sparse_dense = np.asarray(sparse_spatial_data.todense())
 sparse_corrections = {
     "braycurtis": ("zero",),
     "cosine": ("one", "zerodiag_1011"),
     "correlation": ("one", "zerodiag_1011"),
 }
-for m in ["euclidean", "manhattan", "cosine"]:
+for m in ["euclidean", "manhattan", "cosine", "chebyshev", "minkowski",
+          "hamming", "canberra", "correlation", "braycurtis"]:
     dm = corrected(pairwise_distances(sparse_dense, metric=m),
                    sparse_corrections.get(m, ()))
     g.comment("sparse spatial %s (12 x 12)" % m)
     g.arr("sparse_" + m, dm, "double")
+
+# sparse binary metrics (test_umap_metrics.py::sparse_binary_check
+# corrections: jaccard/dice/sokalsneath/yule -> 0.0 fill;
+# kulsinski/russellrao -> 1.0 fill + zero diag 10/11). kulsinski /
+# sokalmichener / sokalsneath are version-skipped upstream (mirrored).
+sparse_binary_dense = binary_data.astype(np.float64)
+sparse_binary_corrections = {
+    "jaccard": ("zero",),
+    "dice": ("zero",),
+    "russellrao": ("one", "zerodiag_1011"),
+}
+for m in ["jaccard", "matching", "dice", "rogerstanimoto", "russellrao"]:
+    dm = corrected(pairwise_distances(sparse_binary_dense, metric=m),
+                   sparse_binary_corrections.get(m, ()))
+    g.comment("sparse binary %s (12 x 12)" % m)
+    g.arr("sparse_binary_" + m, dm, "double")
+
+# sparse hellinger golden: pairwise_special_metric(|csr[:-2].toarray()|)
+# from the reference implementation (10 x 10, compared at decimal=3).
+g.comment("sparse hellinger golden = pairwise_special_metric("
+          "|sparse_spatial[:-2].toarray()|) (10 x 10)")
+g.arr("sparse_hellinger_golden",
+      dist.pairwise_special_metric(np.abs(sparse_dense[:-2])), "double")
 
 g.comment("seuclidean: V drawn post-conftest (see gen script)")
 g.arr("seuclidean_v", seuclidean_v, "double")
