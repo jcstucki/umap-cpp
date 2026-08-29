@@ -166,7 +166,8 @@ struct UMAPParams {
     int n_neighbors = 15;
     int n_components = 2;
     std::string metric = "euclidean";     // named metrics or "precomputed"
-    std::optional<int> n_epochs;          // None -> 500/200 (fit), 100/30 (transform)
+    std::optional<int> n_epochs;          // None -> 500/200 (fit), 100/30
+                                          // (transform), 0 (update: NO SGD)
     double learning_rate = 1.0;
     std::string init = "spectral";        // "spectral" | "random" | "pca" | "tswspectral"
     double min_dist = 0.1;

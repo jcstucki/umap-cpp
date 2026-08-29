@@ -32,18 +32,31 @@ callable metrics (`custom_metric`/`custom_metric_grad`/`custom_output_metric`
 as the `std::function` equivalents of upstream's callables), and `n_jobs`
 parallelism gating (seeded fits force `n_jobs=1` with upstream's warning).
 
+An adversarial differential audit (2026-08-29, recorded in
+[docs/AUDIT-2026-08-29.md](docs/AUDIT-2026-08-29.md)) re-proved the bit-exact
+surface across 21 cases + 17 fuzz edges and found four real deviations, all
+since fixed and golden-locked: `update()` with default `n_epochs` (upstream
+runs ZERO SGD epochs), the supervised `target_metric="count"` float32 value
+chain, transform-side exact-tie neighbour selection (numpy's introselect /
+introsort now ported verbatim next to numba's fit-side quickselect), and two
+degenerate corners (the n=2 empty-graph `ValueError`, and
+`ensure_all_finite="allow-nan"`'s NaN pairwise diagonal + NaN-propagating
+`np.max` pipeline).
+
 Documented deviations (each noted at its definition site and in
 [ROADMAP.md](ROADMAP.md)): Spectra-vs-ARPACK eigensolver residuals in spectral
 init (~1e-6, up to sign), `find_ab_params` reaching scipy's optimum to ~1e-7,
 tau-prng standing in for `RandomState` in some multi-component spectral
-branches, exact-tie ordering in a few argsort/argpartition sites (including
-the sparse-precomputed k-selection), sparse `init="pca"` (sklearn's
-randomized TruncatedSVD is not bit-replicable) and callable metrics on sparse
-input (the CSR callable signature) both raising, kNN construction staying
-single-threaded regardless of `n_jobs` (performance-only; bit-exact with
-`NUMBA_NUM_THREADS=1`), `"custom"`-metric models not being serialisable, and
-the GPU path's float32/hogwild semantics (below). `ROADMAP.md` is the
-authoritative, per-feature log of parity levels and deviations.
+branches, exact-tie ordering in the two full-row `np.argsort` sites
+(`update()`'s init-neighbour selection and `inverse_transform`'s candidate
+ordering; every k-selection site is now tie-exact), sparse `init="pca"`
+(sklearn's randomized TruncatedSVD is not bit-replicable) and callable
+metrics on sparse input (the CSR callable signature) both raising, kNN
+construction staying single-threaded regardless of `n_jobs`
+(performance-only; bit-exact with `NUMBA_NUM_THREADS=1`), `"custom"`-metric
+models not being serialisable, and the GPU path's float32/hogwild semantics
+(below). `ROADMAP.md` is the authoritative, per-feature log of parity levels
+and deviations.
 
 ## Building
 
@@ -183,10 +196,10 @@ should keep the default `Device::CPU`.
 suites generated from the real Python implementation
 (`scripts/gen_golden*.py`, `scripts/gen_upstream_fixtures.py`):
 
-* Metal build: **368 test cases / 172,124 assertions**, 0 failures
-  (27 skips: version-removed scipy metrics, upstream `@skip` mirrors,
+* Metal build: **412 test cases / 177,095 assertions**, 0 failures
+  (23 skips: version-removed scipy metrics, upstream `@skip` mirrors,
   typed-surface-unrepresentable cases, a hidden GPU timing case);
-* CPU-only build: **362 cases / 169,712 assertions**, 0 failures (26 skips).
+* CPU-only build: **406 cases / 174,683 assertions**, 0 failures (22 skips).
 
 `scripts/test_install.sh` additionally verifies `cmake --install`, the
 `find_package(umapcpp)` consumer build (C++ and C), and the installed CLI
