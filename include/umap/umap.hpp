@@ -527,6 +527,12 @@ class UMAP {
 
  private:
     void validate_parameters() const;
+    // --- hardening additions ------------------------------------------------
+    // upstream's self._input_distance_func for the callable branch: the raw
+    // custom_metric, or the _dist_only wrapper over custom_metric_grad
+    // (metric(x, y)[0]). Empty when metric != "custom".
+    DistanceF32Fn custom_input_dist() const;
+    // ------------------------------------------------------------------------
     std::vector<float> make_fit_init(const float* data, int64_t n_index,
                                      const SparseMatrix& filtered_graph,
                                      nnd::NumpyRandomState& rs) const;

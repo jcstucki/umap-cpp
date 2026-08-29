@@ -303,6 +303,11 @@ target_sources(umap_tests PRIVATE
     tests/test_umap_grads.cpp)
 # ----------------------------------------------------------------------------
 
+# --- hardening additions ----------------------------------------------------
+target_sources(umap_tests PRIVATE
+    tests/test_custom_metrics.cpp)
+# ----------------------------------------------------------------------------
+
 add_test(NAME umap_tests COMMAND umap_tests)
 
 # --- phase4 additions ---------------------------------------------------------

@@ -10,6 +10,7 @@
 #include <limits>
 #include <numeric>
 #include <random>
+#include <set>  // hardening additions: upstream registry name sets
 #include <stdexcept>
 #include <string>
 
@@ -781,7 +782,98 @@ std::vector<float> pca_fit_transform(const float* X, int64_t n, int64_t dim,
 
 // ------------------------------------------------------------------- UMAP
 
+// --- hardening additions -----------------------------------------------------
+// Upstream registry *name sets* for _validate_parameters' input-metric elif
+// chain. These deliberately mirror the Python dicts (enumerated from
+// reference/umap umap/distances.py + umap/sparse.py and
+// reference/pynndescent pynndescent/distances.py + pynndescent/sparse.py),
+// not the C++ kernel registries: validation routing (which names are
+// recognised, and which raise "not supported for sparse data") must follow
+// dict membership even for metrics whose kernels live elsewhere.
+namespace {
+
+// dist.named_distances (41 keys).
+const std::set<std::string>& upstream_named_distances() {
+    static const std::set<std::string> s = {
+        "braycurtis", "canberra", "categorical", "chebyshev", "correlation",
+        "cosine", "count", "dice", "euclidean", "hamming", "haversine",
+        "hellinger", "hierarchical_categorical", "jaccard", "kulsinski", "l1",
+        "l2", "linf", "linfinity", "linfty", "ll_dirichlet", "mahalanobis",
+        "manhattan", "matching", "minkowski", "myers", "ordinal", "poincare",
+        "rogerstanimoto", "russellrao", "seuclidean", "softmax_hellinger",
+        "sokalmichener", "sokalsneath", "standardised_euclidean", "string",
+        "symmetric_kl", "taxicab", "weighted_minkowski", "wminkowski", "yule"};
+    return s;
+}
+
+// sparse.sparse_named_distances keys that also appear in dist.named_distances
+// (the only ones the chain can reach; e.g. "l2" and "symmetric_kl" are
+// missing, so they raise for sparse input like upstream).
+const std::set<std::string>& upstream_sparse_named_distances() {
+    static const std::set<std::string> s = {
+        "braycurtis",    "canberra",   "chebyshev", "correlation",
+        "cosine",        "dice",       "euclidean", "hamming",
+        "hellinger",     "jaccard",    "kulsinski", "l1",
+        "linf",          "linfinity",  "linfty",    "ll_dirichlet",
+        "manhattan",     "matching",   "minkowski", "rogerstanimoto",
+        "russellrao",    "sokalmichener", "sokalsneath", "taxicab"};
+    return s;
+}
+
+// pynndescent.distances.named_distances (53 keys).
+const std::set<std::string>& upstream_pynn_named_distances() {
+    static const std::set<std::string> s = {
+        "bit_hamming", "bit_jaccard", "braycurtis", "canberra", "chebyshev",
+        "circular_kantorovich", "circular_wasserstein", "correlation",
+        "cosine", "dice", "dot", "euclidean", "hamming", "haversine",
+        "hellinger", "inner_product", "jaccard", "jensen-shannon",
+        "jensen_shannon", "kantorovich", "kantorovich-1d", "kantorovich_1d",
+        "kulsinski", "l1", "l2", "linf", "linfinity", "linfty", "mahalanobis",
+        "manhattan", "matching", "minkowski", "rogerstanimoto", "russellrao",
+        "seuclidean", "sinkhorn", "sokalmichener", "sokalsneath", "spearmanr",
+        "sqeuclidean", "standardised_euclidean", "symmetric-kl",
+        "symmetric_kl", "symmetric_kullback_liebler", "taxicab",
+        "true_angular", "tsss", "wasserstein", "wasserstein-1d",
+        "wasserstein_1d", "weighted_minkowski", "wminkowski", "yule"};
+    return s;
+}
+
+// pynndescent.sparse.sparse_named_distances keys reachable from the pynn
+// elif branch (metric not in dist.named_distances).
+const std::set<std::string>& upstream_pynn_sparse_named_distances() {
+    static const std::set<std::string> s = {
+        "jensen-shannon", "jensen_shannon", "kantorovich", "kantorovich-1d",
+        "sqeuclidean", "symmetric-kl", "symmetric_kullback_liebler",
+        "wasserstein", "wasserstein-1d", "wasserstein_1d"};
+    return s;
+}
+
+}  // namespace
+// -----------------------------------------------------------------------------
+
 UMAP::UMAP(UMAPParams params) : params_(std::move(params)) {}
+
+// --- hardening additions -----------------------------------------------------
+// upstream's `self._input_distance_func` for the callable-metric branch: the
+// raw distance function when custom_metric is given, otherwise the _dist_only
+// wrapper over the gradient flavour (@numba.njit _dist_only(x, y):
+// return _m(x, y)[0]; the float64 -> float32 rounding lands where upstream's
+// float32 stores do). Empty when metric != "custom".
+DistanceF32Fn UMAP::custom_input_dist() const {
+    if (params_.metric != "custom") return DistanceF32Fn();
+    if (params_.custom_metric) return params_.custom_metric;
+    if (!params_.custom_metric_grad) return DistanceF32Fn();
+    const OutputMetricFn g = params_.custom_metric_grad;
+    return [g](const float* x, const float* y, std::size_t n) {
+        std::vector<double> grad(n);
+        // OutputMetricFn takes float* because the SGD mutates coordinates
+        // through it; a metric must not write through x/y.
+        return static_cast<float>(g(const_cast<float*>(x),
+                                    const_cast<float*>(y),
+                                    static_cast<int>(n), grad.data()));
+    };
+}
+// -----------------------------------------------------------------------------
 
 void UMAP::validate_parameters() const {
     const UMAPParams& p = params_;
@@ -836,17 +928,73 @@ void UMAP::validate_parameters() const {
                 "n_epochs must be a nonnegative integer "
                 "or a list of nonnegative integers");
     }
-    if (p.metric == "precomputed") {
+    // --- hardening additions ------------------------------------------------
+    // "set input distance metric & inverse_transform distance metric":
+    // upstream's full elif chain in order (callable -> precomputed ->
+    // hellinger-data guard [in fit_impl: needs the data] -> dist.named ->
+    // pynndescent named -> raise). The name sets are upstream's registries
+    // verbatim (dist.named_distances / sparse.sparse_named_distances /
+    // pynndescent named_distances / pynndescent sparse_named_distances,
+    // enumerated from the reference checkout), NOT the C++ kernel registry --
+    // the routing (e.g. "sqeuclidean" is pynn-only, "l2" is sparse-invalid)
+    // follows the Python dict membership exactly.
+    if (p.metric == "custom") {
+        // C++ equivalent of a *callable* metric. Restriction (documented):
+        // dense input only -- upstream sparse callables use the CSR
+        // (ind1, data1, ind2, data2) signature, which DistanceF32Fn cannot
+        // express.
+        if (!p.custom_metric && !p.custom_metric_grad)
+            throw std::invalid_argument(
+                "metric is neither callable nor a recognised string");
+        if (sparse_data_)
+            throw std::invalid_argument(
+                "custom (callable) metrics are not supported for sparse "
+                "input in the C++ port (upstream callables take the sparse "
+                "(ind1, data1, ind2, data2) signature)");
+        if (!p.custom_metric_grad)
+            warn_msg(
+                "custom distance metric does not return gradient; "
+                "inverse_transform will be unavailable. To enable using "
+                "inverse_transform method, define a distance function that "
+                "returns a tuple of (distance [float], gradient [np.array])");
+    } else if (p.metric == "precomputed") {
         if (p.unique)
             throw std::invalid_argument(
                 "unique is poorly defined on a precomputed metric");
         warn_msg(
             "using precomputed metric; inverse_transform will be unavailable");
+    } else if (upstream_named_distances().count(p.metric) > 0) {
+        if (sparse_data_ &&
+            upstream_sparse_named_distances().count(p.metric) == 0)
+            throw std::invalid_argument("Metric " + p.metric +
+                                        " is not supported for sparse data");
+        if (named_distances_with_gradients().count(p.metric) == 0)
+            warn_msg("gradient function is not yet implemented for " +
+                     p.metric +
+                     " distance metric; inverse_transform will be unavailable");
+    } else if (upstream_pynn_named_distances().count(p.metric) > 0) {
+        if (sparse_data_ &&
+            upstream_pynn_sparse_named_distances().count(p.metric) == 0)
+            throw std::invalid_argument("Metric " + p.metric +
+                                        " is not supported for sparse data");
+        warn_msg("gradient function is not yet implemented for " + p.metric +
+                 " distance metric; inverse_transform will be unavailable");
+    } else {
+        throw std::invalid_argument(
+            "metric is neither callable nor a recognised string");
     }
+    // ------------------------------------------------------------------------
     // --- densmap additions --------------------------------------------------
-    // set output distance metric (upstream's elif chain; callable output
-    // metrics are out of C++ scope). Note the reference's "cannnot" typo.
-    if (p.output_metric == "precomputed") {
+    // set output distance metric (upstream's elif chain; metric == "custom"
+    // is the C++ callable equivalent). Note the reference's "cannnot" typo.
+    if (p.output_metric == "custom") {
+        // hardening additions: upstream's callable branch requires the
+        // gradient flavour (out_returns_grad) or raises this exact message.
+        if (!p.custom_output_metric)
+            throw std::invalid_argument(
+                "custom output_metric must return a tuple of (distance "
+                "[float], gradient [np.array])");
+    } else if (p.output_metric == "precomputed") {
         throw std::invalid_argument("output_metric cannnot be 'precomputed'");
     } else if (named_distances_with_gradients().count(p.output_metric) > 0) {
         // ok -- resolved at embedding time via make_output_metric
@@ -1536,9 +1684,11 @@ UMAP& UMAP::fit_impl(const float* X, int64_t n_samples, int64_t n_features,
             fitted_ = true;
             return *this;
         }
-        std::fprintf(stderr,
-                     "n_neighbors is larger than the dataset size; truncating "
-                     "to X.shape[0] - 1\n");
+        // hardening additions: upstream warn() -- routed through warn_msg so
+        // a test-installed handler counts it like pytest.warns.
+        warn_msg(
+            "n_neighbors is larger than the dataset size; truncating to "
+            "X.shape[0] - 1");
         n_neighbors_ = static_cast<int>(n_index - 1);
         // if self.densmap: self._densmap_kwds["n_neighbors"] = _n_neighbors
         if (params_.densmap) dens_n_neighbors = n_neighbors_;
@@ -1629,10 +1779,14 @@ UMAP& UMAP::fit_impl(const float* X, int64_t n_samples, int64_t n_features,
                 /*x_is_y=*/true);
             // ----------------------------------------------------------------
         } else {
+            // hardening additions: metric == "custom" rides the identical
+            // _pairwise_callable route (upstream passes the callable
+            // _input_distance_func into sklearn's pairwise_distances).
+            const DistanceF32Fn cid = custom_input_dist();
             dmat = pairwise_distances_sklearn(X_indexed, n_index, X_indexed,
                                               n_index, n_features,
                                               params_.metric, /*x_is_y=*/true,
-                                              params_.metric_kwds);
+                                              params_.metric_kwds, &cid);
         }
         // dmat[dmat >= self._disconnection_distance] = np.inf (skipped for
         // the default +inf threshold, where the mask is all-False).
@@ -1721,12 +1875,15 @@ UMAP& UMAP::fit_impl(const float* X, int64_t n_samples, int64_t n_features,
             // ----------------------------------------------------------------
         } else {
             // NN-descent (continuing the numpy RandomState stream) with the
-            // prepared search index kept for transform().
+            // prepared search index kept for transform(). hardening
+            // additions: metric == "custom" resolves through pynndescent's
+            // callable branch (raw function, euclidean trees).
+            const DistanceF32Fn cid = custom_input_dist();
             knn_index_ = std::make_shared<nnd::PreparedIndex>(
                 nnd::PreparedIndex::build(X_indexed, n_index, n_features,
                                           n_neighbors_, params_.metric,
                                           params_.metric_kwds, rs,
-                                          params_.verbose));
+                                          params_.verbose, &cid));
             knn_indices_ = knn_index_->knn_indices();
             knn_dists_ = knn_index_->knn_dists();
             knn_cols_ = n_neighbors_;
@@ -1844,8 +2001,13 @@ UMAP& UMAP::fit_impl(const float* X, int64_t n_samples, int64_t n_features,
                                        params_.output_metric == "l2");
         OutputMetricFn out_metric;
         if (!euclidean_output)
-            out_metric = make_output_metric(params_.output_metric,
-                                            params_.output_metric_kwds);
+            // hardening additions: "custom" is the C++ callable equivalent
+            // (validated non-empty); it runs the same generic layout as any
+            // named non-euclidean output metric.
+            out_metric = params_.output_metric == "custom"
+                             ? params_.custom_output_metric
+                             : make_output_metric(params_.output_metric,
+                                                  params_.output_metric_kwds);
         // --------------------------------------------------------------------
 
         // --- phase4 additions ------------------------------------------------
@@ -2298,9 +2460,12 @@ MembershipStrengths UMAP::transform_membership(const float* X_new,
         }
         if (!gpu_knn_done) {
         // ---------------------------------------------------------------------
+        // hardening additions: custom metrics ride the same brute-force
+        // route (upstream transform's pairwise_distances with the callable).
+        const DistanceF32Fn cid = custom_input_dist();
         const std::vector<float> dmat = pairwise_distances_sklearn(
             X_new, n_queries, raw_data_.data(), n_, dim_, params_.metric,
-            /*x_is_y=*/false, params_.metric_kwds);
+            /*x_is_y=*/false, params_.metric_kwds, &cid);
         // argpartition + argsort: k smallest per row, sorted by distance
         // (ties by ascending index).
         fast_knn_from_dmat(dmat, n_queries, n_, cols, indices.data(),
@@ -2312,9 +2477,12 @@ MembershipStrengths UMAP::transform_membership(const float* X_new,
         cols = params_.n_neighbors;
         // epsilon = 0.24 if self._knn_search_index._angular_trees else 0.12
         // (the kwds-aware resolve_metric mirrors the flag the index was
-        // built with, including the generic-metric hook's angular list).
+        // built with, including the generic-metric hook's angular list;
+        // hardening additions: the custom overload keeps callables
+        // non-angular like pynndescent, so they query at 0.12).
+        const DistanceF32Fn cid_eps = custom_input_dist();
         const double epsilon =
-            nnd::resolve_metric(params_.metric, params_.metric_kwds)
+            nnd::resolve_metric(params_.metric, params_.metric_kwds, &cid_eps)
                     .angular_trees
                 ? 0.24
                 : 0.12;
@@ -2511,8 +2679,13 @@ std::vector<float> UMAP::transform_from_membership(
             /*move_other=*/false);
     } else {
         // --- densmap additions ----------------------------------------------
-        const OutputMetricFn out_metric = make_output_metric(
-            params_.output_metric, params_.output_metric_kwds);
+        // hardening additions: output_metric == "custom" substitutes the
+        // user function (validated non-empty at fit).
+        const OutputMetricFn out_metric =
+            params_.output_metric == "custom"
+                ? params_.custom_output_metric
+                : make_output_metric(params_.output_metric,
+                                     params_.output_metric_kwds);
         optimize_layout_generic(
             embedding.data(), static_cast<int>(n_queries),
             tail_embedding.data(), dim_out, head, tail, n_epochs,
@@ -2665,9 +2838,14 @@ std::vector<float> UMAP::inverse_transform(const float* X_emb,
 
     // The upstream restriction chain, in its elif order (so e.g. a
     // transform_mode="graph" model with n_components >= 8 only warns).
+    // hardening additions: a "custom" metric has an inverse exactly when the
+    // gradient flavour was provided (upstream: _inverse_distance_func is the
+    // user callable itself for in_returns_grad, else None).
     const bool has_inverse =
-        params_.metric != "precomputed" &&
-        named_distances_with_gradients().count(params_.metric) > 0;
+        params_.metric == "custom"
+            ? static_cast<bool>(params_.custom_metric_grad)
+            : (params_.metric != "precomputed" &&
+               named_distances_with_gradients().count(params_.metric) > 0);
     if (sparse_data_) {
         throw std::invalid_argument(
             "Inverse transform not available for sparse input.");
@@ -2876,9 +3054,13 @@ std::vector<float> UMAP::inverse_transform(const float* X_emb,
 
     // optimize_layout_inverse against the raw data with
     // named_distances_with_gradients[self.metric] at initial_alpha / 4.
+    // hardening additions: metric == "custom" uses the user's gradient
+    // flavour directly (upstream's _inverse_distance_func).
     std::vector<float> tail_data = raw_data_;  // move_other=False copy
     const OutputMetricFn inverse_metric =
-        make_output_metric(params_.metric, params_.metric_kwds);
+        params_.metric == "custom"
+            ? params_.custom_metric_grad
+            : make_output_metric(params_.metric, params_.metric_kwds);
     int64_t rng_state[3] = {r3[0], r3[1], r3[2]};
     optimize_layout_inverse(
         inv_transformed_points.data(), static_cast<int>(n_queries),
@@ -2993,10 +3175,13 @@ UMAP& UMAP::update_impl(const float* X_new, const int32_t* new_indptr,
                     raw_indices_.data(), raw_values_.data(), n_total,
                     params_.metric, /*x_is_y=*/true);
             } else {
+                // hardening additions: custom metrics take the same
+                // _pairwise_callable route as fit's small-data branch.
+                const DistanceF32Fn cid = custom_input_dist();
                 dmat = pairwise_distances_sklearn(
                     raw_data_.data(), n_total, raw_data_.data(), n_total,
                     dim_, params_.metric, /*x_is_y=*/true,
-                    params_.metric_kwds);
+                    params_.metric_kwds, &cid);
             }
             // No disconnection_distance masking and no inf -> -1 pruning in
             // update() (unlike fit).
@@ -3046,11 +3231,14 @@ UMAP& UMAP::update_impl(const float* X_new, const int32_t* new_indptr,
                 knn_indices_ = sparse_knn_index_->knn_indices();
                 knn_dists_ = sparse_knn_index_->knn_dists();
             } else {
+                // hardening additions: custom metrics resolve through the
+                // callable branch when the update crosses into large data.
+                const DistanceF32Fn cid = custom_input_dist();
                 knn_index_ = std::make_shared<nnd::PreparedIndex>(
                     nnd::PreparedIndex::build(
                         raw_data_.data(), n_total, dim_, n_neighbors_,
                         params_.metric, params_.metric_kwds, rs,
-                        params_.verbose));
+                        params_.verbose, &cid));
                 knn_indices_ = knn_index_->knn_indices();
                 knn_dists_ = knn_index_->knn_dists();
             }
@@ -3141,8 +3329,11 @@ UMAP& UMAP::update_impl(const float* X_new, const int32_t* new_indptr,
                                    params_.output_metric == "l2");
     OutputMetricFn out_metric;
     if (!euclidean_output)
-        out_metric = make_output_metric(params_.output_metric,
-                                        params_.output_metric_kwds);
+        // hardening additions: "custom" output metric substitution.
+        out_metric = params_.output_metric == "custom"
+                         ? params_.custom_output_metric
+                         : make_output_metric(params_.output_metric,
+                                              params_.output_metric_kwds);
     std::vector<std::vector<float>> emb_list;
     embedding_ = simplicial_set_embedding_from_init(
         g, fit_init_.data(), dim_out, a_, b_, rng_state, n_epochs,

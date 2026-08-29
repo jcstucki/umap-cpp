@@ -227,7 +227,17 @@ TEST_CASE("test_umap_unique_and_precomputed") {
 
 // Typed n_components / metric objects are unrepresentable in C++.
 TEST_CASE("test_umap_bad_n_components" * doctest::skip()) {}
-TEST_CASE("test_umap_bad_metrics" * doctest::skip()) {}
+
+TEST_CASE("test_umap_bad_metrics") {
+    // The two string halves of the upstream test (metric=2.75 /
+    // output_metric=2.75 are unrepresentable against the typed surface).
+    UMAPParams p;
+    p.metric = "foobar";
+    check_fit_raises(p);
+    p = UMAPParams();
+    p.output_metric = "foobar";
+    check_fit_raises(p);
+}
 
 // --- hardening additions -----------------------------------------------------
 TEST_CASE("test_umap_bad_n_jobs") {
@@ -287,9 +297,67 @@ TEST_CASE("n_jobs caps the unseeded parallel SGD  [hardening]") {
 }
 // -----------------------------------------------------------------------------
 
-// Callable metrics are not portable to C++.
-TEST_CASE("test_umap_custom_distance_w_grad" * doctest::skip()) {}
-TEST_CASE("test_umap_bad_output_metric_no_grad" * doctest::skip()) {}
+// --- hardening additions: callable metrics via metric="custom" --------------
+TEST_CASE("test_umap_custom_distance_w_grad") {
+    // dist1 (no gradient) -> fit warns (>= 1: the no-gradient warning);
+    // dist2 (gradient flavour) -> at most the n_neighbors truncation warning
+    // (upstream asserts len(warnings) <= 1 on nn_data[:10]).
+    std::vector<std::string> warnings;
+    umap::set_warning_handler(
+        [&warnings](const std::string& m) { warnings.push_back(m); });
+
+    {
+        UMAPParams p;
+        p.metric = "custom";
+        // dist1 = np.sum(np.abs(x - y))
+        p.custom_metric = [](const float* x, const float* y, std::size_t n) {
+            float s = 0.0f;
+            for (std::size_t i = 0; i < n; ++i) s += std::fabs(x[i] - y[i]);
+            return s;
+        };
+        p.n_epochs = 11;
+        UMAP u(p);
+        u.fit(nn_data_f32().data(), 10, kNnDim);
+        CHECK(warnings.size() >= 1);
+        bool saw_no_grad = false;
+        for (const auto& w : warnings)
+            if (w.find("custom distance metric does not return gradient") !=
+                std::string::npos)
+                saw_no_grad = true;
+        CHECK(saw_no_grad);
+    }
+
+    warnings.clear();
+    {
+        UMAPParams p;
+        p.metric = "custom";
+        // dist2 = (np.sum(np.abs(x - y)), (x - y)) -- the gradient flavour;
+        // the distance is derived from it (upstream's _dist_only wrapper).
+        p.custom_metric_grad = [](float* x, float* y, int dim, double* grad) {
+            double s = 0.0;
+            for (int i = 0; i < dim; ++i) {
+                s += std::fabs(static_cast<double>(x[i]) - y[i]);
+                grad[i] = (x[i] > y[i]) ? 1.0 : ((x[i] < y[i]) ? -1.0 : 0.0);
+            }
+            return s;
+        };
+        p.n_epochs = 11;
+        UMAP u(p);
+        u.fit(nn_data_f32().data(), 10, kNnDim);
+        CHECK(warnings.size() <= 1);
+    }
+    umap::set_warning_handler(nullptr);
+}
+
+TEST_CASE("test_umap_bad_output_metric_no_grad") {
+    // A callable output metric without the gradient flavour raises
+    // upstream's "custom output_metric must return a tuple ..." ValueError:
+    // here, output_metric="custom" with no custom_output_metric provided.
+    UMAPParams p;
+    p.output_metric = "custom";
+    check_fit_raises(p);
+}
+// -----------------------------------------------------------------------------
 
 TEST_CASE("test_umap_bad_hellinger_data") {
     // u.fit(-nn_data): the umap_.py fit guard "Metric 'hellinger' does not

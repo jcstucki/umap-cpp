@@ -286,6 +286,13 @@ void UMAP::save(std::ostream& os) const {
         throw std::runtime_error(
             "UMAP::save: standard-branch sparse fits (sparse search index) "
             "are not serialisable");
+    // --- hardening additions ------------------------------------------------
+    // std::function metrics cannot be persisted (like pickling a lambda).
+    if (params_.metric == "custom" || params_.output_metric == "custom")
+        throw std::runtime_error(
+            "UMAP::save: models using \"custom\" (std::function) metrics are "
+            "not serialisable");
+    // ------------------------------------------------------------------------
 
     std::vector<std::pair<uint32_t, std::string>> sections;
 
@@ -350,6 +357,9 @@ void UMAP::save(std::ostream& os) const {
         w_f64(s, p.target_weight);
         w_str(s, p.ensure_all_finite);
         w_u8(s, p.device == Device::GPU ? 1 : 0);
+        // hardening additions: n_jobs appended (readers treat trailing
+        // fields as optional, so files written before it still load).
+        w_i32(s, p.n_jobs);
         sections.emplace_back(kSecParams, s.str());
     }
     {  // fitted scalars
@@ -529,6 +539,9 @@ UMAP UMAP::load(std::istream& is) {
                 p.target_weight = r_f64(s);
                 p.ensure_all_finite = r_str(s);
                 p.device = r_u8(s) != 0 ? Device::GPU : Device::CPU;
+                // hardening additions: optional trailing n_jobs.
+                if (s.peek() != std::char_traits<char>::eof())
+                    p.n_jobs = r_i32(s);
                 m.params_ = std::move(p);
                 break;
             }
