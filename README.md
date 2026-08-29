@@ -174,20 +174,52 @@ A complete `find_package` consumer (C++ and C) lives in
 `UMAPParams::device = umap::Device::GPU` (CLI: `--device gpu`) routes to Metal
 kernels where they genuinely cover the computation:
 
+* **every kNN computation site** runs on a tiled exact brute-force engine
+  (one thread per query, data streamed through threadgroup-memory tiles — any
+  n, any query count; per-thread top-k registers for k ≤ 64, a
+  (dist, index)-heap for 64 < k ≤ 256);
 * the layout SGD of standard euclidean-output fits (one thread per edge,
   hogwild float32 updates — the same race semantics as numba's
-  `parallel=True`; ~9× vs the sequential CPU loop on a 5k-point benchmark);
-* exact brute-force kNN where the small-data branch (and transform) would
-  compute sklearn-replica pairwise distances, for dense euclidean/cosine with
-  `n_neighbors ≤ 64`.
+  `parallel=True`; ~9× vs the sequential CPU loop on a 5k-point benchmark).
 
-Everything else (densMAP, non-euclidean output metrics, n_epochs lists,
-transform's frozen-embedding SGD, sparse/precomputed kNN) falls back to the
-CPU port with a stderr note. GPU results are validated at embedding-quality
-level (trustworthiness parity with CPU), **not** bitwise: Metal has no
-float64, the device RNG is seeded per (edge, epoch), and hogwild updates race
-by design. Users who need seeded bit-exact parity with the Python reference
-should keep the default `Device::CPU`.
+kNN coverage by site (device=GPU; anything not covered falls back to the
+bit-exact CPU port with a stderr note):
+
+| kNN site | engine-covered metrics | otherwise |
+| --- | --- | --- |
+| dense fit, small-data branch (n < 4096) | euclidean/l2, sqeuclidean, manhattan/l1/taxicab, chebyshev/linf\*, minkowski(p), cosine, correlation, hamming, canberra, braycurtis, seuclidean(v), wminkowski(w, p), mahalanobis(Vinv) — k ≤ 256 | CPU pairwise |
+| dense fit, standard branch (n ≥ 4096) | same 13 metrics, k ≤ 256, `unique=False` — the engine's **exact** kNN graph replaces NN-descent's approximate one (recall 1.0; no search index is built) | CPU NN-descent |
+| dense transform (any n) | same 13 metrics, k ≤ 256 — exact engine kNN vs the training data, no search index needed | CPU `PreparedIndex` query |
+| sparse (CSR) fit small + standard, sparse transform | euclidean, cosine (norm-trick CSR kernel) | CPU sparse kernels / NN-descent |
+| precomputed / `precomputed_knn` | n/a (no distance computation) | — |
+| `update()`, supervised target-y kNN, `output_dens` embedding density, `inverse_transform` ranking, composites | CPU only (RandomState-stream- or bit-exactness-critical; `update()` additionally needs the NN-descent index a GPU standard fit skips, so it raises) | CPU |
+
+Discrete/object metrics, the boolean (jaccard/dice/yule/…) family, hellinger,
+and custom callables stay CPU-fallback. Under device=GPU the standard-branch
+kNN graph is **exact** rather than NN-descent-approximate — quality parity
+like the rest of GPU mode, deliberately *not* bit-identical to Python's
+approximate graph. GPU standard fits build no search index: transform runs
+its kNN on the engine directly, `save()`/`load()` round-trip (the index
+sections are optional), but `update()` raises and a saved model needs Metal
+at load-site to transform.
+
+Rough exact-kNN timings (M-series, dim 16, k 15; hidden test
+`-ns -tc="gpu knn timing*"`): GPU exact 47 ms vs CPU NN-descent 103 ms at
+n=5k, 318 ms vs 494 ms at 20k, 2087 ms vs 1408 ms at 50k. The O(n²) exact
+engine wins below n ≈ 35k *and* returns recall-1.0 graphs; well above that,
+CPU NN-descent becomes faster (at approximate recall) — device=GPU keeps the
+exact graph regardless, so for multi-hundred-k datasets where fit time
+dominates quality needs, prefer `Device::CPU`.
+
+GPU results are validated at embedding-quality level (per-metric kNN parity
+vs a float64 CPU reference at ≤ 1e-5, trustworthiness parity with CPU fits),
+**not** bitwise: kNN distances are float32 (exact ties resolve in ascending
+data-index order), Metal has no float64, the device RNG is seeded per
+(edge, epoch), and hogwild updates race by design. densMAP, non-euclidean
+output metrics, n_epochs lists and transform's frozen-embedding SGD keep
+their layout optimization on the CPU (kNN can still be GPU). Users who need
+seeded bit-exact parity with the Python reference should keep the default
+`Device::CPU`.
 
 ## Tests
 
@@ -196,9 +228,9 @@ should keep the default `Device::CPU`.
 suites generated from the real Python implementation
 (`scripts/gen_golden*.py`, `scripts/gen_upstream_fixtures.py`):
 
-* Metal build: **412 test cases / 177,095 assertions**, 0 failures
-  (23 skips: version-removed scipy metrics, upstream `@skip` mirrors,
-  typed-surface-unrepresentable cases, a hidden GPU timing case);
+* Metal build: **420 test cases / 255,185 assertions**, 0 failures
+  (24 skips: version-removed scipy metrics, upstream `@skip` mirrors,
+  typed-surface-unrepresentable cases, two hidden GPU timing cases);
 * CPU-only build: **406 cases / 174,683 assertions**, 0 failures (22 skips).
 
 `scripts/test_install.sh` additionally verifies `cmake --install`, the
