@@ -250,6 +250,51 @@ TEST_CASE("update u4 (sparse euclidean, small -> small) bit-exact") {
         CHECK(m.embedding()[static_cast<std::size_t>(i)] == u4_embedding[i]);
 }
 
+TEST_CASE("update u8 (DEFAULT n_epochs runs ZERO SGD epochs) bit-exact") {
+    // Upstream update() resolves self.n_epochs=None to n_epochs=0, which
+    // survives simplicial_set_embedding's None-only remap: every
+    // epochs_per_sample entry is -1 and the SGD loop is range(0). The
+    // update embedding is exactly the [0,10]-rescaled init (old embedding +
+    // init_update mean rows), NOT a re-optimized layout. Audit 2026-08-29
+    // (c01): the port used to map unset -> the 500-epoch default here.
+    using namespace golden_update;
+    UMAPParams p;
+    p.n_neighbors = 11;
+    p.min_dist = 0.01;
+    // n_epochs deliberately UNSET (upstream None).
+    p.init = "random";
+    p.random_state = 42;
+    p.a = ab_a;
+    p.b = ab_b;
+    UMAP m(p);
+    m.fit(u8_X, u8_n, u8_dim);
+    for (int i = 0; i < u8_n * 2; ++i)
+        CHECK(m.embedding()[static_cast<std::size_t>(i)] ==
+              u8_fit_embedding[i]);
+
+    static_assert(u8_update_n_epochs == 0,
+                  "upstream runs zero epochs for default-n_epochs update()");
+    m.update(u8_X_new, u8_n_new, u8_dim);
+    const int n_total = u8_n + u8_n_new;
+    CHECK(m.n_samples() == n_total);
+    REQUIRE(m.embedding().size() == static_cast<std::size_t>(n_total) * 2);
+    for (int i = 0; i < n_total * 2; ++i)
+        CHECK(m.embedding()[static_cast<std::size_t>(i)] ==
+              u8_upd1_embedding[i]);
+
+    // Second chained default update: another rescale + init_update on top.
+    m.update(u8_X_new2, u8_n_new2, u8_dim);
+    const int n_total2 = n_total + u8_n_new2;
+    CHECK(m.n_samples() == n_total2);
+    check_graph(m.graph(), u8_graph_indptr,
+                sizeof(u8_graph_indptr) / sizeof(u8_graph_indptr[0]),
+                u8_graph_indices, u8_graph_data,
+                sizeof(u8_graph_indices) / sizeof(u8_graph_indices[0]));
+    REQUIRE(m.embedding().size() == static_cast<std::size_t>(n_total2) * 2);
+    for (int i = 0; i < n_total2 * 2; ++i)
+        CHECK(m.embedding()[static_cast<std::size_t>(i)] == u8_embedding[i]);
+}
+
 TEST_CASE("update error cases match upstream") {
     using namespace golden_update;
     // precomputed metric -> ValueError.

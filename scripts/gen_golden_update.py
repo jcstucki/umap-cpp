@@ -282,6 +282,48 @@ out.append(carr("u7_knn_dists_new", m3._knn_dists[-15:]))
 out.append(carr("u7_embedding_tail", m3.embedding_[-60:]))
 out.append("")
 
+# ---- u8: DEFAULT n_epochs (None) fit + two chained updates --------------
+# Upstream update() maps self.n_epochs=None to n_epochs=0, and the 0
+# SURVIVES simplicial_set_embedding's None-only remap: make_epochs_per_sample
+# (graph.data, 0) returns all -1 and optimize_layout_euclidean runs
+# range(0) epochs. An update() with default n_epochs therefore performs NO
+# optimization -- the result is exactly the [0,10]-rescaled init (old
+# embedding + init_update mean-neighbour rows). Audit 2026-08-29 (c01)
+# proved the C++ used to run the full 500-epoch default here instead.
+X = make_blobs(rng, 115, 5, [[0] * 5, [5] * 5, [-5, 5, -5, 5, -5]], 1.0)
+X8, X8new = X[:90], X[90:115]
+X8new, X8new2 = X8new[:15], X8new[15:]
+m = um.UMAP(n_neighbors=11, min_dist=0.01, init="random", random_state=42,
+            a=ab_a, b=ab_b)  # n_epochs left UNSET (None)
+m.fit(X8)
+fit_emb = m.embedding_.copy()
+cap_idx = len(captured)
+m.update(X8new)
+cap = captured[cap_idx]
+assert cap["n_epochs"] == 0, cap["n_epochs"]
+assert np.array_equal(cap["init"], m.embedding_)  # zero epochs: init == out
+upd1_emb = m.embedding_.copy()
+cap_idx = len(captured)
+m.update(X8new2)
+cap2 = captured[cap_idx]
+assert cap2["n_epochs"] == 0, cap2["n_epochs"]
+out.append("// ---- u8: euclidean 90 + 15 + 10, DEFAULT (unset) n_epochs:")
+out.append("// update() runs ZERO SGD epochs upstream (None -> 0 survives")
+out.append("// simplicial_set_embedding); embeddings are the rescaled inits.")
+out.append("static const int u8_n = 90;")
+out.append("static const int u8_n_new = 15;")
+out.append("static const int u8_n_new2 = 10;")
+out.append("static const int u8_dim = 5;")
+out.append(carr("u8_X", X8))
+out.append(carr("u8_X_new", X8new))
+out.append(carr("u8_X_new2", X8new2))
+out.append(carr("u8_fit_embedding", fit_emb))
+out.append("static const int u8_update_n_epochs = %d;" % cap["n_epochs"])
+out.append(carr("u8_upd1_embedding", upd1_emb))
+emit_graph("u8", m.graph_)
+out.append(carr("u8_embedding", m.embedding_))
+out.append("")
+
 out.append("}  // namespace golden_update")
 print("\n".join(out))
 print("captures: %d" % len(captured), file=sys.stderr)

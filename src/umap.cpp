@@ -3631,12 +3631,19 @@ UMAP& UMAP::update_impl(const float* X_new, const int32_t* new_indptr,
                      init_knn_cols);
 
     // n_epochs = 0 if self.n_epochs is None else self.n_epochs, handed to
-    // simplicial_set_embedding (0 -> the 500/200 default); the epoch filter
-    // writes through into graph_ via the shared-buffer quirk, as in fit.
+    // simplicial_set_embedding. The 0 SURVIVES there (only None is remapped
+    // to the 500/200 default), so make_epochs_per_sample(graph.data, 0)
+    // returns all -1 and the SGD loop is range(0): an update() with unset
+    // n_epochs performs NO optimization -- the result is exactly the
+    // [0,10]-rescaled init (old embedding + init_update mean rows). The
+    // weight filter still runs (n_epochs_max=0 is not > 10, so it thresholds
+    // by default_epochs) and writes through into graph_ via the
+    // shared-buffer quirk, as in fit. (Audit 2026-08-29, c01: the previous
+    // value_or(-1) resolved unset to a full 500-epoch SGD run.)
     SparseMatrix g = graph_;
     const std::vector<int>* epochs_list =
         params_.n_epochs_list.has_value() ? &*params_.n_epochs_list : nullptr;
-    int requested_epochs = params_.n_epochs.value_or(-1);
+    int requested_epochs = params_.n_epochs.value_or(0);
     if (epochs_list != nullptr) {
         requested_epochs =
             *std::max_element(epochs_list->begin(), epochs_list->end());
