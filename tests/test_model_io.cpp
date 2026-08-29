@@ -167,7 +167,8 @@ TEST_CASE("densmap + output_dens extras round trip") {
     check_graph_equal(loaded.graph_dists(), model.graph_dists());
 }
 
-TEST_CASE("sparse small-data fit round trips; sparse standard fit refuses") {
+TEST_CASE("sparse small-data fit round trips; sparse standard fit round "
+          "trips (SparsePreparedIndex)") {
     // ~35% dense random CSR, euclidean.
     const int n = 100, dim = 20;
     TestRng rng(2026);
@@ -204,14 +205,27 @@ TEST_CASE("sparse small-data fit round trips; sparse standard fit refuses") {
         loaded.transform(indptr.data(), indices.data(), data.data(), 30),
         model.transform(indptr.data(), indices.data(), data.data(), 30));
 
-    // The standard sparse branch keeps a SparsePreparedIndex, which the
-    // format does not cover: save must refuse.
+    // --- hardening additions ------------------------------------------------
+    // The standard sparse branch keeps a SparsePreparedIndex; the format
+    // covers it (section 11), and the loaded model's query-backed transform
+    // is bit-exact against the in-memory model.
     umap::UMAPParams pf = p;
     pf.force_approximation_algorithm = true;
     umap::UMAP forced(pf);
     forced.fit(indptr.data(), indices.data(), data.data(), n, dim);
-    std::ostringstream sink;
-    CHECK_THROWS_AS(forced.save(sink), std::runtime_error);
+    CHECK(!forced.small_data());
+
+    const umap::UMAP floaded = roundtrip(forced);
+    CHECK(floaded.sparse_data());
+    CHECK(!floaded.small_data());
+    check_vec_equal(floaded.embedding(), forced.embedding());
+    check_graph_equal(floaded.graph(), forced.graph());
+    // 30 query rows exercise SparsePreparedIndex::query (tree descent +
+    // search-graph expansion) on the deserialised state.
+    check_vec_equal(
+        floaded.transform(indptr.data(), indices.data(), data.data(), 30),
+        forced.transform(indptr.data(), indices.data(), data.data(), 30));
+    // ------------------------------------------------------------------------
 }
 
 TEST_CASE("format validation: magic, version, truncation, unfitted") {

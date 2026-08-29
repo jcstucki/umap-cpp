@@ -2034,10 +2034,15 @@ UMAP& UMAP::fit_impl(const float* X, int64_t n_samples, int64_t n_features,
             // --- supervised-sparse additions --------------------------------
             // Sparse NN-descent (continuing the numpy RandomState stream)
             // with the prepared sparse search index kept for transform().
+            // hardening additions: metric_kwds.p forwarded (upstream passes
+            // self._metric_kwds into nearest_neighbors/NNDescent).
+            spdist::SparseMetricKwds skwds;
+            skwds.p = params_.metric_kwds.p;
             sparse_knn_index_ = std::make_shared<spnnd::SparsePreparedIndex>(
                 spnnd::SparsePreparedIndex::build(
                     sp_indptr, sp_indices, sp_values, n_index, n_features,
-                    n_neighbors_, params_.metric, rs, params_.verbose));
+                    n_neighbors_, params_.metric, rs, params_.verbose,
+                    skwds));
             knn_indices_ = sparse_knn_index_->knn_indices();
             knn_dists_ = sparse_knn_index_->knn_dists();
             knn_cols_ = n_neighbors_;
@@ -3415,12 +3420,15 @@ UMAP& UMAP::update_impl(const float* X_new, const int32_t* new_indptr,
             // search index continuing this (transform_seed) stream.
             small_data_ = false;
             if (sparse_data_) {
+                // hardening additions: metric_kwds.p forwarded like fit.
+                spdist::SparseMetricKwds skwds;
+                skwds.p = params_.metric_kwds.p;
                 sparse_knn_index_ =
                     std::make_shared<spnnd::SparsePreparedIndex>(
                         spnnd::SparsePreparedIndex::build(
                             raw_indptr_.data(), raw_indices_.data(),
                             raw_values_.data(), n_total, dim_, n_neighbors_,
-                            params_.metric, rs, params_.verbose));
+                            params_.metric, rs, params_.verbose, skwds));
                 knn_indices_ = sparse_knn_index_->knn_indices();
                 knn_dists_ = sparse_knn_index_->knn_dists();
             } else {
@@ -3587,9 +3595,15 @@ MembershipStrengths UMAP::transform_membership_sparse(
         }
         cols = params_.n_neighbors;
         // epsilon = 0.24 if self._knn_search_index._angular_trees else 0.12.
+        // hardening additions: dim_/kwds bound so n_features-requiring
+        // metric names (hamming etc.) resolve instead of throwing.
+        spdist::SparseMetricKwds skwds;
+        skwds.p = params_.metric_kwds.p;
         const double epsilon =
-            spdist::resolve_sparse_metric(params_.metric).angular_trees ? 0.24
-                                                                        : 0.12;
+            spdist::resolve_sparse_metric(params_.metric, dim_, skwds)
+                    .angular_trees
+                ? 0.24
+                : 0.12;
         indices.resize(static_cast<std::size_t>(n_queries) * cols);
         dists.resize(static_cast<std::size_t>(n_queries) * cols);
         sparse_knn_index_->query(q_indptr, q_indices, q_data, n_queries, cols,

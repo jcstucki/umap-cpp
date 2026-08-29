@@ -31,11 +31,15 @@
 //   10 rng bookkeeping  index_rs_ (the persisted numpy RandomState stream
 //                       NNDescent.update() continues), as
 //                       NumpyRandomState::save_state() text
+//   11 sparse prepared  full SparsePreparedIndex state (hardening
+//      index            additions; present iff the fit kept a sparse search
+//                       index); the sparse metric closure is rebuilt from
+//                       params (dim binds n_features metrics) at load
 //
-// Standard-branch *sparse* fits are rejected (SparsePreparedIndex is not
-// serialised); everything else a fit can produce round-trips, including
-// small-data sparse fits, densmap/output_dens radii, n_epochs_list snapshots
-// and composite-operator results.
+// Everything a fit can produce round-trips -- dense and sparse (small-data
+// AND standard-branch), densmap/output_dens radii, n_epochs_list snapshots
+// and composite-operator results -- except models with "custom"
+// (std::function) metrics, which throw at save().
 // -----------------------------------------------------------------------------
 #include <cstdint>
 #include <cstring>
@@ -49,6 +53,7 @@
 #include <vector>
 
 #include "umap/nn_descent.hpp"
+#include "umap/sparse_nn_descent.hpp"  // hardening additions
 #include "umap/umap.hpp"
 
 namespace umap {
@@ -199,6 +204,7 @@ enum : uint32_t {
     kSecExtras = 8,
     kSecPreparedIndex = 9,
     kSecRng = 10,
+    kSecSparsePreparedIndex = 11,  // hardening additions
 };
 
 }  // namespace
@@ -265,6 +271,73 @@ PreparedIndex PreparedIndex::deserialize(std::istream& is,
 
 }  // namespace nnd
 
+// --- hardening additions -----------------------------------------------------
+// ------------------------------------- SparsePreparedIndex persistence
+
+namespace spnnd {
+
+void SparsePreparedIndex::serialize(std::ostream& os) const {
+    w_i64(os, n_);
+    w_i64(os, dim_);
+    w_i64(os, n_neighbors_);
+    w_vec(os, data_indptr_);
+    w_vec(os, data_indices_);
+    w_vec(os, data_data_);
+    w_vec(os, vertex_order_);
+    w_vec(os, search_graph_.indptr);
+    w_vec(os, search_graph_.indices);
+    w_f32(os, search_graph_.min_distance);
+    // SparseFlatTree: per-node trimmed hyperplanes are vectors-of-vectors.
+    w_i64(os, tree_.n_nodes);
+    w_u64(os, tree_.hyperplane_inds.size());
+    for (const auto& v : tree_.hyperplane_inds) w_vec(os, v);
+    w_u64(os, tree_.hyperplane_data.size());
+    for (const auto& v : tree_.hyperplane_data) w_vec(os, v);
+    w_vec(os, tree_.offsets);
+    w_vec(os, tree_.children);
+    w_vec(os, tree_.indices);
+    for (int64_t s : search_rng_state_) w_i64(os, s);
+    w_vec(os, knn_indices_);
+    w_vec(os, knn_dists_);
+}
+
+SparsePreparedIndex SparsePreparedIndex::deserialize(
+    std::istream& is, const std::string& metric,
+    const spdist::SparseMetricKwds& kwds) {
+    SparsePreparedIndex ix;
+    ix.n_ = r_i64(is);
+    ix.dim_ = r_i64(is);
+    ix.n_neighbors_ = r_i64(is);
+    ix.data_indptr_ = r_vec<int32_t>(is);
+    ix.data_indices_ = r_vec<int32_t>(is);
+    ix.data_data_ = r_vec<float>(is);
+    ix.vertex_order_ = r_vec<int32_t>(is);
+    ix.search_graph_.indptr = r_vec<int32_t>(is);
+    ix.search_graph_.indices = r_vec<int32_t>(is);
+    ix.search_graph_.min_distance = r_f32(is);
+    ix.tree_.n_nodes = r_i64(is);
+    const uint64_t n_hi = r_u64(is);
+    ix.tree_.hyperplane_inds.resize(static_cast<std::size_t>(n_hi));
+    for (auto& v : ix.tree_.hyperplane_inds) v = r_vec<int32_t>(is);
+    const uint64_t n_hd = r_u64(is);
+    ix.tree_.hyperplane_data.resize(static_cast<std::size_t>(n_hd));
+    for (auto& v : ix.tree_.hyperplane_data) v = r_vec<float>(is);
+    ix.tree_.offsets = r_vec<float>(is);
+    ix.tree_.children = r_vec<int32_t>(is);
+    ix.tree_.indices = r_vec<int32_t>(is);
+    for (int64_t& s : ix.search_rng_state_) s = r_i64(is);
+    ix.knn_indices_ = r_vec<int32_t>(is);
+    ix.knn_dists_ = r_vec<float>(is);
+    // The distance closure is not stored; rebuild it exactly as build() did
+    // (dim binds pynndescent's sparse_need_n_features metrics, kwds.p
+    // minkowski).
+    ix.metric_ = spdist::resolve_sparse_metric(metric, ix.dim_, kwds);
+    return ix;
+}
+
+}  // namespace spnnd
+// -----------------------------------------------------------------------------
+
 // --------------------------------------------------------- UMAP persistence
 
 namespace {
@@ -282,10 +355,6 @@ void UMAP::save(std::ostream& os) const {
     require_little_endian();
     if (!fitted_)
         throw std::runtime_error("UMAP::save: model is not fitted");
-    if (sparse_knn_index_)
-        throw std::runtime_error(
-            "UMAP::save: standard-branch sparse fits (sparse search index) "
-            "are not serialisable");
     // --- hardening additions ------------------------------------------------
     // std::function metrics cannot be persisted (like pickling a lambda).
     if (params_.metric == "custom" || params_.output_metric == "custom")
@@ -428,6 +497,11 @@ void UMAP::save(std::ostream& os) const {
         knn_index_->serialize(s);
         sections.emplace_back(kSecPreparedIndex, s.str());
     }
+    if (sparse_knn_index_) {  // hardening additions: sparse search index
+        std::ostringstream s;
+        sparse_knn_index_->serialize(s);
+        sections.emplace_back(kSecSparsePreparedIndex, s.str());
+    }
     if (index_rs_.has_value()) {  // persisted RandomState stream
         std::ostringstream s;
         w_str(s, index_rs_->save_state());
@@ -473,6 +547,7 @@ UMAP UMAP::load(std::istream& is) {
     UMAP m;
     bool pknn_had_search_index = false;
     std::string prepared_payload;  // parsed after params (needs the metric)
+    std::string sparse_prepared_payload;  // hardening additions: idem
     for (uint32_t si = 0; si < n_sections; ++si) {
         const uint32_t id = r_u32(is);
         const uint64_t nbytes = r_u64(is);
@@ -604,10 +679,15 @@ UMAP UMAP::load(std::istream& is) {
             case kSecRng:
                 m.index_rs_ = nnd::NumpyRandomState::from_state(r_str(s));
                 break;
+            case kSecSparsePreparedIndex:
+                // hardening additions: deferred like the dense index.
+                sparse_prepared_payload = payload;
+                break;
             default:
                 break;  // forward compatibility: skip unknown sections
         }
-        if (id != kSecPreparedIndex && s.fail())
+        if (id != kSecPreparedIndex && id != kSecSparsePreparedIndex &&
+            s.fail())
             throw std::runtime_error(
                 "UMAP model file: truncated section " + std::to_string(id));
     }
@@ -620,6 +700,16 @@ UMAP UMAP::load(std::istream& is) {
         if (m.params_.precomputed_knn.has_value() && pknn_had_search_index)
             m.params_.precomputed_knn->search_index = m.knn_index_;
     }
+    // --- hardening additions ------------------------------------------------
+    if (!sparse_prepared_payload.empty()) {
+        std::istringstream s(sparse_prepared_payload);
+        spdist::SparseMetricKwds skwds;
+        skwds.p = m.params_.metric_kwds.p;
+        m.sparse_knn_index_ = std::make_shared<spnnd::SparsePreparedIndex>(
+            spnnd::SparsePreparedIndex::deserialize(s, m.params_.metric,
+                                                    skwds));
+    }
+    // ------------------------------------------------------------------------
     m.fitted_ = true;
     return m;
 }
