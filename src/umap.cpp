@@ -33,6 +33,7 @@
 #ifdef UMAP_ENABLE_METAL
 #include "umap/metal/gpu_knn.hpp"
 #include "umap/metal/gpu_layout.hpp"  // gpu-transform additions
+#include "umap/metal/gpu_nnd.hpp"     // gpu-nnd additions
 #endif
 // -----------------------------------------------------------------------------
 
@@ -2640,7 +2641,10 @@ UMAP& UMAP::fit_impl(const float* X, int64_t n_samples, int64_t n_features,
             // (recall 1.0 >= NN-descent's, so this is quality-parity like
             // the rest of GPU mode -- NOT bit-identical to Python's
             // approximate graph; the numpy RandomState also skips
-            // NN-descent's draws). No search index is built: device=GPU
+            // NN-descent's draws). gpu-nnd additions: above the exact
+            // engine's measured crossover (metal::kGpuNndCrossoverN) dense
+            // fits switch to the GPU NN-descent engine — see the block
+            // below. No search index is built: device=GPU
             // transforms run their kNN on the engine directly, but update()
             // then raises (it needs the NN-descent index) and a model loaded
             // where Metal is unavailable cannot transform. unique=True stays
@@ -2665,6 +2669,38 @@ UMAP& UMAP::fit_impl(const float* X, int64_t n_samples, int64_t n_features,
                     knn_dists_.assign(
                         static_cast<std::size_t>(n_index) * n_neighbors_,
                         0.0f);
+                    // --- gpu-nnd additions ------------------------------
+                    // Above the exact engine's O(n^2) crossover the dense
+                    // self-kNN runs on the GPU NN-descent engine instead
+                    // (approximate graph at NN-descent recall — the same
+                    // trade the CPU standard branch makes; the reverse-
+                    // sampling races additionally make repeated GPU
+                    // NN-descent fits non-bit-identical to each other).
+                    // gpu_knn_mode: exact below kGpuNndCrossoverN or for
+                    // metrics/k the descent kernels do not cover;
+                    // $UMAP_GPU_KNN_MODE=exact|nnd overrides. A false
+                    // return (no device / oversize buffers) falls through
+                    // to the exact engine, then to the CPU note.
+                    if (!sparse_data_ &&
+                        metal::gpu_knn_mode(static_cast<int>(n_index),
+                                            static_cast<int>(n_neighbors_),
+                                            gpu_metric) ==
+                            metal::GpuKnnMode::nnd) {
+                        const uint64_t nnd_seed =
+                            params_.random_state.has_value()
+                                ? static_cast<uint64_t>(
+                                      *params_.random_state)
+                                : static_cast<uint64_t>(
+                                      std::random_device{}());
+                        gpu_knn_done = metal::gpu_nn_descent_knn(
+                            X_indexed, static_cast<int>(n_index),
+                            static_cast<int>(n_features),
+                            static_cast<int>(n_neighbors_), gpu_metric,
+                            nnd_seed, knn_indices_.data(),
+                            knn_dists_.data());
+                    }
+                    if (!gpu_knn_done)
+                    // ----------------------------------------------------
                     gpu_knn_done =
                         sparse_data_
                             ? metal::gpu_sparse_brute_force_knn(
