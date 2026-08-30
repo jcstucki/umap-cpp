@@ -262,8 +262,8 @@ bit-exact CPU port with a stderr note):
 | kNN site | engine-covered metrics | otherwise |
 | --- | --- | --- |
 | dense fit, small-data branch (n < 4096) | euclidean/l2, sqeuclidean, manhattan/l1/taxicab, chebyshev/linf\*, minkowski(p), cosine, correlation, hamming, canberra, braycurtis, seuclidean(v), wminkowski(w, p), mahalanobis(Vinv) — k ≤ 256 | CPU pairwise |
-| dense fit, standard branch (4096 ≤ n ≤ 30k) | same 13 metrics, k ≤ 256, `unique=False` — the engine's **exact** kNN graph replaces NN-descent's approximate one (recall 1.0; no search index is built) | CPU NN-descent |
-| dense fit, standard branch (n > 30k) | euclidean/l2, sqeuclidean, manhattan, cosine, k ≤ 64, `unique=False` — **GPU NN-descent** (host RP-forest init + on-device descent; recall ≈ CPU NN-descent's to ~1e-4, see below); other engine metrics / 64 < k ≤ 256 stay on the exact GPU engine at any n | CPU NN-descent |
+| dense fit, standard branch (4096 ≤ n ≤ 100k) | same 13 metrics, k ≤ 256, `unique=False` — the engine's **exact** kNN graph replaces NN-descent's approximate one (recall 1.0; no search index is built) | CPU NN-descent |
+| dense fit, standard branch (n > 100k) | euclidean/l2, sqeuclidean, manhattan, cosine, k ≤ 64, `unique=False` — **GPU NN-descent** (host RP-forest init + on-device descent; recall ≈ CPU NN-descent's to ~1e-4, see below); other engine metrics / 64 < k ≤ 256 stay on the exact GPU engine at any n | CPU NN-descent |
 | dense transform (any n) | same 13 metrics, k ≤ 256 — exact engine kNN vs the training data, no search index needed | CPU `PreparedIndex` query |
 | sparse (CSR) fit small + standard, sparse transform | euclidean, cosine (norm-trick CSR kernel) | CPU sparse kernels / NN-descent |
 | precomputed / `precomputed_knn` | n/a (no distance computation) | — |
@@ -271,7 +271,7 @@ bit-exact CPU port with a stderr note):
 
 Discrete/object metrics, the boolean (jaccard/dice/yule/…) family, hellinger,
 and custom callables stay CPU-fallback. Under device=GPU the standard-branch
-kNN graph is **exact** up to n = 30k and **GPU NN-descent** above — quality
+kNN graph is **exact** up to n = 100k and **GPU NN-descent** above — quality
 parity like the rest of GPU mode, deliberately *not* bit-identical to
 Python's approximate graph (and, uniquely on the GPU-NN-descent leg,
 not bit-identical between two runs either: reverse-candidate sampling
@@ -281,23 +281,29 @@ n (exact, O(n_q·n)), `save()`/`load()` round-trip (the index sections are
 optional), but `update()` raises and a saved model needs Metal at load-site
 to transform.
 
-kNN timings (M-series, dim 16, k 15; hidden tests `-ns -tc="gpu knn
-timing*"` / `-tc="gpu nnd timing*"`, remeasured 2026-08-29 after the
-watchdog fix below):
+kNN timings (M1 Max 32-core, k 15; hidden tests `-ns -tc="gpu knn
+crossover timing*"`, remeasured 2026-08-30 after the P1 kernel rewrite — the
+register-blocked decomposable-metric fast body, ~16–18× over the old scalar
+engine):
 
-| n | GPU NN-descent | GPU exact | CPU NN-descent | GPU-nnd recall (CPU-nnd) |
-| --- | --- | --- | --- | --- |
-| 20k | 140 ms | 307 ms | 450 ms | 0.9975 (0.9976) |
-| 50k | 407 ms | 2251 ms | 1270 ms | 0.9952 (0.9952) |
-| 100k | 968 ms | 8963 ms | 3000 ms | 0.9931 (0.9932) |
+| n | GPU exact (dim 16) | GPU nnd (dim 16) | GPU exact (dim 64) | GPU nnd (dim 64) | nnd recall (16 / 64) |
+| --- | --- | --- | --- | --- | --- |
+| 20k | 35 ms | 143 ms | 74 ms | 507 ms | 0.997 / 0.973 |
+| 30k | 51 ms | 214 ms | 187 ms | 818 ms | 0.997 / 0.959 |
+| 50k | 147 ms | ~385 ms | ~720 ms | ~1530 ms | 0.995 / 0.934 |
+| 100k | ~520 ms | ~990 ms | ~2650 ms | ~3880 ms | 0.993 / 0.893 |
 
-The auto crossover (`umap::metal::kGpuNndCrossoverN` = 30000) keeps the
-exact engine below 30k, where its absolute cost is modest and it returns
-recall-1.0 graphs — strictly better than the CPU standard branch — and
-switches to GPU NN-descent above, where the O(n²) term dominates (≥ ~3× the
-descent and growing) for a ≤ ~0.7% recall difference; the descent's recall
-tracks the bit-exact CPU NN-descent port's to ~1e-4 at every measured size.
-`UMAP_GPU_KNN_MODE=exact|nnd` overrides the mode for experiments. (The
+The rewritten exact engine is now faster than GPU NN-descent at **every**
+measured size and both dims through 100k — while still returning recall-1.0
+graphs — so the auto crossover (`umap::metal::kGpuNndCrossoverN`) moves from
+30000 to **100000**: exact owns the whole measured range, NN-descent takes
+over only in the truly-large, unmeasured regime where the exact engine's O(n²)
+term must eventually overtake the descent's ~O(n log n) (it has not by 100k on
+either dim) and beyond a single Metal buffer. The descent's recall still
+tracks the bit-exact CPU NN-descent port's to ~1e-4 at each size (it falls off
+with dim/n as shown, which the exact engine sidesteps entirely below the
+crossover). `UMAP_GPU_KNN_MODE=exact|nnd` overrides the mode for experiments.
+(The
 2026-08-29 gpu-nnd pass also fixed a silent-corruption hazard in the exact
 engine: monolithic multi-second dispatches at n ≈ 100k were sporadically
 aborted by the macOS GPU watchdog and returned zero-filled buffers unnoticed

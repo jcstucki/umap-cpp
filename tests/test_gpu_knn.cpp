@@ -25,6 +25,7 @@
 #include "umap/device.hpp"
 #include "umap/distances.hpp"
 #include "umap/metal/gpu_knn.hpp"
+#include "umap/metal/gpu_nnd.hpp"
 #include "umap/nn_descent.hpp"
 #include "umap/umap.hpp"
 
@@ -961,6 +962,39 @@ TEST_CASE("gpu-knn fallback: uncovered metric/k under device=GPU is "
 }
 
 // ---------------------------------------------------------------------------
+// Large-tile parity: 50k x 64, k=15 (the PERF_BASELINE.md P1 flagship shape)
+// vs the float64 CPU reference on a query subsample (gpu-knn-gemm pass).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("gpu knn engine: large-tile parity 50k x 64 (k=15, subsampled)") {
+    METAL_REQUIRED();
+    const int n = 50000, dim = 64, k = 15;
+    const auto data = random_matrix(n, dim, 0x50C4);
+    std::vector<int> rows;
+    for (int i = 0; i < n; i += 331) rows.push_back(i);  // 152 query rows
+
+    std::vector<int32_t> gpu_idx(static_cast<std::size_t>(n) * k);
+    std::vector<float> gpu_dist(static_cast<std::size_t>(n) * k);
+    ENGINE_REQUIRE_OR_SKIP(umap::metal::gpu_brute_force_knn(
+        data.data(), n, dim, data.data(), n, k,
+        umap::metal::KnnMetric::euclidean, gpu_idx.data(), gpu_dist.data()));
+    // Self-kNN sanity across the whole output: self first, ascending rows.
+    for (int i = 0; i < n; i += 97) {
+        CHECK(gpu_idx[static_cast<std::size_t>(i) * k] == i);
+        CHECK(gpu_dist[static_cast<std::size_t>(i) * k] == 0.0f);
+        for (int m = 1; m < k; ++m)
+            CHECK(gpu_dist[static_cast<std::size_t>(i) * k + m] >=
+                  gpu_dist[static_cast<std::size_t>(i) * k + m - 1]);
+    }
+    std::vector<int32_t> cpu_idx;
+    std::vector<float> cpu_dist;
+    cpu_knn_ref(data.data(), n, dim, data.data(), n, k,
+                RefFn(umap::euclidean), rows, cpu_idx, cpu_dist);
+    check_rows_match(data.data(), dim, data.data(), k, RefFn(umap::euclidean),
+                     rows, cpu_idx, cpu_dist, gpu_idx, gpu_dist);
+}
+
+// ---------------------------------------------------------------------------
 // Rough timing: GPU exact engine vs CPU NN-descent (hidden by default; run
 // with `./umap_tests -ns -tc="gpu knn timing*"`).
 // ---------------------------------------------------------------------------
@@ -990,5 +1024,128 @@ TEST_CASE("gpu knn timing: exact engine vs CPU NN-descent"
         const auto t2 = clock::now();
         MESSAGE("n=" << n << ": GPU exact " << ms(t1 - t0)
                      << " ms, CPU NN-descent " << ms(t2 - t1) << " ms");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// gpu-knn-gemm additions: P1 before/after cells and the exact-vs-NND
+// crossover matrix (hidden; `-ns -tc="gpu knn gemm timing*"` and
+// `-ns -tc="gpu knn crossover timing*"`).
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// 10 gaussian blobs (bench/gen_data.py shape): clustered data so the NND
+// side of the crossover measurement sees realistic neighbourhood structure.
+std::vector<float> blob_matrix(int n, int dim, uint64_t seed) {
+    TestRng rng(seed);
+    std::vector<float> centers(static_cast<std::size_t>(10) * dim);
+    for (auto& v : centers) v = static_cast<float>(20.0 * rng.next());
+    std::vector<float> m(static_cast<std::size_t>(n) * dim);
+    for (int i = 0; i < n; ++i) {
+        const int c = i % 10;
+        for (int d = 0; d < dim; ++d)
+            m[static_cast<std::size_t>(i) * dim + d] =
+                centers[static_cast<std::size_t>(c) * dim + d] +
+                static_cast<float>(rng.normal());
+    }
+    return m;
+}
+
+template <typename Fn>
+long long median_ms_of_3(Fn&& fn) {
+    using clock = std::chrono::steady_clock;
+    std::array<long long, 3> t{};
+    for (int rep = 0; rep < 3; ++rep) {
+        const auto t0 = clock::now();
+        if (!fn()) return -1;
+        t[static_cast<std::size_t>(rep)] =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                clock::now() - t0)
+                .count();
+    }
+    std::sort(t.begin(), t.end());
+    return t[1];
+}
+
+}  // namespace
+
+TEST_CASE("gpu knn gemm timing: exact engine at the P1 cells (10k/50k x 64)"
+          * doctest::skip()) {
+    METAL_REQUIRED();
+    const int k = 15;
+    // Warm up device/pipeline creation outside the timed region.
+    {
+        const auto w = random_matrix(256, 64, 1);
+        std::vector<int32_t> wi(static_cast<std::size_t>(256) * k);
+        std::vector<float> wd(static_cast<std::size_t>(256) * k);
+        ENGINE_REQUIRE_OR_SKIP(umap::metal::gpu_brute_force_knn(
+            w.data(), 256, 64, w.data(), 256, k,
+            umap::metal::KnnMetric::euclidean, wi.data(), wd.data()));
+    }
+    for (const int n : {10000, 50000}) {
+        const int dim = 64;
+        const auto data = random_matrix(n, dim, 4242);
+        std::vector<int32_t> idx(static_cast<std::size_t>(n) * k);
+        std::vector<float> dst(static_cast<std::size_t>(n) * k);
+        const long long t = median_ms_of_3([&] {
+            return umap::metal::gpu_brute_force_knn(
+                data.data(), n, dim, data.data(), n, k,
+                umap::metal::KnnMetric::euclidean, idx.data(), dst.data());
+        });
+        REQUIRE(t >= 0);
+        const double gflop = 2.0 * n * double(n) * dim / 1e9;
+        MESSAGE("n=" << n << " dim=" << dim << ": GPU exact " << t
+                     << " ms (distance-flop rate "
+                     << gflop / (static_cast<double>(t) / 1e3)
+                     << " GFLOP/s)");
+    }
+}
+
+TEST_CASE("gpu knn crossover timing: exact vs GPU NN-descent "
+          "(20k/30k/50k/100k x 16/64)" * doctest::skip()) {
+    METAL_REQUIRED();
+    const int k = 15;
+    for (const int dim : {16, 64}) {
+        for (const int n : {20000, 30000, 50000, 100000}) {
+            const auto X = blob_matrix(n, dim, 0xB10B + n + dim);
+            std::vector<int32_t> eidx(static_cast<std::size_t>(n) * k);
+            std::vector<float> edst(static_cast<std::size_t>(n) * k);
+            std::vector<int32_t> nidx(static_cast<std::size_t>(n) * k);
+            std::vector<float> ndst(static_cast<std::size_t>(n) * k);
+            const long long te = median_ms_of_3([&] {
+                return umap::metal::gpu_brute_force_knn(
+                    X.data(), n, dim, X.data(), n, k,
+                    umap::metal::KnnMetric::euclidean, eidx.data(),
+                    edst.data());
+            });
+            const long long tn = median_ms_of_3([&] {
+                return umap::metal::gpu_nn_descent_knn(
+                    X.data(), n, dim, k, umap::metal::KnnMetric::euclidean,
+                    42, nidx.data(), ndst.data());
+            });
+            REQUIRE(te >= 0);
+            REQUIRE(tn >= 0);
+            // recall of the descent graph vs the exact graph
+            std::size_t hit = 0;
+            for (int i = 0; i < n; ++i) {
+                for (int m = 0; m < k; ++m) {
+                    const int32_t want =
+                        eidx[static_cast<std::size_t>(i) * k + m];
+                    for (int m2 = 0; m2 < k; ++m2) {
+                        if (nidx[static_cast<std::size_t>(i) * k + m2] ==
+                            want) {
+                            ++hit;
+                            break;
+                        }
+                    }
+                }
+            }
+            const double recall =
+                static_cast<double>(hit) / (static_cast<double>(n) * k);
+            MESSAGE("n=" << n << " dim=" << dim << ": exact " << te
+                         << " ms, GPU nnd " << tn << " ms (recall " << recall
+                         << ")");
+        }
     }
 }

@@ -390,12 +390,19 @@ TEST_CASE("gpu nnd routing: device=GPU fits — exact below the crossover, "
 // End-to-end: large-n device=GPU fit lands on the descent engine
 // ---------------------------------------------------------------------------
 
-TEST_CASE("gpu-nnd e2e: 40k device=GPU fit (auto -> nn-descent) reaches "
+TEST_CASE("gpu-nnd e2e: 40k device=GPU fit (forced -> nn-descent) reaches "
           "CPU-NN-descent-comparable trustworthiness") {
     METAL_REQUIRED();
     const int n = 40000, dim = 8, k = 10;
     const int nq = 60;  // transform leg below: same centers, tail rows
-    REQUIRE(n > umap::metal::kGpuNndCrossoverN);  // auto mode routes to nnd
+    // The gpu-knn-gemm P1 kernel rewrite pushed kGpuNndCrossoverN past 40k
+    // (the exact engine now out-runs GPU NN-descent through 100k), so auto
+    // mode routes 40k to the exact engine. Force the descent engine to keep
+    // exercising it end-to-end at this size; the routing decision itself is
+    // covered by the "gpu-nnd routing" case above.
+    EnvGuard force_nnd("UMAP_GPU_KNN_MODE", "nnd");
+    REQUIRE(umap::metal::gpu_knn_mode(n, k, umap::metal::KnnMetric::euclidean) ==
+            umap::metal::GpuKnnMode::nnd);
     const auto X = mixture_data(n + nq, dim, 0x40C4FE, 6);
 
     umap::UMAPParams p;
