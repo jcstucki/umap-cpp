@@ -2864,10 +2864,10 @@ UMAP& UMAP::fit_impl(const float* X, int64_t n_samples, int64_t n_features,
         // requires Device::CPU (the default).
         Device sgd_device = Device::CPU;
         if (params_.device == Device::GPU) {
+            // densmap-gpu additions: densMAP now runs on the Metal kernel too
+            // (sgd_epoch_densmap; per-epoch reductions host-side).
             const char* cpu_reason = nullptr;
-            if (params_.densmap)
-                cpu_reason = "densmap is CPU-only";
-            else if (!euclidean_output)
+            if (!euclidean_output)
                 cpu_reason = "non-euclidean output metrics are CPU-only";
             else if (epochs_list != nullptr)
                 cpu_reason =

@@ -14,13 +14,20 @@
 //   zero-norm special cases, evaluated in float32 (the CPU reference uses
 //   float64), so distances agree to ~1e-5 and indices up to genuine ties.
 //
-// Kernel 2: sgd_epoch — one epoch of optimize_layout_euclidean
-//   (layouts.py::_optimize_layout_euclidean_single_epoch, densmap off):
-//   one thread per 1-simplex (edge), hogwild-style unsynchronized float32
-//   updates on the embedding buffer(s). numba's prange(parallel=True) path has
-//   exactly the same race semantics (unsequenced racy f4 loads/stores), so this
-//   is a faithful *parallel-semantics* port; bit-exactness vs the sequential
-//   CPU path is neither possible nor required.
+// Kernel 2: sgd_epoch / sgd_epoch_densmap — one epoch of
+//   optimize_layout_euclidean (layouts.py::_optimize_layout_euclidean_single_
+//   epoch): one thread per 1-simplex (edge), hogwild-style unsynchronized
+//   float32 updates on the embedding buffer(s). numba's prange(parallel=True)
+//   path has exactly the same race semantics (unsequenced racy f4 loads/
+//   stores), so this is a faithful *parallel-semantics* port; bit-exactness vs
+//   the sequential CPU path is neither possible nor required. sgd_epoch_densmap
+//   (densmap-gpu additions) adds the per-edge density gradient correction of
+//   the densmap_flag branch; the per-epoch scalars (re_std/re_mean/re_cov/
+//   mu_tot) and the epoch-init reductions are computed HOST-side between
+//   epochs (see src/metal/gpu_layout.cpp) and arrive via DensSgdParams plus
+//   the mu/R/phi_sum/re_sum buffers. move_other=false (transform's frozen
+//   tail embedding) is a runtime flag: tail rows are then never written, so
+//   only same-head-vertex updates can race.
 //
 // Deviations from the CPU (sequential numba) path — all documented host-side
 // in include/umap/metal/gpu_layout.hpp too:
@@ -536,16 +543,42 @@ struct SgdParams {
     long rng2;
 };
 
-kernel void sgd_epoch(device float* head_embedding [[buffer(0)]],
-                      device float* tail_embedding [[buffer(1)]],
-                      device const int* head [[buffer(2)]],
-                      device const int* tail [[buffer(3)]],
-                      device const float* epochs_per_sample [[buffer(4)]],
-                      device const float* epochs_per_negative_sample [[buffer(5)]],
-                      device float* epoch_of_next_sample [[buffer(6)]],
-                      device float* epoch_of_next_negative_sample [[buffer(7)]],
-                      constant SgdParams& p [[buffer(8)]],
-                      uint gid [[thread_position_in_grid]]) {
+// --- densmap-gpu additions --------------------------------------------------
+// Per-epoch densMAP scalars, computed on the HOST from the epoch-init
+// reductions (src/layouts.cpp::densmap_epoch_stats runs on the shared
+// embedding buffer between epochs — the CPU float32/float64 numpy semantics
+// are reused verbatim; only the per-edge work below runs on the GPU).
+// Mirrors struct DensSgdParams in src/metal/gpu_layout.cpp.
+struct DensSgdParams {
+    float lambda_;  // densmap_kwds["lambda"] (f8 host-side; f32 on device)
+    float mu_tot;   // np.sum(mu_sum) / 2
+    float re_std;   // np.sqrt(np.var(re_sum) + var_shift)
+    float re_mean;  // np.mean(re_sum)
+    float re_cov;   // np.dot(re_sum, R) / (n_vertices - 1)
+};
+// ----------------------------------------------------------------------------
+
+// Shared edge body of the SGD epoch. DENSMAP=true adds the density gradient
+// correction (layouts.py densmap_flag branch) in float32 — the CPU reference
+// mixes f8/f4 there; this path is quality-level parity like the rest of the
+// kernel. The dens_* pointers are only dereferenced when DENSMAP is true
+// (sgd_epoch passes null).
+template <bool DENSMAP>
+static inline void sgd_epoch_body(device float* head_embedding,
+                                  device float* tail_embedding,
+                                  device const int* head,
+                                  device const int* tail,
+                                  device const float* epochs_per_sample,
+                                  device const float* epochs_per_negative_sample,
+                                  device float* epoch_of_next_sample,
+                                  device float* epoch_of_next_negative_sample,
+                                  constant SgdParams& p,
+                                  device const float* dens_mu,
+                                  device const float* dens_R,
+                                  device const float* dens_phi_sum,
+                                  device const float* dens_re_sum,
+                                  thread const DensSgdParams& dp,
+                                  uint gid) {
     const uint i = gid + p.edge_offset;
     if (i >= p.n_edges) return;
     const float n = (float)p.epoch;
@@ -581,6 +614,40 @@ kernel void sgd_epoch(device float* head_embedding [[buffer(0)]],
         dist_squared += diff * diff;
     }
 
+    // --- densmap-gpu additions: grad_cor_coeff (float32 evaluation of the
+    // layouts.py densmap_flag block; j/k here are still the edge endpoints —
+    // negative sampling below reuses k). Compiled out when !DENSMAP.
+    float grad_cor_coeff = 0.0f;
+    if (DENSMAP) {
+        const float dsq = dist_squared;
+        const float phi = 1.0f / (1.0f + p.a * pow(dsq, p.b));
+        const float dphi_term = p.a * p.b * pow(dsq, p.b - 1.0f) /
+                                (1.0f + p.a * pow(dsq, p.b));
+
+        const float q_jk = phi / dens_phi_sum[(uint)k];
+        const float q_kj = phi / dens_phi_sum[(uint)j];
+
+        const float drk = q_jk * ((1.0f - p.b * (1.0f - phi)) /
+                                      exp(dens_re_sum[(uint)k]) +
+                                  dphi_term);
+        const float drj = q_kj * ((1.0f - p.b * (1.0f - phi)) /
+                                      exp(dens_re_sum[(uint)j]) +
+                                  dphi_term);
+
+        const float re_std_sq = dp.re_std * dp.re_std;
+        const float weight_k =
+            dens_R[(uint)k] -
+            dp.re_cov * (dens_re_sum[(uint)k] - dp.re_mean) / re_std_sq;
+        const float weight_j =
+            dens_R[(uint)j] -
+            dp.re_cov * (dens_re_sum[(uint)j] - dp.re_mean) / re_std_sq;
+
+        grad_cor_coeff = dp.lambda_ * dp.mu_tot *
+                         (weight_k * drk + weight_j * drj) /
+                         (dens_mu[i] * dp.re_std) / (float)p.n_vertices;
+    }
+    // ------------------------------------------------------------------------
+
     float grad_coeff;
     if (dist_squared > 0.0f) {
         grad_coeff = -2.0f * p.a * p.b * pow(dist_squared, p.b - 1.0f);
@@ -590,7 +657,10 @@ kernel void sgd_epoch(device float* head_embedding [[buffer(0)]],
     }
 
     for (uint d = 0; d < dim; ++d) {
-        const float grad_d = clipf(grad_coeff * (current[d] - other[d]));
+        float grad_d = clipf(grad_coeff * (current[d] - other[d]));
+        if (DENSMAP) {
+            grad_d += clipf(2.0f * grad_cor_coeff * (current[d] - other[d]));
+        }
         current[d] += grad_d * p.alpha;  // racy on purpose (hogwild)
         if (p.move_other) {
             other[d] += -grad_d * p.alpha;
@@ -641,3 +711,48 @@ kernel void sgd_epoch(device float* head_embedding [[buffer(0)]],
     epoch_of_next_negative_sample[i] +=
         (float)n_neg_samples * epochs_per_negative_sample[i];
 }
+
+kernel void sgd_epoch(device float* head_embedding [[buffer(0)]],
+                      device float* tail_embedding [[buffer(1)]],
+                      device const int* head [[buffer(2)]],
+                      device const int* tail [[buffer(3)]],
+                      device const float* epochs_per_sample [[buffer(4)]],
+                      device const float* epochs_per_negative_sample [[buffer(5)]],
+                      device float* epoch_of_next_sample [[buffer(6)]],
+                      device float* epoch_of_next_negative_sample [[buffer(7)]],
+                      constant SgdParams& p [[buffer(8)]],
+                      uint gid [[thread_position_in_grid]]) {
+    const DensSgdParams dp{0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    sgd_epoch_body<false>(head_embedding, tail_embedding, head, tail,
+                          epochs_per_sample, epochs_per_negative_sample,
+                          epoch_of_next_sample, epoch_of_next_negative_sample,
+                          p, /*dens_mu=*/nullptr, /*dens_R=*/nullptr,
+                          /*dens_phi_sum=*/nullptr, /*dens_re_sum=*/nullptr, dp,
+                          gid);
+}
+
+// --- densmap-gpu additions --------------------------------------------------
+kernel void sgd_epoch_densmap(
+    device float* head_embedding [[buffer(0)]],
+    device float* tail_embedding [[buffer(1)]],
+    device const int* head [[buffer(2)]],
+    device const int* tail [[buffer(3)]],
+    device const float* epochs_per_sample [[buffer(4)]],
+    device const float* epochs_per_negative_sample [[buffer(5)]],
+    device float* epoch_of_next_sample [[buffer(6)]],
+    device float* epoch_of_next_negative_sample [[buffer(7)]],
+    constant SgdParams& p [[buffer(8)]],
+    device const float* dens_mu [[buffer(9)]],       // per-edge membership
+    device const float* dens_R [[buffer(10)]],       // per-vertex log radii (std.)
+    device const float* dens_phi_sum [[buffer(11)]], // per-epoch host reduction
+    device const float* dens_re_sum [[buffer(12)]],  // per-epoch host reduction
+    constant DensSgdParams& dpc [[buffer(13)]],
+    uint gid [[thread_position_in_grid]]) {
+    const DensSgdParams dp = dpc;
+    sgd_epoch_body<true>(head_embedding, tail_embedding, head, tail,
+                         epochs_per_sample, epochs_per_negative_sample,
+                         epoch_of_next_sample, epoch_of_next_negative_sample,
+                         p, dens_mu, dens_R, dens_phi_sum, dens_re_sum, dp,
+                         gid);
+}
+// ----------------------------------------------------------------------------

@@ -7,6 +7,7 @@
 #include <cstring>
 
 #include "metal_context.hpp"
+#include "umap/layouts.hpp"  // densmap-gpu additions: DensmapParams + host stats
 
 namespace umap {
 namespace metal {
@@ -49,6 +50,41 @@ constexpr int kEpochsPerCommandBuffer = 25;
 constexpr std::size_t kEdgeSubDispatches = 32;
 constexpr std::size_t kMinEdgeChunk = 64;
 
+// --- densmap-gpu additions ---------------------------------------------------
+// Mirrors struct DensSgdParams in umap_kernels.metal (5 x float32). The
+// scalars are the per-epoch densmap_flag values, computed host-side by
+// umap::densmap_epoch_stats (see gpu_layout.hpp for the work-split rationale).
+struct DensSgdParams {
+    float lambda_;
+    float mu_tot;
+    float re_std;
+    float re_mean;
+    float re_cov;
+};
+static_assert(sizeof(DensSgdParams) == 20, "DensSgdParams layout must match MSL");
+
+// The densmap SGD pipeline is a separate kernel entry point sharing the edge
+// body with sgd_epoch (not a metal_context named slot — cached here like the
+// kNN engine's specialized pipelines).
+MTL::ComputePipelineState* densmap_sgd_pipeline() {
+    // Magic-static once-init (thread-safe); nullptr failures are cached too.
+    static MTL::ComputePipelineState* cached = []() -> MTL::ComputePipelineState* {
+        MetalContext& ctx = context();
+        if (!ctx.ok()) return nullptr;
+        NS::String* fn_name =
+            NS::String::string("sgd_epoch_densmap", NS::UTF8StringEncoding);
+        MTL::Function* fn = ctx.library->newFunction(fn_name);
+        if (!fn) return nullptr;
+        NS::Error* error = nullptr;
+        MTL::ComputePipelineState* pso =
+            ctx.device->newComputePipelineState(fn, &error);
+        fn->release();
+        return pso;
+    }();
+    return cached;
+}
+// -----------------------------------------------------------------------------
+
 }  // namespace
 
 bool gpu_optimize_layout_euclidean(
@@ -56,13 +92,46 @@ bool gpu_optimize_layout_euclidean(
     const std::vector<int32_t>& head, const std::vector<int32_t>& tail,
     int n_epochs, int n_vertices, const std::vector<double>& epochs_per_sample,
     double a, double b, const int64_t rng_state[3], double gamma,
-    double initial_alpha, double negative_sample_rate, bool move_other) {
+    double initial_alpha, double negative_sample_rate, bool move_other,
+    const DensmapParams* densmap_kwds) {
     MTL::ComputePipelineState* pso = pipeline("sgd_epoch");
     if (!pso) return false;
     MetalContext& ctx = context();
 
     const std::size_t n_edges = epochs_per_sample.size();
     if (n_edges == 0 || n_epochs <= 0) return true;
+
+    // --- densmap-gpu additions ----------------------------------------------
+    // First epoch with the density correction active:
+    // densmap_flag(n) = lambda > 0 and (n+1)/n_epochs > 1 - frac — monotone
+    // in n, so epochs [0, first_dens_epoch) batch exactly like the plain path
+    // and [first_dens_epoch, n_epochs) run one host-synchronised command
+    // buffer each (the per-epoch scalars depend on the embedding state).
+    const bool densmap = densmap_kwds != nullptr;
+    int first_dens_epoch = n_epochs;
+    if (densmap && densmap_kwds->lambda > 0.0) {
+        for (int n = 0; n < n_epochs; ++n) {
+            if ((static_cast<double>(n + 1) / static_cast<double>(n_epochs)) >
+                (1.0 - densmap_kwds->frac)) {
+                first_dens_epoch = n;
+                break;
+            }
+        }
+    }
+    const bool dens_active = densmap && first_dens_epoch < n_epochs;
+    MTL::ComputePipelineState* pso_dens =
+        dens_active ? densmap_sgd_pipeline() : nullptr;
+    if (dens_active) {
+        // The kernel needs per-edge mu and per-vertex R aligned with this
+        // graph; the fit configuration also implies aliased head/tail
+        // (move_other=true). Anything else is a caller bug — fall back.
+        if (!pso_dens || !move_other || head_embedding != tail_embedding ||
+            densmap_kwds->mu.size() != n_edges ||
+            densmap_kwds->R.size() != static_cast<std::size_t>(n_vertices)) {
+            return false;
+        }
+    }
+    // ------------------------------------------------------------------------
 
     // float32 device copies of the float64 bookkeeping (Metal has no double;
     // documented deviation).
@@ -100,6 +169,35 @@ bool gpu_optimize_layout_euclidean(
     MTL::Buffer* eonns_buf = ctx.device->newBuffer(
         epns_f.data(), n_edges * sizeof(float), MTL::ResourceStorageModeShared);
 
+    // --- densmap-gpu additions ----------------------------------------------
+    // mu / R are constant across epochs; phi_sum / re_sum are refilled from
+    // the host stats before each corrected epoch (shared storage, so a plain
+    // memcpy into contents() is coherent once the previous buffer completed).
+    const std::size_t nv_bytes =
+        static_cast<std::size_t>(n_vertices) * sizeof(float);
+    MTL::Buffer* dens_mu_buf = nullptr;
+    MTL::Buffer* dens_R_buf = nullptr;
+    MTL::Buffer* dens_phi_buf = nullptr;
+    MTL::Buffer* dens_re_buf = nullptr;
+    float dens_lambda = 0.0f;
+    float dens_mu_tot = 0.0f;
+    std::vector<float> re_sum_host, phi_sum_host;
+    if (dens_active) {
+        dens_mu_buf =
+            ctx.device->newBuffer(densmap_kwds->mu.data(),
+                                  n_edges * sizeof(float),
+                                  MTL::ResourceStorageModeShared);
+        dens_R_buf = ctx.device->newBuffer(densmap_kwds->R.data(), nv_bytes,
+                                           MTL::ResourceStorageModeShared);
+        dens_phi_buf =
+            ctx.device->newBuffer(nv_bytes, MTL::ResourceStorageModeShared);
+        dens_re_buf =
+            ctx.device->newBuffer(nv_bytes, MTL::ResourceStorageModeShared);
+        dens_lambda = static_cast<float>(densmap_kwds->lambda);
+        dens_mu_tot = densmap_mu_tot(densmap_kwds->mu_sum);
+    }
+    // ------------------------------------------------------------------------
+
     SgdParams params;
     params.n_edges = static_cast<uint32_t>(n_edges);
     params.dim = static_cast<uint32_t>(dim);
@@ -126,37 +224,73 @@ bool gpu_optimize_layout_euclidean(
         if (v > 0) edge_chunk = static_cast<std::size_t>(v);
     }
 
-    for (int n0 = 0; n0 < n_epochs; n0 += kEpochsPerCommandBuffer) {
-        const int n1 = std::min(n_epochs, n0 + kEpochsPerCommandBuffer);
-        MTL::CommandBuffer* cmd = ctx.queue->commandBuffer();
-        for (int n = n0; n < n1; ++n) {
-            // Alpha decay on the host, exactly as in layouts.py.
-            params.alpha = static_cast<float>(
-                initial_alpha *
-                (1.0 - (static_cast<double>(n) / static_cast<double>(n_epochs))));
-            params.epoch = static_cast<uint32_t>(n);
+    // Encodes epoch n's sub-dispatches into cmd; dp non-null selects the
+    // densmap pipeline + the extra density buffers.
+    const auto encode_epoch = [&](MTL::CommandBuffer* cmd, int n,
+                                  const DensSgdParams* dp) {
+        // Alpha decay on the host, exactly as in layouts.py.
+        params.alpha = static_cast<float>(
+            initial_alpha *
+            (1.0 - (static_cast<double>(n) / static_cast<double>(n_epochs))));
+        params.epoch = static_cast<uint32_t>(n);
 
-            for (std::size_t off = 0; off < n_edges; off += edge_chunk) {
-                params.edge_offset = static_cast<uint32_t>(off);
-                const std::size_t count = std::min(edge_chunk, n_edges - off);
-                MTL::ComputeCommandEncoder* enc = cmd->computeCommandEncoder();
-                enc->setComputePipelineState(pso);
-                enc->setBuffer(head_buf, 0, 0);
-                enc->setBuffer(tail_buf, 0, 1);
-                enc->setBuffer(head_idx_buf, 0, 2);
-                enc->setBuffer(tail_idx_buf, 0, 3);
-                enc->setBuffer(eps_buf, 0, 4);
-                enc->setBuffer(epns_buf, 0, 5);
-                enc->setBuffer(eons_buf, 0, 6);
-                enc->setBuffer(eonns_buf, 0, 7);
-                enc->setBytes(&params, sizeof(params), 8);
-                enc->dispatchThreads(MTL::Size::Make(count, 1, 1),
-                                     MTL::Size::Make(tg, 1, 1));
-                enc->endEncoding();
+        for (std::size_t off = 0; off < n_edges; off += edge_chunk) {
+            params.edge_offset = static_cast<uint32_t>(off);
+            const std::size_t count = std::min(edge_chunk, n_edges - off);
+            MTL::ComputeCommandEncoder* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(dp != nullptr ? pso_dens : pso);
+            enc->setBuffer(head_buf, 0, 0);
+            enc->setBuffer(tail_buf, 0, 1);
+            enc->setBuffer(head_idx_buf, 0, 2);
+            enc->setBuffer(tail_idx_buf, 0, 3);
+            enc->setBuffer(eps_buf, 0, 4);
+            enc->setBuffer(epns_buf, 0, 5);
+            enc->setBuffer(eons_buf, 0, 6);
+            enc->setBuffer(eonns_buf, 0, 7);
+            enc->setBytes(&params, sizeof(params), 8);
+            if (dp != nullptr) {
+                enc->setBuffer(dens_mu_buf, 0, 9);
+                enc->setBuffer(dens_R_buf, 0, 10);
+                enc->setBuffer(dens_phi_buf, 0, 11);
+                enc->setBuffer(dens_re_buf, 0, 12);
+                enc->setBytes(dp, sizeof(DensSgdParams), 13);
             }
+            enc->dispatchThreads(MTL::Size::Make(count, 1, 1),
+                                 MTL::Size::Make(tg, 1, 1));
+            enc->endEncoding();
         }
-        cmd->commit();
-        cmd->waitUntilCompleted();
+    };
+
+    int n = 0;
+    while (n < n_epochs) {
+        if (n < first_dens_epoch) {
+            // Plain epochs: batched several per command buffer.
+            const int n1 = std::min(
+                {n_epochs, n + kEpochsPerCommandBuffer, first_dens_epoch});
+            MTL::CommandBuffer* cmd = ctx.queue->commandBuffer();
+            for (; n < n1; ++n) encode_epoch(cmd, n, nullptr);
+            cmd->commit();
+            cmd->waitUntilCompleted();
+        } else {
+            // densmap-gpu additions: corrected epoch. The previous command
+            // buffer completed, so the shared embedding buffer is coherent;
+            // run the CPU epoch-init + scalar reductions on it, publish
+            // phi_sum / re_sum to the device, then dispatch the epoch.
+            float* emb = static_cast<float*>(head_buf->contents());
+            const DensmapEpochScalars s = densmap_epoch_stats(
+                emb, emb, head.data(), tail.data(), n_edges, a, b, dim,
+                *densmap_kwds, n_vertices, re_sum_host, phi_sum_host);
+            std::memcpy(dens_phi_buf->contents(), phi_sum_host.data(),
+                        nv_bytes);
+            std::memcpy(dens_re_buf->contents(), re_sum_host.data(), nv_bytes);
+            const DensSgdParams dp{dens_lambda, dens_mu_tot, s.re_std,
+                                   s.re_mean, s.re_cov};
+            MTL::CommandBuffer* cmd = ctx.queue->commandBuffer();
+            encode_epoch(cmd, n, &dp);
+            cmd->commit();
+            cmd->waitUntilCompleted();
+            ++n;
+        }
     }
 
     std::memcpy(head_embedding, head_buf->contents(), head_bytes);
@@ -172,6 +306,11 @@ bool gpu_optimize_layout_euclidean(
     epns_buf->release();
     eons_buf->release();
     eonns_buf->release();
+    // densmap-gpu additions
+    if (dens_mu_buf) dens_mu_buf->release();
+    if (dens_R_buf) dens_R_buf->release();
+    if (dens_phi_buf) dens_phi_buf->release();
+    if (dens_re_buf) dens_re_buf->release();
     return true;
 }
 

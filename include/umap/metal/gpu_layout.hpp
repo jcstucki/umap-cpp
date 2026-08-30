@@ -38,13 +38,31 @@
 #include <vector>
 
 namespace umap {
+
+struct DensmapParams;  // umap/layouts.hpp (densmap-gpu additions)
+
 namespace metal {
 
 // Signature mirrors umap::optimize_layout_euclidean. head_embedding /
 // tail_embedding are n_head_vertices x dim / n_vertices x dim row-major
 // float32; when they alias (standard fit), a single device buffer is used.
 // head_embedding (and tail_embedding if move_other) are updated in place.
-// densmap is not supported on the GPU path (throws, like densmap=true on CPU).
+// move_other=false (transform's frozen-tail SGD) never writes tail rows, so
+// the hogwild races are confined to same-head-vertex updates.
+//
+// densmap-gpu additions: a non-null densmap_kwds enables the densMAP
+// gradient correction (gated per epoch by lambda > 0 and
+// (n+1)/n_epochs > 1 - frac, exactly as upstream). Work split: the per-edge
+// SGD runs on the GPU (sgd_epoch_densmap kernel); the epoch-init reductions
+// and the re_std/re_mean/re_cov scalars run on the HOST between epochs via
+// umap::densmap_epoch_stats — the simplest correct split, chosen because the
+// reductions are O(edges) with no negative sampling (a fraction of an
+// epoch's work), need a host sync anyway (the scalars feed the very next
+// dispatch), and reusing the CPU code keeps the numpy float32 reduction
+// semantics single-sourced. Corrected epochs therefore run one command
+// buffer per epoch instead of the 25-epoch batches (documented cost).
+// densmap_kwds requires move_other=true and aliased head/tail (the fit
+// configuration, like the CPU path).
 // Returns false (embeddings untouched) if no Metal device is available.
 bool gpu_optimize_layout_euclidean(
     float* head_embedding, int n_head_vertices, float* tail_embedding, int dim,
@@ -52,7 +70,7 @@ bool gpu_optimize_layout_euclidean(
     int n_epochs, int n_vertices, const std::vector<double>& epochs_per_sample,
     double a, double b, const int64_t rng_state[3], double gamma = 1.0,
     double initial_alpha = 1.0, double negative_sample_rate = 5.0,
-    bool move_other = false);
+    bool move_other = false, const DensmapParams* densmap_kwds = nullptr);
 
 }  // namespace metal
 }  // namespace umap

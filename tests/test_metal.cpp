@@ -601,18 +601,8 @@ TEST_CASE("phase4 dispatch: unsupported GPU combos fall back to the bit-exact "
         return static_cast<float>(s);
     };
 
-    SUBCASE("densmap") {
-        umap::UMAPParams p = base;
-        p.densmap = true;
-        umap::UMAP cpu_model(p);
-        cpu_model.fit(X.data(), n, dim);
-        p.device = umap::Device::GPU;
-        umap::UMAP gpu_model(p);  // warns, then runs the CPU path
-        gpu_model.fit(X.data(), n, dim);
-        REQUIRE(gpu_model.embedding().size() == cpu_model.embedding().size());
-        for (std::size_t i = 0; i < cpu_model.embedding().size(); ++i)
-            CHECK(gpu_model.embedding()[i] == cpu_model.embedding()[i]);
-    }
+    // (densmap-gpu additions: the former "densmap" subcase is gone — densMAP
+    // now runs the Metal kernel; see the gpu densmap parity cases below.)
     SUBCASE("non-euclidean output metric") {
         umap::UMAPParams p = base;
         p.output_metric = "haversine";
@@ -725,5 +715,140 @@ TEST_CASE("gpu transform sgd: held-out quality parity vs the CPU transform "
             << ", CPU trust: " << trust_cpu << ", GPU trust: " << trust_gpu);
     CHECK(gpu_correct >= cpu_correct - 2);
     CHECK(trust_gpu >= trust_cpu - 0.05);
+}
+// -----------------------------------------------------------------------------
+
+// --- densmap-gpu additions ---------------------------------------------------
+// densMAP on the Metal kernel: per-edge density correction on the GPU, epoch
+// reductions host-side (see gpu_layout.hpp).
+
+namespace {
+
+// Two 6-d gaussian clusters with 4x different base spreads AND an internal
+// density gradient (point i's spread scales 0.5x..1.5x across each cluster):
+// densMAP should embed the wide cluster with visibly larger local radii, and
+// the within-cluster radius ORDER gives the rank-correlation below real
+// signal to preserve (uniform-spread clusters make rad_emb ranks mostly
+// noise-driven and the correlation floor drops to ~0.8 for ANY two runs —
+// including CPU-seeded vs CPU-hogwild).
+std::vector<float> two_density_clusters(int n_per, uint64_t seed) {
+    TestRng rng(seed);
+    const int dim = 6;
+    std::vector<float> X;
+    X.reserve(static_cast<std::size_t>(2 * n_per) * dim);
+    const double bases[2] = {0.6, 2.4};
+    const double centers[2] = {0.0, 25.0};
+    for (int c = 0; c < 2; ++c)
+        for (int i = 0; i < n_per; ++i) {
+            const double scale =
+                bases[c] * (0.5 + static_cast<double>(i) / n_per);
+            for (int d = 0; d < dim; ++d)
+                X.push_back(
+                    static_cast<float>(centers[c] + scale * rng.normal()));
+        }
+    return X;
+}
+
+// Spearman rank correlation (no tie handling — gaussian-derived radii are
+// tie-free in practice).
+double spearman(const std::vector<float>& a, const std::vector<float>& b) {
+    REQUIRE(a.size() == b.size());
+    const std::size_t n = a.size();
+    const auto ranks = [n](const std::vector<float>& v) {
+        std::vector<std::size_t> order(n);
+        for (std::size_t i = 0; i < n; ++i) order[i] = i;
+        std::sort(order.begin(), order.end(),
+                  [&](std::size_t x, std::size_t y) { return v[x] < v[y]; });
+        std::vector<double> r(n);
+        for (std::size_t i = 0; i < n; ++i)
+            r[order[i]] = static_cast<double>(i);
+        return r;
+    };
+    const auto ra = ranks(a), rb = ranks(b);
+    const double mean = (static_cast<double>(n) - 1.0) / 2.0;
+    double num = 0.0, da = 0.0, db = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        num += (ra[i] - mean) * (rb[i] - mean);
+        da += (ra[i] - mean) * (ra[i] - mean);
+        db += (rb[i] - mean) * (rb[i] - mean);
+    }
+    return num / std::sqrt(da * db);
+}
+
+}  // namespace
+
+TEST_CASE("gpu densmap: trustworthiness parity and density-order preservation "
+          "on two unequal-density clusters") {
+    METAL_REQUIRED();
+    const int n_per = 150, dim = 6, n = 2 * n_per;
+    const auto X = two_density_clusters(n_per, 20260830);
+
+    // dens_lambda=25 makes the density term dominate the racy SGD noise so
+    // the rad_emb rank order is a stable, meaningful target (at the default
+    // lambda=2 the CPU reference's own hogwild runs only reach rho ~0.85 vs
+    // the seeded CPU run; measured 2026-08-29).
+    umap::UMAPParams p;
+    p.n_neighbors = 20;
+    p.min_dist = 0.01;
+    p.init = "random";
+    p.random_state = 42;
+    p.n_epochs = 400;  // dens correction active for the last frac (0.3) epochs
+    p.densmap = true;
+    p.output_dens = true;
+    p.dens_lambda = 25.0;
+
+    umap::UMAP cpu_model(p);
+    cpu_model.fit(X.data(), n, dim);
+    p.device = umap::Device::GPU;
+    umap::UMAP gpu_model(p);
+    gpu_model.fit(X.data(), n, dim);
+
+    REQUIRE(gpu_model.embedding().size() == cpu_model.embedding().size());
+    for (float v : gpu_model.embedding()) CHECK(std::isfinite(v));
+
+    // The GPU path must actually have run (hogwild f32 SGD can not reproduce
+    // the sequential CPU embedding bit-for-bit; a silent CPU fallback would).
+    bool any_diff = false;
+    for (std::size_t i = 0; i < cpu_model.embedding().size(); ++i)
+        if (gpu_model.embedding()[i] != cpu_model.embedding()[i])
+            any_diff = true;
+    CHECK(any_diff);
+
+    // Measured GPU distributions at this configuration (30 runs, M-series,
+    // 2026-08-29): trust 0.801-0.829 vs CPU 0.826 (threshold cpu-0.05 sits
+    // ~3.5 sd under the observed min); rho 0.933-0.955, mean 0.943, sd
+    // 0.0055 (the 0.9 threshold is ~6 sd under the observed min). CPU-seq
+    // vs CPU-hogwild rho at the same config: 0.936/0.944 — the GPU sits in
+    // the reference's own parallel band. Broken-kernel check: negating
+    // grad_cor_coeff in sgd_epoch_densmap INVERTS the density field — rho
+    // -0.895 and the wide cluster comes out with the smaller radius, failing
+    // both density clauses while trust stays ~0.80 (verified, reverted) —
+    // so these clauses specifically exercise the density correction.
+    const double trust_cpu = testutil::trustworthiness(
+        X.data(), n, dim, cpu_model.embedding().data(), 2, 10);
+    const double trust_gpu = testutil::trustworthiness(
+        X.data(), n, dim, gpu_model.embedding().data(), 2, 10);
+    CAPTURE(trust_cpu);
+    CAPTURE(trust_gpu);
+    MESSAGE("densmap trustworthiness — CPU: " << trust_cpu
+            << ", GPU: " << trust_gpu);
+    CHECK(trust_gpu >= trust_cpu - 0.05);
+
+    // Density preservation proxy: the embedded local-radius ORDER must agree
+    // between the CPU and GPU runs (Spearman >= 0.9), and both runs must give
+    // the wide cluster the larger mean embedded radius.
+    REQUIRE(cpu_model.rad_emb().size() == static_cast<std::size_t>(n));
+    REQUIRE(gpu_model.rad_emb().size() == static_cast<std::size_t>(n));
+    const double rho = spearman(cpu_model.rad_emb(), gpu_model.rad_emb());
+    CAPTURE(rho);
+    MESSAGE("rad_emb spearman(CPU, GPU): " << rho);
+    CHECK(rho >= 0.9);
+    const auto mean_rad = [&](const std::vector<float>& r, int c) {
+        double s = 0.0;
+        for (int i = 0; i < n_per; ++i) s += r[c * n_per + i];
+        return s / n_per;
+    };
+    CHECK(mean_rad(cpu_model.rad_emb(), 1) > mean_rad(cpu_model.rad_emb(), 0));
+    CHECK(mean_rad(gpu_model.rad_emb(), 1) > mean_rad(gpu_model.rad_emb(), 0));
 }
 // -----------------------------------------------------------------------------

@@ -405,6 +405,38 @@ void optimize_euclidean_epoch_range(
 
 }  // namespace
 
+// --- densmap-gpu additions ---------------------------------------------------
+// Epoch-level densMAP reductions exported for the Metal host path (see
+// layouts.hpp): identical numerics to the in-loop code below — the GPU run
+// differs from the CPU one only through the (racy, float32) embedding state
+// these are computed FROM.
+float densmap_mu_tot(const std::vector<float>& mu_sum) {
+    return numpy_sum_f32(mu_sum.data(), static_cast<int64_t>(mu_sum.size())) /
+           2.0f;
+}
+
+DensmapEpochScalars densmap_epoch_stats(
+    const float* head_embedding, const float* tail_embedding,
+    const int32_t* head, const int32_t* tail, std::size_t n_edges, double a,
+    double b, int dim, const DensmapParams& densmap_kwds, int n_vertices,
+    std::vector<float>& re_sum, std::vector<float>& phi_sum) {
+    re_sum.resize(static_cast<std::size_t>(n_vertices));
+    phi_sum.resize(static_cast<std::size_t>(n_vertices));
+    densmap_epoch_init(head_embedding, tail_embedding, head, tail, n_edges, a,
+                       b, dim, re_sum, phi_sum);
+    // dens_re_std = np.sqrt(np.var(re_sum) + var_shift): float32 (NEP 50: the
+    // Python-float var_shift is weak). Likewise mean/cov.
+    const int64_t nv = static_cast<int64_t>(re_sum.size());
+    const float var = numpy_var_f32(re_sum.data(), nv);
+    DensmapEpochScalars s;
+    s.re_std = std::sqrt(var + static_cast<float>(densmap_kwds.var_shift));
+    s.re_mean = numpy_mean_f32(re_sum.data(), nv);
+    s.re_cov = numpy_dot_f32(re_sum.data(), densmap_kwds.R.data(), nv) /
+               static_cast<float>(n_vertices - 1);
+    return s;
+}
+// -----------------------------------------------------------------------------
+
 void optimize_layout_euclidean(
     float* head_embedding, int n_head_vertices, float* tail_embedding, int dim,
     const std::vector<int32_t>& head, const std::vector<int32_t>& tail,
@@ -436,10 +468,7 @@ void optimize_layout_euclidean(
     std::vector<float> dens_phi_sum;
     std::vector<float> dens_re_sum;
     if (densmap) {
-        dens.mu_tot =
-            numpy_sum_f32(densmap_kwds->mu_sum.data(),
-                          static_cast<int64_t>(densmap_kwds->mu_sum.size())) /
-            2.0f;
+        dens.mu_tot = densmap_mu_tot(densmap_kwds->mu_sum);
         dens.lambda = densmap_kwds->lambda;
         dens.R = densmap_kwds->R.data();
         dens.mu = densmap_kwds->mu.data();
@@ -508,19 +537,15 @@ void optimize_layout_euclidean(
                       static_cast<double>(n_epochs)) >
                      (1.0 - densmap_kwds->frac));
         if (dens.flag) {
-            densmap_epoch_init(head_embedding, tail_embedding, head.data(),
-                               tail.data(), n_edges, a, b, dim, dens_re_sum,
-                               dens_phi_sum);
-            // dens_re_std = np.sqrt(np.var(re_sum) + var_shift): float32
-            // (NEP 50: the Python-float var_shift is weak). Likewise mean/cov.
-            const int64_t nv = static_cast<int64_t>(dens_re_sum.size());
-            const float var = numpy_var_f32(dens_re_sum.data(), nv);
-            dens.re_std = std::sqrt(
-                var + static_cast<float>(densmap_kwds->var_shift));
-            dens.re_mean = numpy_mean_f32(dens_re_sum.data(), nv);
-            dens.re_cov =
-                numpy_dot_f32(dens_re_sum.data(), densmap_kwds->R.data(), nv) /
-                static_cast<float>(n_vertices - 1);
+            // densmap-gpu additions: hoisted into densmap_epoch_stats (shared
+            // with the Metal host path); numerics unchanged.
+            const DensmapEpochScalars s = densmap_epoch_stats(
+                head_embedding, tail_embedding, head.data(), tail.data(),
+                n_edges, a, b, dim, *densmap_kwds, n_vertices, dens_re_sum,
+                dens_phi_sum);
+            dens.re_std = s.re_std;
+            dens.re_mean = s.re_mean;
+            dens.re_cov = s.re_cov;
         } else {
             dens.re_std = 0.0f;
             dens.re_mean = 0.0f;
@@ -727,19 +752,19 @@ std::vector<float> simplicial_set_embedding_from_init(
     } else {
         // --- phase4 additions ------------------------------------------------
         // Device::GPU routes this euclidean epoch loop to the Metal hogwild
-        // kernel. The kernel covers exactly the plain euclidean SGD (no
-        // densmap correction, no snapshot list); UMAP::fit gates and warns
-        // for those combos before requesting GPU, so the checks here are a
-        // safety net. Quality-level parity only (see gpu_layout.hpp).
+        // kernel — including the densMAP correction (densmap-gpu additions;
+        // per-epoch reductions stay host-side, see gpu_layout.hpp). Only the
+        // snapshot list stays CPU; UMAP::fit gates and warns for that combo
+        // before requesting GPU, so the check here is a safety net. Quality-
+        // level parity only (see gpu_layout.hpp).
         bool gpu_done = false;
-        if (device == Device::GPU && densmap_kwds == nullptr &&
-            epochs_list == nullptr) {
+        if (device == Device::GPU && epochs_list == nullptr) {
 #ifdef UMAP_ENABLE_METAL
             gpu_done = metal::gpu_optimize_layout_euclidean(
                 embedding.data(), n_samples, embedding.data(), n_components,
                 head, tail, n_epochs, n_vertices, epochs_per_sample, a, b,
                 rng_state, gamma, initial_alpha, negative_sample_rate,
-                /*move_other=*/true);
+                /*move_other=*/true, densmap_kwds);
 #endif
             if (!gpu_done) {
                 std::fprintf(stderr,

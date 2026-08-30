@@ -89,6 +89,34 @@ struct DensmapParams {
 };
 // ----------------------------------------------------------------------------
 
+// --- densmap-gpu additions --------------------------------------------------
+// densMAP epoch internals exported for the Metal host path
+// (src/metal/gpu_layout.cpp): the GPU port keeps every epoch-level reduction
+// on the CPU — with the exact numpy float32 semantics the CPU epoch loop uses
+// — and offloads only the per-edge SGD work. Both live in src/layouts.cpp so
+// there is a single source of truth for the numerics.
+
+// mu_tot = np.sum(mu_sum) / 2 (float32 pairwise sum, computed once per run).
+float densmap_mu_tot(const std::vector<float>& mu_sum);
+
+// The per-epoch scalars of the densmap_flag branch, computed for the CURRENT
+// embedding state: runs _optimize_layout_euclidean_densmap_epoch_init into
+// re_sum / phi_sum (resized to n_vertices) and returns
+//   re_std  = np.sqrt(np.var(re_sum) + var_shift)      (float32)
+//   re_mean = np.mean(re_sum)                          (float32)
+//   re_cov  = np.dot(re_sum, R) / (n_vertices - 1)     (float32; sdot)
+struct DensmapEpochScalars {
+    float re_std = 0.0f;
+    float re_mean = 0.0f;
+    float re_cov = 0.0f;
+};
+DensmapEpochScalars densmap_epoch_stats(
+    const float* head_embedding, const float* tail_embedding,
+    const int32_t* head, const int32_t* tail, std::size_t n_edges, double a,
+    double b, int dim, const DensmapParams& densmap_kwds, int n_vertices,
+    std::vector<float>& re_sum, std::vector<float>& phi_sum);
+// ----------------------------------------------------------------------------
+
 // Improve an embedding using SGD to minimise the fuzzy set cross entropy
 // between the 1-skeletons of the high- and low-dimensional fuzzy simplicial
 // sets (layouts.py::optimize_layout_euclidean). Operates on head_embedding in
