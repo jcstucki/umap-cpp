@@ -163,6 +163,29 @@ bool gpu_brute_force_knn(const float* data, int n, int dim,
             for (int i = 0; i < dim; ++i)
                 aux[static_cast<std::size_t>(i) * dim + i] = 1.0f;
         }
+    } else if (metric == KnnMetric::cosine || metric == KnnMetric::correlation) {
+        // gpu-knn-gemm (PERF_BASELINE.md P1): the register-blocked fast body
+        // reads per-DATA-ROW terms out of aux (indexed by absolute data row,
+        // not by dim): cosine wants the squared row norm sum_d x_j[d]^2,
+        // correlation wants the row mean. These are query-independent, so
+        // hoisting them here removes the second pass the scalar body ran over
+        // every data row. Computed in float32 to match the on-device dot's
+        // accumulation domain; the fast body's tail (dim % 4 != 0 or the
+        // block remainder) falls back to pair_dist, which recomputes the same
+        // quantities inline and never reads aux, so the two paths agree.
+        aux.assign(static_cast<std::size_t>(n), 0.0f);
+        const bool corr = (metric == KnnMetric::correlation);
+        for (int j = 0; j < n; ++j) {
+            const float* row = data + static_cast<std::size_t>(j) * dim;
+            float s = 0.0f;
+            if (corr) {
+                for (int d = 0; d < dim; ++d) s += row[d];
+                aux[static_cast<std::size_t>(j)] = s / static_cast<float>(dim);
+            } else {
+                for (int d = 0; d < dim; ++d) s += row[d] * row[d];
+                aux[static_cast<std::size_t>(j)] = s;
+            }
+        }
     }
 
     const bool heap = k > kSmallKCap;

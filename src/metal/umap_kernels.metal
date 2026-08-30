@@ -75,6 +75,47 @@ constant constexpr uint kTileFloats = 4096;
 constant constexpr uint kSmallK = 64;   // register insertion-list cap
 constant constexpr uint kHeapK = 256;   // thread-memory heap cap
 
+// --- gpu-knn-gemm additions -------------------------------------------------
+// Register-blocked fast path (PERF_BASELINE.md P1). The scalar body below
+// re-reads the query row from device memory for every (data row, dim)
+// iteration — 32 lanes x a 4·dim-byte stride touch a fresh cache line per
+// load, which is what pinned the old kernel at ~0.3% of fp32 peak. The fast
+// path caches the query row in thread registers as float4 chunks (one load
+// for dim <= kQChunkDims) and walks the threadgroup tile in blocks of
+// kRowBlock rows: per float4 of dims that is 1 register operand + kRowBlock
+// tile loads feeding 8 independent accumulator chains (ILP), ~0.9 counted
+// flops per instruction against the 1-flop/instr scalar body.
+//
+// simdgroup_float8x8 GEMM (norms ± Q·Dᵀ) was considered and rejected: on
+// pre-M4 Apple GPUs simdgroup matrices lower onto the same FMA ALUs (no
+// dedicated matmul units), so MMA only buys operand sharing — which register
+// blocking gets too — while the norm-trick expansion ||q||²+||x||²−2q·x
+// loses the exact 0.0f distance for self/duplicate pairs (asserted by the
+// parity suite) and precision for near-duplicates. The diff form keeps each
+// pair's accumulation serial in ascending d, bit-compatible with the scalar
+// body.
+//
+// Covered metrics (per-pipeline function-constant fold): euclidean,
+// sqeuclidean, manhattan (single diff accumulator), cosine (dot only — the
+// data-row norms arrive precomputed in aux[n], halving the per-pair ALU) and
+// correlation (query pre-shifted by mu_q in registers, data row means in
+// aux[n], dot + shifted-norm accumulators). Requires dim % 4 == 0 (float4
+// tile rows stay 16-byte aligned) and dim <= kTileFloats; everything else —
+// chebyshev/minkowski/hamming/canberra/braycurtis/seuclidean/wminkowski and
+// the O(dim²) mahalanobis — keeps the scalar tile body, as do fast metrics
+// at dim % 4 != 0.
+constant constexpr uint kQChunkDims = 64;  // query dims per register chunk
+constant constexpr uint kRowBlock = 8;     // tile rows per accumulator block
+
+static inline bool fast_metric() {
+    return kMetricId == UMAP_KNN_EUCLIDEAN ||
+           kMetricId == UMAP_KNN_SQEUCLIDEAN ||
+           kMetricId == UMAP_KNN_MANHATTAN ||
+           kMetricId == UMAP_KNN_COSINE ||
+           kMetricId == UMAP_KNN_CORRELATION;
+}
+// ----------------------------------------------------------------------------
+
 struct KnnDenseParams {
     uint n;    // number of data rows
     uint nq;   // number of query rows
@@ -183,7 +224,7 @@ struct TopKHeap {
 
 // Per-query precomputed terms (metric-dependent).
 struct QueryCtx {
-    float q_norm;  // cosine: sum q^2
+    float q_norm;  // cosine: sum q^2; correlation: sum (q - mu_q)^2 (fast path)
     float mu_q;    // correlation: mean(q)
 };
 
@@ -199,6 +240,15 @@ static inline QueryCtx make_query_ctx(device const float* q, uint dim) {
         float s = 0.0f;
         for (uint d = 0; d < dim; ++d) s += q[d];
         qc.mu_q = s / (float)dim;
+        // gpu-knn-gemm: the query-side centred norm depends only on the
+        // query; hoisted here (same serial ascending-d accumulation as the
+        // scalar body's per-pair recomputation) for the fast path.
+        float nq = 0.0f;
+        for (uint d = 0; d < dim; ++d) {
+            const float sq = q[d] - qc.mu_q;
+            nq += sq * sq;
+        }
+        qc.q_norm = nq;
     }
     return qc;
 }
@@ -319,6 +369,182 @@ static inline float pair_dist(device const float* q, XPtr x, uint dim,
     return INFINITY;
 }
 
+// --- gpu-knn-gemm additions -------------------------------------------------
+
+// Load one register chunk of the query row. For correlation the query is
+// pre-centred here once (qreg = q - mu_q), so the inner loop pays a single
+// subtraction per data element instead of two.
+static inline void load_qreg(device const float* q, uint c, uint clen,
+                             thread float4* qreg, thread const QueryCtx& qc) {
+    device const float4* q4 = (device const float4*)(q + c);
+    const uint n4 = clen / 4u;
+    if (kMetricId == UMAP_KNN_CORRELATION) {
+        const float4 shift = float4(qc.mu_q);
+        for (uint j = 0; j < n4; ++j) qreg[j] = q4[j] - shift;
+    } else {
+        for (uint j = 0; j < n4; ++j) qreg[j] = q4[j];
+    }
+}
+
+// One kRowBlock x clen accumulation step against the threadgroup tile.
+// acc is the primary accumulator (diff² / |diff| / dot), acc2 the
+// correlation shifted-norm, mux the correlation per-row means. Every
+// accumulator advances serially in ascending d (lanes .x...w unrolled in
+// order), so per-pair values match the scalar body's accumulation order; the
+// ILP comes from the kRowBlock independent chains, the operand reuse from
+// qv serving all kRowBlock rows.
+static inline void accum_block(thread const float4* qreg,
+                               threadgroup const float* x0, uint dim, uint c,
+                               uint clen, thread float* acc,
+                               thread float* acc2, thread const float* mux) {
+    threadgroup const float4* xr[kRowBlock];
+    for (uint r = 0; r < kRowBlock; ++r)
+        xr[r] = (threadgroup const float4*)(x0 + r * dim + c);
+    const uint n4 = clen / 4u;
+    for (uint j = 0; j < n4; ++j) {
+        const float4 qv = qreg[j];
+        for (uint r = 0; r < kRowBlock; ++r) {
+            const float4 xv = xr[r][j];
+            if (kMetricId == UMAP_KNN_EUCLIDEAN ||
+                kMetricId == UMAP_KNN_SQEUCLIDEAN) {
+                const float4 t = qv - xv;
+                float s = acc[r];
+                s += t.x * t.x;
+                s += t.y * t.y;
+                s += t.z * t.z;
+                s += t.w * t.w;
+                acc[r] = s;
+            } else if (kMetricId == UMAP_KNN_MANHATTAN) {
+                const float4 t = fabs(qv - xv);
+                float s = acc[r];
+                s += t.x;
+                s += t.y;
+                s += t.z;
+                s += t.w;
+                acc[r] = s;
+            } else if (kMetricId == UMAP_KNN_COSINE) {
+                float s = acc[r];
+                s += qv.x * xv.x;
+                s += qv.y * xv.y;
+                s += qv.z * xv.z;
+                s += qv.w * xv.w;
+                acc[r] = s;
+            } else {  // correlation (qv pre-centred by load_qreg)
+                const float4 sx = xv - float4(mux[r]);
+                float dot = acc[r];
+                float nx = acc2[r];
+                dot += qv.x * sx.x;
+                dot += qv.y * sx.y;
+                dot += qv.z * sx.z;
+                dot += qv.w * sx.w;
+                nx += sx.x * sx.x;
+                nx += sx.y * sx.y;
+                nx += sx.z * sx.z;
+                nx += sx.w * sx.w;
+                acc[r] = dot;
+                acc2[r] = nx;
+            }
+        }
+    }
+}
+
+// Fold the block accumulators into the final distance; formulas (incl. the
+// zero-norm special cases) identical to pair_dist. aux_row is the
+// precomputed data-row norm for cosine, unused otherwise.
+static inline float fast_row_dist(float acc, float acc2, float aux_row,
+                                  thread const QueryCtx& qc) {
+    switch (kMetricId) {
+        case UMAP_KNN_EUCLIDEAN:
+            return sqrt(acc);
+        case UMAP_KNN_COSINE: {
+            const float xn = aux_row;
+            if (qc.q_norm == 0.0f && xn == 0.0f) return 0.0f;
+            if (qc.q_norm == 0.0f || xn == 0.0f) return 1.0f;
+            return 1.0f - acc / sqrt(qc.q_norm * xn);
+        }
+        case UMAP_KNN_CORRELATION: {
+            if (qc.q_norm == 0.0f && acc2 == 0.0f) return 0.0f;
+            if (acc == 0.0f) return 1.0f;
+            return 1.0f - acc / sqrt(qc.q_norm * acc2);
+        }
+        default:  // sqeuclidean / manhattan
+            return acc;
+    }
+}
+
+// Fast-path dense body: float4 cooperative tile loads, register-cached query
+// chunks, kRowBlock-row accumulator blocks, per-thread full top-k (rows are
+// pushed in ascending data order, so the k-boundary tie rule is unchanged).
+// Preconditions: fast_metric() && dim % 4 == 0 && dim <= kTileFloats.
+template <typename TOPK>
+static inline void knn_dense_body_fast(device const float* data,
+                                       device const float* q, bool active,
+                                       constant KnnDenseParams& p,
+                                       device const float* aux,
+                                       threadgroup float* tile, uint lid,
+                                       uint tg_size,
+                                       thread const QueryCtx& qc,
+                                       thread TOPK& top) {
+    const uint dim = p.dim;
+    const uint tile_rows = kTileFloats / dim;
+    float4 qreg[kQChunkDims / 4u];
+    const bool single_chunk = dim <= kQChunkDims;
+    if (single_chunk && active) load_qreg(q, 0u, dim, qreg, qc);
+    for (uint base = 0; base < p.n; base += tile_rows) {
+        const uint rows = min(tile_rows, p.n - base);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {  // float4 cooperative load (dim % 4 == 0 keeps rows 16B-aligned)
+            device const float4* src4 =
+                (device const float4*)(data + (ulong)base * dim);
+            threadgroup float4* dst4 = (threadgroup float4*)tile;
+            const uint total4 = rows * dim / 4u;
+            for (uint t = lid; t < total4; t += tg_size) dst4[t] = src4[t];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (!active) continue;
+        uint r0 = 0;
+        for (; r0 + kRowBlock <= rows; r0 += kRowBlock) {
+            float acc[kRowBlock];
+            float acc2[kRowBlock];
+            float mux[kRowBlock];
+            for (uint r = 0; r < kRowBlock; ++r) {
+                acc[r] = 0.0f;
+                acc2[r] = 0.0f;
+                mux[r] = 0.0f;
+            }
+            if (kMetricId == UMAP_KNN_CORRELATION) {
+                for (uint r = 0; r < kRowBlock; ++r)
+                    mux[r] = aux[base + r0 + r];
+            }
+            threadgroup const float* x0 = tile + r0 * dim;
+            if (single_chunk) {
+                accum_block(qreg, x0, dim, 0u, dim, acc, acc2, mux);
+            } else {
+                for (uint c = 0; c < dim; c += kQChunkDims) {
+                    const uint clen = min(kQChunkDims, dim - c);
+                    load_qreg(q, c, clen, qreg, qc);
+                    accum_block(qreg, x0, dim, c, clen, acc, acc2, mux);
+                }
+            }
+            for (uint r = 0; r < kRowBlock; ++r) {
+                const float aux_row = (kMetricId == UMAP_KNN_COSINE)
+                                          ? aux[base + r0 + r]
+                                          : 0.0f;
+                top.push(fast_row_dist(acc[r], acc2[r], aux_row, qc),
+                         (int)(base + r0 + r));
+            }
+        }
+        for (; r0 < rows; ++r0) {  // block tail: scalar per-row path
+            const float dist =
+                pair_dist(q, (threadgroup const float*)(tile + r0 * dim), dim,
+                          p.p, aux, qc);
+            top.push(dist, (int)(base + r0));
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+
 // Shared dense body: cooperative tile streaming + per-thread top-k. All
 // threads of the threadgroup participate in the tile loads and barriers even
 // when their query index is out of range (dispatch is by threadgroups).
@@ -340,7 +566,15 @@ static inline void knn_dense_body(device const float* data,
     top.init(p.k);
 
     const uint tile_rows = p.dim <= kTileFloats ? kTileFloats / p.dim : 0u;
-    if (tile_rows == 0) {
+    // gpu-knn-gemm (PERF_BASELINE.md P1): the decomposable metrics take the
+    // register-blocked fast body when the tile fits and dim is float4-aligned;
+    // all other metrics / geometries fall through to the scalar tile loop.
+    // The fast body owns its own tile streaming + top-k (identical push order),
+    // so it is a complete replacement of the else-branch for those cases.
+    if (tile_rows != 0u && fast_metric() && (p.dim % 4u) == 0u) {
+        knn_dense_body_fast(data, q, active, p, aux, tile, lid, tg_size, qc,
+                            top);
+    } else if (tile_rows == 0) {
         // Row wider than the tile: direct device reads (no barriers needed).
         if (active) {
             for (uint j = 0; j < p.n; ++j) {
