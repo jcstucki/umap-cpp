@@ -2857,11 +2857,11 @@ UMAP& UMAP::fit_impl(const float* X, int64_t n_samples, int64_t n_features,
         // --------------------------------------------------------------------
 
         // --- phase4 additions ------------------------------------------------
-        // Runtime device dispatch for the layout SGD. The Metal kernel covers
-        // exactly the standard euclidean-output fit; unsupported combinations
-        // fall back to the (bit-exact) CPU path with a stderr note. GPU runs
-        // are quality-level parity only -- seeded bitwise reproducibility
-        // requires Device::CPU (the default).
+        // Runtime device dispatch for the layout SGD. The Metal kernels cover
+        // euclidean-output fits, densMAP included (densmap-gpu additions);
+        // unsupported combinations fall back to the (bit-exact) CPU path with
+        // a stderr note. GPU runs are quality-level parity only -- seeded
+        // bitwise reproducibility requires Device::CPU (the default).
         Device sgd_device = Device::CPU;
         if (params_.device == Device::GPU) {
             // densmap-gpu additions: densMAP now runs on the Metal kernel too
