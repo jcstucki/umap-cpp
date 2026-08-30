@@ -498,6 +498,348 @@ kernel void knn_sparse_heap(device const int* d_indptr [[buffer(0)]],
                     d_norms, q_norms, out_idx, out_dist, p, gid, top);
 }
 
+// splitmix64 — shared rng scrambler: derives the per-(edge, epoch) tau seeds
+// of the SGD kernels (kernel 2) and the NN-descent sampling draws (kernels 3).
+static inline ulong splitmix64(thread ulong& s) {
+    s += 0x9E3779B97F4A7C15UL;
+    ulong z = s;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9UL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBUL;
+    return z ^ (z >> 31);
+}
+
+// ---------------------------------------------------------------------------
+// Kernels 3a-3e: NN-descent kNN graph construction (gpu-nnd additions)
+// ---------------------------------------------------------------------------
+// GPU port of pynndescent's array-update NN-descent (src/nn_descent.cpp) for
+// the device=GPU standard branch ABOVE the exact-engine crossover. Quality
+// parity, not bit parity: the CPU port is RandomState-stream bit-exact vs
+// Python; this engine only has to deliver a comparable-recall graph fast.
+//
+// Structure (host driver: src/metal/gpu_nnd.cpp):
+//  - init: the RP-forest leaf arrays are built on the HOST (the existing
+//    bit-exact rp-tree code, private rng) and inverted into a per-node
+//    leaf-membership table; nnd_init then runs one thread per node that
+//    scans its own leaves + random top-up draws and serially merges into its
+//    own heap row (no races, n-way parallel).
+//  - per iteration (serial encoder = inter-kernel barriers):
+//      nnd_sample_fwd   one thread per node: own heap entries -> own
+//                       new/old candidate lists (no atomics);
+//      nnd_sample_rev   one thread per heap entry (j, s): appends j to the
+//                       candidate list of its neighbour via an atomic counter
+//                       with reservoir replacement past the cap — the ONE
+//                       racy step (which reverse candidates survive under
+//                       contention is scheduling-dependent; the CPU port
+//                       keeps a deterministic random subset instead);
+//      nnd_clear_flags  one thread per heap entry: clear "new" iff the entry
+//                       was sampled into its owner's new list (the
+//                       new_build_candidates semantics);
+//      nnd_join         one thread per node i: receiving-side local join.
+//                       The CPU joins pairs (a, b) within cand(p) and pushes
+//                       to both; since sampling pushes both directions of
+//                       every heap edge, cand is (cap-modulo) symmetric, so
+//                       node i recovers exactly those pairs by scanning
+//                       q in cand(p) for p in cand(i) — new pivots join new
+//                       + old targets, old pivots join new targets — and
+//                       merges into its OWN register-copy heap serially.
+//                       No atomics, no races; each pair is evaluated from
+//                       both endpoints (~2x the CPU's distance count, far
+//                       cheaper than inbox scatter + a second merge pass).
+//                       Accepted pushes are counted into a global counter
+//                       the host reads back per iteration (early
+//                       termination, delta = 0.001 like pynndescent).
+// Metrics: sqeuclidean (serves euclidean/l2 via host-side sqrt), cosine
+// (plain float32 form — same ordering as pynndescent's alternative_cosine,
+// already the final distance), manhattan. Heap rows use the CPU heap
+// semantics (max-heap keyed on distance alone, checked dedup pushes).
+
+#define UMAP_NND_SQEUCLIDEAN 0u
+#define UMAP_NND_COSINE 1u
+#define UMAP_NND_MANHATTAN 2u
+
+constant constexpr uint kNndMaxK = 64;  // per-node heap cap (register copy)
+
+struct NndParams {
+    uint n;        // nodes
+    uint dim;      // dimensionality
+    uint k;        // heap width (n_neighbors), <= kNndMaxK
+    uint n_cand;   // candidate-list cap C (runtime, >= k)
+    uint metric;   // UMAP_NND_*
+    uint iter;     // current iteration (rng salt)
+    uint n_trees;  // node_leaves row length (init only)
+    uint leaf_len; // leaf_array row length (init only)
+    ulong seed;    // base rng seed
+};
+
+static inline float nnd_dist(device const float* x, device const float* y,
+                             uint dim, uint metric) {
+    switch (metric) {
+        case UMAP_NND_COSINE: {
+            float dot = 0.0f, nx = 0.0f, ny = 0.0f;
+            for (uint d = 0; d < dim; ++d) {
+                dot += x[d] * y[d];
+                nx += x[d] * x[d];
+                ny += y[d] * y[d];
+            }
+            if (nx == 0.0f && ny == 0.0f) return 0.0f;
+            if (nx == 0.0f || ny == 0.0f) return 1.0f;
+            return 1.0f - dot / sqrt(nx * ny);
+        }
+        case UMAP_NND_MANHATTAN: {
+            float s = 0.0f;
+            for (uint d = 0; d < dim; ++d) s += fabs(x[d] - y[d]);
+            return s;
+        }
+        default: {  // UMAP_NND_SQEUCLIDEAN
+            float s = 0.0f;
+            for (uint d = 0; d < dim; ++d) {
+                const float diff = x[d] - y[d];
+                s += diff * diff;
+            }
+            return s;
+        }
+    }
+}
+
+// Register copy of one heap row; checked_push is the CPU
+// checked_flagged_heap_push (max-heap keyed on distance alone, O(k) dedup).
+struct NndHeap {
+    float d[kNndMaxK];
+    int i[kNndMaxK];
+    uchar f[kNndMaxK];
+    uint k;
+    void init(uint kk) {
+        k = min(kk, kNndMaxK);
+        for (uint j = 0; j < k; ++j) {
+            d[j] = INFINITY;
+            i[j] = -1;
+            f[j] = 0;
+        }
+    }
+    void load(device const float* hd, device const int* hi,
+              device const uchar* hf, uint kk, ulong row) {
+        k = min(kk, kNndMaxK);
+        for (uint j = 0; j < k; ++j) {
+            d[j] = hd[row * k + j];
+            i[j] = hi[row * k + j];
+            f[j] = hf[row * k + j];
+        }
+    }
+    void store(device float* hd, device int* hi, device uchar* hf,
+               ulong row) {
+        for (uint j = 0; j < k; ++j) {
+            hd[row * k + j] = d[j];
+            hi[row * k + j] = i[j];
+            hf[row * k + j] = f[j];
+        }
+    }
+    int checked_push(float p, int n, uchar flag) {
+        if (p >= d[0]) return 0;
+        for (uint j = 0; j < k; ++j)
+            if (i[j] == n) return 0;
+        uint elt = 0;
+        for (;;) {
+            const uint l = 2 * elt + 1;
+            const uint r = l + 1;
+            uint sw;
+            if (l >= k) {
+                break;
+            } else if (r >= k) {
+                if (d[l] > p) sw = l; else break;
+            } else if (d[l] >= d[r]) {
+                if (p < d[l]) sw = l; else break;
+            } else {
+                if (p < d[r]) sw = r; else break;
+            }
+            d[elt] = d[sw];
+            i[elt] = i[sw];
+            f[elt] = f[sw];
+            elt = sw;
+        }
+        d[elt] = p;
+        i[elt] = n;
+        f[elt] = flag;
+        return 1;
+    }
+};
+
+// 3a: heap init from the host-built RP-forest leaves + random top-up.
+kernel void nnd_init(device const float* data [[buffer(0)]],
+                     device float* heap_dist [[buffer(1)]],
+                     device int* heap_idx [[buffer(2)]],
+                     device uchar* heap_flag [[buffer(3)]],
+                     device const int* leaf_idx [[buffer(4)]],
+                     device const int* node_leaves [[buffer(5)]],
+                     constant NndParams& p [[buffer(6)]],
+                     uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.n) return;
+    NndHeap h;
+    h.init(p.k);
+    device const float* xi = data + (ulong)gid * p.dim;
+    for (uint t = 0; t < p.n_trees; ++t) {
+        const int row = node_leaves[(ulong)gid * p.n_trees + t];
+        if (row < 0) continue;
+        device const int* leaf = leaf_idx + (ulong)row * p.leaf_len;
+        for (uint m = 0; m < p.leaf_len; ++m) {
+            const int q = leaf[m];
+            if (q < 0) break;
+            if ((uint)q == gid) continue;
+            const float dd =
+                nnd_dist(xi, data + (ulong)q * p.dim, p.dim, p.metric);
+            h.checked_push(dd, q, 1);
+        }
+    }
+    // init_random semantics: top up under-filled rows with random draws.
+    if (h.i[0] < 0) {
+        uint filled = 0;
+        for (uint j = 0; j < p.k; ++j)
+            if (h.i[j] >= 0) ++filled;
+        ulong s = p.seed ^ ((ulong)(gid + 1) * 0xD1342543DE82EF95UL);
+        for (uint r = filled; r < p.k; ++r) {
+            const uint q = (uint)(splitmix64(s) % (ulong)p.n);
+            const float dd =
+                nnd_dist(xi, data + (ulong)q * p.dim, p.dim, p.metric);
+            h.checked_push(dd, (int)q, 1);
+        }
+    }
+    h.store(heap_dist, heap_idx, heap_flag, (ulong)gid);
+}
+
+// 3b: forward sampling — own heap entries into own candidate lists.
+// Candidate arrays are host-reset to -1 and counts to 0 before each
+// iteration.
+kernel void nnd_sample_fwd(device const int* heap_idx [[buffer(0)]],
+                           device const uchar* heap_flag [[buffer(1)]],
+                           device int* new_cand [[buffer(2)]],
+                           device int* old_cand [[buffer(3)]],
+                           device uint* new_count [[buffer(4)]],
+                           device uint* old_count [[buffer(5)]],
+                           constant NndParams& p [[buffer(6)]],
+                           uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.n) return;
+    uint nc = 0, oc = 0;
+    for (uint s = 0; s < p.k; ++s) {
+        const int j = heap_idx[(ulong)gid * p.k + s];
+        if (j < 0) continue;
+        if (heap_flag[(ulong)gid * p.k + s]) {
+            if (nc < p.n_cand) new_cand[(ulong)gid * p.n_cand + nc++] = j;
+        } else {
+            if (oc < p.n_cand) old_cand[(ulong)gid * p.n_cand + oc++] = j;
+        }
+    }
+    new_count[gid] = nc;
+    old_count[gid] = oc;
+}
+
+// 3c: reverse sampling — heap entry (j, s) appends j to the candidate list
+// of heap_idx[j, s]. Atomic append with reservoir replacement past the cap.
+kernel void nnd_sample_rev(device const int* heap_idx [[buffer(0)]],
+                           device const uchar* heap_flag [[buffer(1)]],
+                           device int* new_cand [[buffer(2)]],
+                           device int* old_cand [[buffer(3)]],
+                           device atomic_uint* new_count [[buffer(4)]],
+                           device atomic_uint* old_count [[buffer(5)]],
+                           constant NndParams& p [[buffer(6)]],
+                           uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.n * p.k) return;
+    const int t = heap_idx[gid];
+    if (t < 0) return;
+    const uint j = gid / p.k;  // owner of the heap entry
+    const bool isnew = heap_flag[gid] != 0;
+    device atomic_uint* cnt = (isnew ? new_count : old_count) + (uint)t;
+    device int* list =
+        (isnew ? new_cand : old_cand) + (ulong)(uint)t * p.n_cand;
+    const uint c = atomic_fetch_add_explicit(cnt, 1u, memory_order_relaxed);
+    if (c < p.n_cand) {
+        list[c] = (int)j;
+    } else {
+        ulong s = p.seed ^ ((ulong)(p.iter + 1) * 0xAF251AF3B0F025B5UL) ^
+                  ((ulong)(gid + 1) * 0xD1342543DE82EF95UL);
+        const uint r = (uint)(splitmix64(s) % (ulong)(c + 1));
+        if (r < p.n_cand) list[r] = (int)j;  // racy overwrite by design
+    }
+}
+
+// 3d: clear the "new" flag of heap entries sampled into their owner's new
+// list (new_build_candidates' final loop).
+kernel void nnd_clear_flags(device const int* heap_idx [[buffer(0)]],
+                            device uchar* heap_flag [[buffer(1)]],
+                            device const int* new_cand [[buffer(2)]],
+                            device const uint* new_count [[buffer(3)]],
+                            constant NndParams& p [[buffer(4)]],
+                            uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.n * p.k) return;
+    const int idx = heap_idx[gid];
+    if (idx < 0 || heap_flag[gid] == 0) return;
+    const uint i = gid / p.k;
+    const uint cn = min(new_count[i], p.n_cand);
+    for (uint m = 0; m < cn; ++m) {
+        if (new_cand[(ulong)i * p.n_cand + m] == idx) {
+            heap_flag[gid] = 0;
+            return;
+        }
+    }
+}
+
+// Join one candidate list of a pivot against node i's register heap.
+static inline uint nnd_join_list(thread NndHeap& h, device const float* xi,
+                                 device const float* data,
+                                 device const int* list, uint len, uint dim,
+                                 uint metric) {
+    uint c = 0;
+    for (uint m = 0; m < len; ++m) {
+        const int q = list[m];
+        if (q < 0) continue;
+        const float dd =
+            nnd_dist(xi, data + (ulong)(uint)q * dim, dim, metric);
+        if (dd >= h.d[0]) continue;  // cheap pre-filter before the dedup scan
+        c += (uint)h.checked_push(dd, q, 1);
+    }
+    return c;
+}
+
+// 3e: receiving-side local join + per-node serial heap merge.
+kernel void nnd_join(device const float* data [[buffer(0)]],
+                     device float* heap_dist [[buffer(1)]],
+                     device int* heap_idx [[buffer(2)]],
+                     device uchar* heap_flag [[buffer(3)]],
+                     device const int* new_cand [[buffer(4)]],
+                     device const int* old_cand [[buffer(5)]],
+                     device const uint* new_count [[buffer(6)]],
+                     device const uint* old_count [[buffer(7)]],
+                     device atomic_uint* updates [[buffer(8)]],
+                     constant NndParams& p [[buffer(9)]],
+                     uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.n) return;
+    NndHeap h;
+    h.load(heap_dist, heap_idx, heap_flag, p.k, (ulong)gid);
+    device const float* xi = data + (ulong)gid * p.dim;
+    uint c = 0;
+    const uint cn = min(new_count[gid], p.n_cand);
+    const uint co = min(old_count[gid], p.n_cand);
+    for (uint a = 0; a < cn; ++a) {  // new pivots: join new + old targets
+        const int pv = new_cand[(ulong)gid * p.n_cand + a];
+        if (pv < 0) continue;
+        const ulong base = (ulong)(uint)pv * p.n_cand;
+        c += nnd_join_list(h, xi, data, new_cand + base,
+                           min(new_count[(uint)pv], p.n_cand), p.dim,
+                           p.metric);
+        c += nnd_join_list(h, xi, data, old_cand + base,
+                           min(old_count[(uint)pv], p.n_cand), p.dim,
+                           p.metric);
+    }
+    for (uint a = 0; a < co; ++a) {  // old pivots: join new targets only
+        const int pv = old_cand[(ulong)gid * p.n_cand + a];
+        if (pv < 0) continue;
+        const ulong base = (ulong)(uint)pv * p.n_cand;
+        c += nnd_join_list(h, xi, data, new_cand + base,
+                           min(new_count[(uint)pv], p.n_cand), p.dim,
+                           p.metric);
+    }
+    h.store(heap_dist, heap_idx, heap_flag, (ulong)gid);
+    if (c > 0) atomic_fetch_add_explicit(updates, c, memory_order_relaxed);
+}
+
 // ---------------------------------------------------------------------------
 // Kernel 2: SGD layout epoch
 // ---------------------------------------------------------------------------
@@ -516,14 +858,8 @@ static inline int tau_rand_int(thread long state[3]) {
     return (int)(uint)((ulong)(state[0] ^ state[1] ^ state[2]));
 }
 
-// splitmix64 — used only to derive well-mixed per-(edge, epoch) tau seeds.
-static inline ulong splitmix64(thread ulong& s) {
-    s += 0x9E3779B97F4A7C15UL;
-    ulong z = s;
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9UL;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBUL;
-    return z ^ (z >> 31);
-}
+// splitmix64 (shared, defined above the kernel-3 section) derives the
+// well-mixed per-(edge, epoch) tau seeds here.
 
 static inline float clipf(float v) { return clamp(v, -4.0f, 4.0f); }
 

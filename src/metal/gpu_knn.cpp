@@ -93,6 +93,34 @@ MTL::Buffer* copy_buffer(MTL::Device* dev, const void* src,
     return dev->newBuffer(src, bytes, MTL::ResourceStorageModeShared);
 }
 
+// --- gpu-nnd additions -------------------------------------------------------
+// Queries are dispatched in slices, one command buffer per slice, so a single
+// submission stays well under the macOS GPU watchdog. A monolithic dispatch
+// at n = nq = 100k (~2 s) was observed to be sporadically ABORTED by the
+// system — and the engine, which never checked the command-buffer status,
+// silently returned the zero-filled output buffers (recall collapse in the
+// gpu-nnd benchmark uncovered it). The work budget per slice keeps each
+// buffer at roughly a couple hundred ms.
+constexpr std::size_t kChunkWorkBudget = std::size_t(2) << 33;  // ~1.7e10
+
+std::size_t query_chunk_rows(std::size_t work_per_query, int nq) {
+    const std::size_t chunk =
+        kChunkWorkBudget / std::max<std::size_t>(1, work_per_query);
+    return std::min<std::size_t>(
+        static_cast<std::size_t>(nq),
+        std::max<std::size_t>(4096, chunk));
+}
+
+// waitUntilCompleted + status verification: an errored/aborted buffer means
+// the outputs are garbage — callers must fall back (return false).
+bool commit_and_wait(MTL::CommandBuffer* cmd) {
+    cmd->commit();
+    cmd->waitUntilCompleted();
+    return cmd->status() == MTL::CommandBufferStatusCompleted &&
+           cmd->error() == nullptr;
+}
+// -----------------------------------------------------------------------------
+
 }  // namespace
 
 bool gpu_brute_force_knn(const float* data, int n, int dim,
@@ -168,42 +196,55 @@ bool gpu_brute_force_knn(const float* data, int n, int dim,
 
     KnnDenseParams params;
     params.n = static_cast<uint32_t>(n);
-    params.nq = static_cast<uint32_t>(nq);
     params.dim = static_cast<uint32_t>(dim);
     params.k = static_cast<uint32_t>(k);
     params.p = p_exp;
 
-    MTL::CommandBuffer* cmd = ctx.queue->commandBuffer();
-    MTL::ComputeCommandEncoder* enc = cmd->computeCommandEncoder();
-    enc->setComputePipelineState(pso);
-    enc->setBuffer(data_buf, 0, 0);
-    enc->setBuffer(query_buf, 0, 1);
-    enc->setBuffer(idx_buf, 0, 2);
-    enc->setBuffer(dist_buf, 0, 3);
-    enc->setBytes(&params, sizeof(params), 4);
-    enc->setBuffer(aux_buf, 0, 5);
+    // gpu-nnd additions: watchdog-safe query chunking + status checks (see
+    // kChunkWorkBudget above). Query/output rows are sliced via buffer-bind
+    // offsets; the kernel is unchanged (data indices stay absolute).
+    const std::size_t chunk = query_chunk_rows(
+        static_cast<std::size_t>(n) * static_cast<std::size_t>(dim), nq);
+    bool ok = true;
+    for (std::size_t off = 0; ok && off < static_cast<std::size_t>(nq);
+         off += chunk) {
+        const std::size_t rows =
+            std::min(chunk, static_cast<std::size_t>(nq) - off);
+        params.nq = static_cast<uint32_t>(rows);
 
-    // Dispatch whole threadgroups: inactive tail threads still take part in
-    // the cooperative tile loads/barriers (guarded in the kernel).
-    const NS::UInteger tg = std::min<NS::UInteger>(
-        pso->maxTotalThreadsPerThreadgroup(), heap ? 64 : 128);
-    const NS::UInteger groups =
-        (static_cast<NS::UInteger>(nq) + tg - 1) / tg;
-    enc->dispatchThreadgroups(MTL::Size::Make(groups, 1, 1),
-                              MTL::Size::Make(tg, 1, 1));
-    enc->endEncoding();
-    cmd->commit();
-    cmd->waitUntilCompleted();
+        MTL::CommandBuffer* cmd = ctx.queue->commandBuffer();
+        MTL::ComputeCommandEncoder* enc = cmd->computeCommandEncoder();
+        enc->setComputePipelineState(pso);
+        enc->setBuffer(data_buf, 0, 0);
+        enc->setBuffer(query_buf, off * dim * sizeof(float), 1);
+        enc->setBuffer(idx_buf, off * k * sizeof(int32_t), 2);
+        enc->setBuffer(dist_buf, off * k * sizeof(float), 3);
+        enc->setBytes(&params, sizeof(params), 4);
+        enc->setBuffer(aux_buf, 0, 5);
 
-    std::memcpy(out_idx, idx_buf->contents(), out_n * sizeof(int32_t));
-    std::memcpy(out_dists, dist_buf->contents(), out_n * sizeof(float));
+        // Dispatch whole threadgroups: inactive tail threads still take part
+        // in the cooperative tile loads/barriers (guarded in the kernel).
+        const NS::UInteger tg = std::min<NS::UInteger>(
+            pso->maxTotalThreadsPerThreadgroup(), heap ? 64 : 128);
+        const NS::UInteger groups =
+            (static_cast<NS::UInteger>(rows) + tg - 1) / tg;
+        enc->dispatchThreadgroups(MTL::Size::Make(groups, 1, 1),
+                                  MTL::Size::Make(tg, 1, 1));
+        enc->endEncoding();
+        ok = commit_and_wait(cmd);
+    }
+
+    if (ok) {
+        std::memcpy(out_idx, idx_buf->contents(), out_n * sizeof(int32_t));
+        std::memcpy(out_dists, dist_buf->contents(), out_n * sizeof(float));
+    }
 
     data_buf->release();
     if (!self_query) query_buf->release();
     idx_buf->release();
     dist_buf->release();
     aux_buf->release();
-    return true;
+    return ok;
 }
 
 bool gpu_sparse_brute_force_knn(const int32_t* d_indptr,
@@ -299,35 +340,50 @@ bool gpu_sparse_brute_force_knn(const int32_t* d_indptr,
 
     KnnSparseParams params;
     params.n = static_cast<uint32_t>(n);
-    params.nq = static_cast<uint32_t>(nq);
     params.k = static_cast<uint32_t>(k);
     params.metric = metric_id;
 
-    MTL::CommandBuffer* cmd = ctx.queue->commandBuffer();
-    MTL::ComputeCommandEncoder* enc = cmd->computeCommandEncoder();
-    enc->setComputePipelineState(pso);
-    enc->setBuffer(d_indptr_buf, 0, 0);
-    enc->setBuffer(d_indices_buf, 0, 1);
-    enc->setBuffer(d_data_buf, 0, 2);
-    enc->setBuffer(q_indptr_buf, 0, 3);
-    enc->setBuffer(q_indices_buf, 0, 4);
-    enc->setBuffer(q_data_buf, 0, 5);
-    enc->setBuffer(d_norms_buf, 0, 6);
-    enc->setBuffer(q_norms_buf, 0, 7);
-    enc->setBuffer(idx_buf, 0, 8);
-    enc->setBuffer(dist_buf, 0, 9);
-    enc->setBytes(&params, sizeof(params), 10);
+    // gpu-nnd additions: watchdog-safe query chunking + status checks, like
+    // the dense engine. The two-pointer dot walks ~(row nnz + data nnz) per
+    // (query, data-row) pair; d_nnz + n bounds the per-query merge work.
+    // q_indptr values are absolute offsets into the full q_indices/q_data
+    // buffers, so only the indptr/norms/output bindings shift per slice.
+    const std::size_t chunk =
+        query_chunk_rows(d_nnz + static_cast<std::size_t>(n), nq);
+    bool ok = true;
+    for (std::size_t off = 0; ok && off < static_cast<std::size_t>(nq);
+         off += chunk) {
+        const std::size_t rows =
+            std::min(chunk, static_cast<std::size_t>(nq) - off);
+        params.nq = static_cast<uint32_t>(rows);
 
-    const NS::UInteger tg = std::min<NS::UInteger>(
-        pso->maxTotalThreadsPerThreadgroup(), heap ? 64 : 128);
-    enc->dispatchThreads(MTL::Size::Make(nq, 1, 1),
-                         MTL::Size::Make(tg, 1, 1));
-    enc->endEncoding();
-    cmd->commit();
-    cmd->waitUntilCompleted();
+        MTL::CommandBuffer* cmd = ctx.queue->commandBuffer();
+        MTL::ComputeCommandEncoder* enc = cmd->computeCommandEncoder();
+        enc->setComputePipelineState(pso);
+        enc->setBuffer(d_indptr_buf, 0, 0);
+        enc->setBuffer(d_indices_buf, 0, 1);
+        enc->setBuffer(d_data_buf, 0, 2);
+        enc->setBuffer(q_indptr_buf, off * sizeof(int32_t), 3);
+        enc->setBuffer(q_indices_buf, 0, 4);
+        enc->setBuffer(q_data_buf, 0, 5);
+        enc->setBuffer(d_norms_buf, 0, 6);
+        enc->setBuffer(q_norms_buf, off * sizeof(float), 7);
+        enc->setBuffer(idx_buf, off * k * sizeof(int32_t), 8);
+        enc->setBuffer(dist_buf, off * k * sizeof(float), 9);
+        enc->setBytes(&params, sizeof(params), 10);
 
-    std::memcpy(out_idx, idx_buf->contents(), out_n * sizeof(int32_t));
-    std::memcpy(out_dists, dist_buf->contents(), out_n * sizeof(float));
+        const NS::UInteger tg = std::min<NS::UInteger>(
+            pso->maxTotalThreadsPerThreadgroup(), heap ? 64 : 128);
+        enc->dispatchThreads(MTL::Size::Make(rows, 1, 1),
+                             MTL::Size::Make(tg, 1, 1));
+        enc->endEncoding();
+        ok = commit_and_wait(cmd);
+    }
+
+    if (ok) {
+        std::memcpy(out_idx, idx_buf->contents(), out_n * sizeof(int32_t));
+        std::memcpy(out_dists, dist_buf->contents(), out_n * sizeof(float));
+    }
 
     d_indptr_buf->release();
     d_indices_buf->release();
@@ -341,7 +397,7 @@ bool gpu_sparse_brute_force_knn(const int32_t* d_indptr,
     }
     idx_buf->release();
     dist_buf->release();
-    return true;
+    return ok;
 }
 
 }  // namespace metal

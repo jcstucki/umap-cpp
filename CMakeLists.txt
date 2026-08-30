@@ -147,6 +147,7 @@ if(UMAP_ENABLE_METAL)
     target_sources(umapcpp PRIVATE
         src/metal/metal_context.cpp
         src/metal/gpu_knn.cpp
+        src/metal/gpu_nnd.cpp   # gpu-nnd additions: NN-descent host engine
         src/metal/gpu_layout.cpp
         src/metal/metal_knn.cpp)  # metal-knn additions: penalized-kNN host
     add_dependencies(umapcpp umap_metallib)
