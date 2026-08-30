@@ -178,9 +178,17 @@ kernels where they genuinely cover the computation:
   (one thread per query, data streamed through threadgroup-memory tiles — any
   n, any query count; per-thread top-k registers for k ≤ 64, a
   (dist, index)-heap for 64 < k ≤ 256);
-* the layout SGD of standard euclidean-output fits (one thread per edge,
-  hogwild float32 updates — the same race semantics as numba's
-  `parallel=True`; ~9× vs the sequential CPU loop on a 5k-point benchmark).
+* the layout SGD of euclidean-output **fits — densMAP included — and of
+  transform** (one thread per edge, hogwild float32 updates — the same race
+  semantics as numba's `parallel=True`). Transform's `move_other=false` SGD
+  never writes the frozen training rows (races confined to the query side);
+  densMAP keeps its per-epoch reductions host-side with the exact CPU numpy
+  float32 semantics (shared-storage embedding buffer) and runs the per-edge
+  density correction on the GPU. 5k-point benchmarks vs the sequential CPU
+  loop (hidden cases `-ns -tc="gpu sgd timing*"` / `-tc="gpu layout
+  timing*"`): plain fit 191 ms vs 1724 ms (~9×), densMAP 280 ms vs 1913 ms
+  (~6.8×, 200 epochs / 60 corrected), transform 84 ms vs 175 ms (~2×, 1000
+  queries, 100 epochs).
 
 kNN coverage by site (device=GPU; anything not covered falls back to the
 bit-exact CPU port with a stderr note):
@@ -212,12 +220,18 @@ exact graph regardless, so for multi-hundred-k datasets where fit time
 dominates quality needs, prefer `Device::CPU`.
 
 GPU results are validated at embedding-quality level (per-metric kNN parity
-vs a float64 CPU reference at ≤ 1e-5, trustworthiness parity with CPU fits),
-**not** bitwise: kNN distances are float32 (exact ties resolve in ascending
-data-index order), Metal has no float64, the device RNG is seeded per
-(edge, epoch), and hogwild updates race by design. densMAP, non-euclidean
-output metrics, n_epochs lists and transform's frozen-embedding SGD keep
-their layout optimization on the CPU (kNN can still be GPU). Users who need
+vs a float64 CPU reference at ≤ 1e-5, trustworthiness parity with CPU fits
+and transforms, held-out transform accuracy, densMAP density-order parity —
+rad_emb Spearman ≥ 0.9 vs the seeded CPU run, inside the CPU reference's own
+sequential-vs-hogwild band), **not** bitwise: kNN distances are float32
+(exact ties resolve in ascending data-index order), Metal has no float64,
+the device RNG is seeded per (edge, epoch), and hogwild updates race by
+design. The complete remaining CPU-only surface under device=GPU: the
+NN-descent >crossover regime (n ≳ 35k, documented above), RandomState-
+stream-critical internals (`update()`, supervised target-y kNN,
+`inverse_transform` ranking, `output_dens` epilogue kNN, composites),
+n_epochs lists (embedding snapshots), non-euclidean output metrics,
+exotic/discrete/boolean/callable input metrics, and k > 256. Users who need
 seeded bit-exact parity with the Python reference should keep the default
 `Device::CPU`.
 
@@ -256,9 +270,9 @@ linking) — returns `false` and the caller runs its own CPU fallback.
 suites generated from the real Python implementation
 (`scripts/gen_golden*.py`, `scripts/gen_upstream_fixtures.py`):
 
-* Metal build: **425 test cases / 263,295 assertions**, 0 failures
-  (24 skips: version-removed scipy metrics, upstream `@skip` mirrors,
-  typed-surface-unrepresentable cases, two hidden GPU timing cases);
+* Metal build: **427 test cases / 265,239 assertions**, 0 failures
+  (25 skips: version-removed scipy metrics, upstream `@skip` mirrors,
+  typed-surface-unrepresentable cases, three hidden GPU timing cases);
 * CPU-only build: **407 cases / 174,687 assertions**, 0 failures (22 skips).
 
 `scripts/test_install.sh` additionally verifies `cmake --install`, the

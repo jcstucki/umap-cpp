@@ -219,7 +219,8 @@ struct ClusterFixture {
 struct GlueParts {
     std::vector<int32_t> head, tail;
     std::vector<double> eps;
-    std::vector<float> init;  // rescaled
+    std::vector<float> init;     // rescaled
+    std::vector<float> weights;  // filtered edge memberships (densmap mu)
 };
 
 GlueParts make_glue(const umap::SparseMatrix& graph_in, const float* init,
@@ -243,6 +244,7 @@ GlueParts make_glue(const umap::SparseMatrix& graph_in, const float* init,
     }
     out.eps = umap::make_epochs_per_sample(g.data.data(), g.data.size(),
                                            n_epochs);
+    out.weights = g.data;
     // [0, 10] per-component float32 rescale (identical to the CPU glue).
     out.init.assign(init, init + static_cast<std::size_t>(g.n_rows) *
                                      n_components);
@@ -465,6 +467,116 @@ TEST_CASE("gpu sgd timing on 5k points" * doctest::skip()) {
     MESSAGE("CPU sequential: " << ms(t1 - t0) << " ms, GPU: " << ms(t2 - t1)
                                << " ms (" << n_epochs << " epochs)");
     for (float v : gpu_emb) CHECK(std::isfinite(v));
+}
+
+// Rough transform-SGD (move_other=false) and densMAP timings at ~5k; hidden
+// by default (`-ns -tc="gpu layout timing*"`).
+TEST_CASE("gpu layout timing: transform and densmap SGD at 5k" *
+          doctest::skip()) {
+    METAL_REQUIRED();
+    const int n = 5000, dim = 8, k = 15;
+    const auto data = random_matrix(n, dim, 5);
+    std::vector<int32_t> knn_idx(static_cast<std::size_t>(n) * k);
+    std::vector<float> knn_dist(static_cast<std::size_t>(n) * k);
+    REQUIRE(umap::metal::gpu_brute_force_knn(
+        data.data(), n, dim, data.data(), n, k,
+        umap::metal::KnnMetric::euclidean, knn_idx.data(), knn_dist.data()));
+    const auto graph =
+        umap::fuzzy_simplicial_set(n, knn_idx.data(), knn_dist.data(), k)
+            .graph;
+    const auto ab = umap::find_ab_params(1.0, 0.1);
+    const double a = ab.a, b = ab.b;
+    const int64_t rng_state[3] = {1234567, -7654321, 55555};
+    using clock = std::chrono::steady_clock;
+    const auto ms = [](auto d) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(d).count();
+    };
+
+    // --- transform-style SGD: the graph rows of 1000 "queries" against the
+    // frozen 5k training embedding, 100 epochs at alpha/4 (the transform
+    // defaults for <= 10k queries).
+    {
+        const int nq = 1000, tr_epochs = 100;
+        GlueParts glue = make_glue(graph, random_matrix(n, 2, 6).data(), 2,
+                                   tr_epochs);
+        std::vector<int32_t> head, tail;
+        std::vector<float> w;
+        for (std::size_t e = 0; e < glue.head.size(); ++e) {
+            if (glue.head[e] < nq) {
+                head.push_back(glue.head[e]);
+                tail.push_back(glue.tail[e]);
+                w.push_back(glue.weights[e]);
+            }
+        }
+        const std::vector<double> eps =
+            umap::make_epochs_per_sample(w.data(), w.size(), tr_epochs);
+        const std::vector<float> tail_emb = glue.init;  // frozen training emb
+        std::vector<float> q0(glue.init.begin(),
+                              glue.init.begin() + static_cast<std::size_t>(nq) * 2);
+        MESSAGE("transform edges: " << head.size());
+
+        std::vector<float> cpu_q = q0, cpu_tail = tail_emb;
+        auto t0 = clock::now();
+        umap::optimize_layout_euclidean(
+            cpu_q.data(), nq, cpu_tail.data(), 2, head, tail, tr_epochs, n,
+            eps, a, b, rng_state, 1.0, 0.25, 5.0, /*parallel=*/false,
+            /*densmap=*/false, /*move_other=*/false);
+        auto t1 = clock::now();
+        std::vector<float> gpu_q = q0, gpu_tail = tail_emb;
+        REQUIRE(umap::metal::gpu_optimize_layout_euclidean(
+            gpu_q.data(), nq, gpu_tail.data(), 2, head, tail, tr_epochs, n,
+            eps, a, b, rng_state, 1.0, 0.25, 5.0, /*move_other=*/false));
+        auto t2 = clock::now();
+        MESSAGE("transform SGD — CPU sequential: " << ms(t1 - t0)
+                << " ms, GPU: " << ms(t2 - t1) << " ms (" << tr_epochs
+                << " epochs)");
+        for (float v : gpu_q) CHECK(std::isfinite(v));
+    }
+
+    // --- densMAP fit-style SGD: 200 epochs, correction active for the last
+    // 30% (frac=0.3); plausible aux data (R standard-normal, mu = filtered
+    // memberships) — the kernel work is identical to a real fit.
+    {
+        const int dm_epochs = 200;
+        GlueParts glue = make_glue(graph, random_matrix(n, 2, 6).data(), 2,
+                                   dm_epochs);
+        umap::DensmapParams dk;
+        dk.lambda = 2.0;
+        dk.frac = 0.3;
+        dk.var_shift = 0.1;
+        dk.mu = glue.weights;
+        dk.mu_sum.assign(static_cast<std::size_t>(n), 0.0f);
+        for (std::size_t e = 0; e < glue.head.size(); ++e) {
+            dk.mu_sum[static_cast<std::size_t>(glue.head[e])] +=
+                glue.weights[e];
+            dk.mu_sum[static_cast<std::size_t>(glue.tail[e])] +=
+                glue.weights[e];
+        }
+        TestRng rrng(99);
+        dk.R.resize(static_cast<std::size_t>(n));
+        for (auto& v : dk.R) v = static_cast<float>(rrng.normal());
+        MESSAGE("densmap edges: " << glue.head.size());
+
+        std::vector<float> cpu_emb = glue.init;
+        auto t0 = clock::now();
+        umap::optimize_layout_euclidean(
+            cpu_emb.data(), n, cpu_emb.data(), 2, glue.head, glue.tail,
+            dm_epochs, n, glue.eps, a, b, rng_state, 1.0, 1.0, 5.0,
+            /*parallel=*/false, /*densmap=*/true, /*move_other=*/true,
+            /*epochs_list=*/nullptr, /*embedding_list=*/nullptr, &dk);
+        auto t1 = clock::now();
+        std::vector<float> gpu_emb = glue.init;
+        REQUIRE(umap::metal::gpu_optimize_layout_euclidean(
+            gpu_emb.data(), n, gpu_emb.data(), 2, glue.head, glue.tail,
+            dm_epochs, n, glue.eps, a, b, rng_state, 1.0, 1.0, 5.0,
+            /*move_other=*/true, &dk));
+        auto t2 = clock::now();
+        MESSAGE("densMAP SGD — CPU sequential: " << ms(t1 - t0)
+                << " ms, GPU: " << ms(t2 - t1) << " ms (" << dm_epochs
+                << " epochs, correction in the last "
+                << static_cast<int>(dm_epochs * dk.frac) << ")");
+        for (float v : gpu_emb) CHECK(std::isfinite(v));
+    }
 }
 
 // --- phase4 additions --------------------------------------------------------
