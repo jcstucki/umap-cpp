@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -246,10 +247,58 @@ void densmap_epoch_init(const float* head_embedding,
 }
 // ----------------------------------------------------------------------------
 
+// --- perf P2 additions -------------------------------------------------------
+// Approximate pow(x, y) for the unseeded hogwild path. Defined and wired in a
+// later change (P2-GATED); forward-declared here so pow_sel<true> parses. It is
+// never odr-used in this change (dispatch only emits FASTPOW=false), so no
+// definition is required for the link.
+inline double fast_pow(double x, double y);
+
+// pow selector: the seeded/sequential path (FASTPOW=false) uses libm std::pow
+// so the bit-contract with numba holds. FASTPOW=true (fast_pow, unseeded path)
+// is enabled in a later change; here only the false instantiation is ever
+// generated, so std::pow is the sole code path.
+template <bool FASTPOW>
+inline double pow_sel(double x, double y) {
+    if constexpr (FASTPOW) {
+        return fast_pow(x, y);
+    } else {
+        return std::pow(x, y);
+    }
+}
+
+// Compile-time-dim reduced euclidean distance. DIM>0 unrolls the loop with the
+// SAME left-to-right float32 accumulation order as the runtime rdist (bit
+// identical); DIM==0 forwards to the runtime rdist with the passed dim.
+template <int DIM>
+inline float rdist_t(const float* x, const float* y, int dim) {
+    if constexpr (DIM > 0) {
+        (void)dim;
+        float result = 0.0f;
+        for (int i = 0; i < DIM; ++i) {
+            const float diff = x[i] - y[i];
+            result += diff * diff;
+        }
+        return result;
+    } else {
+        return rdist(x, y, dim);
+    }
+}
+
 // One epoch over edges [i_begin, i_end) — the numba
-// _optimize_layout_euclidean_single_epoch body (including the densmap_flag
-// branch; `dens` carries the per-epoch densMAP scalars/arrays).
-void optimize_euclidean_epoch_range(
+// _optimize_layout_euclidean_single_epoch body. Templated on:
+//   DIM     compile-time n_components (0 = runtime `dim`); the common fit is
+//           DIM==2, which unrolls the coordinate loops.
+//   DENSMAP whether the densMAP correction is present; when false the entire
+//           density branch and its per-edge struct traffic are elided.
+//   FASTPOW whether to use the approximate fast_pow (unseeded hogwild path
+//           only) instead of libm std::pow.
+// The arithmetic is identical to the original scalar kernel for every
+// (DIM, DENSMAP=..., FASTPOW=false) instantiation: the specializations only
+// reorganize control flow (loop unrolling, dead-branch elision, edge skipping),
+// they do not change the sequence of float operations.
+template <int DIM, bool DENSMAP, bool FASTPOW>
+void optimize_euclidean_epoch_range_t(
     std::size_t i_begin, std::size_t i_end, float* head_embedding,
     float* tail_embedding, const int32_t* head, const int32_t* tail,
     int n_vertices, const double* epochs_per_sample, double a, double b,
@@ -257,26 +306,31 @@ void optimize_euclidean_epoch_range(
     double alpha, const double* epochs_per_negative_sample,
     double* epoch_of_next_negative_sample, double* epoch_of_next_sample,
     int n, const DensmapEpochState& dens) {
+    const std::size_t stride = static_cast<std::size_t>(DIM > 0 ? DIM : dim);
     for (std::size_t i = i_begin; i < i_end; ++i) {
-        if (epoch_of_next_sample[i] <= static_cast<double>(n)) {
-            const int32_t j = head[i];
-            int32_t k = tail[i];
+        // Skip edges whose next-sample epoch hasn't arrived without entering
+        // the body (identical to the guarded original; just an early continue).
+        if (epoch_of_next_sample[i] > static_cast<double>(n)) continue;
 
-            float* current = head_embedding + static_cast<std::size_t>(j) * dim;
-            float* other = tail_embedding + static_cast<std::size_t>(k) * dim;
+        const int32_t j = head[i];
+        int32_t k = tail[i];
 
-            float dist_squared = rdist(current, other, dim);
+        float* current = head_embedding + static_cast<std::size_t>(j) * stride;
+        float* other = tail_embedding + static_cast<std::size_t>(k) * stride;
 
-            // --- densmap additions ------------------------------------------
-            // grad_cor_coeff: float64 except where two float32 operands meet
-            // (re_std_sq, weight_j/k, mu[i] * re_std), exactly as numba types
-            // the reference kernel. np.exp(f4) is float32 expf.
-            double grad_cor_coeff = 0.0;
+        float dist_squared = rdist_t<DIM>(current, other, dim);
+
+        // --- densmap additions ----------------------------------------------
+        // grad_cor_coeff: float64 except where two float32 operands meet
+        // (re_std_sq, weight_j/k, mu[i] * re_std), exactly as numba types the
+        // reference kernel. np.exp(f4) is float32 expf.
+        double grad_cor_coeff = 0.0;
+        if constexpr (DENSMAP) {
             if (dens.flag) {
                 const double dsq = static_cast<double>(dist_squared);
-                const double phi = 1.0 / (1.0 + a * std::pow(dsq, b));
-                const double dphi_term = a * b * std::pow(dsq, b - 1.0) /
-                                         (1.0 + a * std::pow(dsq, b));
+                const double phi = 1.0 / (1.0 + a * pow_sel<FASTPOW>(dsq, b));
+                const double dphi_term = a * b * pow_sel<FASTPOW>(dsq, b - 1.0) /
+                                         (1.0 + a * pow_sel<FASTPOW>(dsq, b));
 
                 const double q_jk =
                     phi / static_cast<double>(
@@ -319,89 +373,124 @@ void optimize_euclidean_epoch_range(
                     static_cast<double>(dens.mu[i] * dens.re_std) /
                     static_cast<double>(n_vertices);
             }
-            // ----------------------------------------------------------------
+        }
+        // --------------------------------------------------------------------
 
-            double grad_coeff;
-            if (dist_squared > 0.0f) {
-                grad_coeff = -2.0 * a * b *
-                             std::pow(static_cast<double>(dist_squared), b - 1.0);
-                grad_coeff /=
-                    a * std::pow(static_cast<double>(dist_squared), b) + 1.0;
-            } else {
-                grad_coeff = 0.0;
-            }
+        double grad_coeff;
+        if (dist_squared > 0.0f) {
+            grad_coeff = -2.0 * a * b *
+                         pow_sel<FASTPOW>(static_cast<double>(dist_squared),
+                                          b - 1.0);
+            grad_coeff /=
+                a * pow_sel<FASTPOW>(static_cast<double>(dist_squared), b) + 1.0;
+        } else {
+            grad_coeff = 0.0;
+        }
 
-            for (int d = 0; d < dim; ++d) {
-                double grad_d = clip(
-                    grad_coeff * static_cast<double>(current[d] - other[d]));
+        const int dloop = DIM > 0 ? DIM : dim;
+        for (int d = 0; d < dloop; ++d) {
+            double grad_d =
+                clip(grad_coeff * static_cast<double>(current[d] - other[d]));
 
-                // --- densmap additions --------------------------------------
+            // --- densmap additions ------------------------------------------
+            if constexpr (DENSMAP) {
                 if (dens.flag) {
                     grad_d += clip(2.0 * grad_cor_coeff *
                                    static_cast<double>(current[d] - other[d]));
                 }
-                // ------------------------------------------------------------
-
-                current[d] =
-                    static_cast<float>(current[d] + grad_d * alpha);
-                if (move_other) {
-                    other[d] =
-                        static_cast<float>(other[d] + (-grad_d) * alpha);
-                }
             }
+            // ----------------------------------------------------------------
 
-            epoch_of_next_sample[i] += epochs_per_sample[i];
-
-            // int() in numba truncates toward zero, as does the C++ cast.
-            const long long n_neg_samples = static_cast<long long>(
-                (static_cast<double>(n) - epoch_of_next_negative_sample[i]) /
-                epochs_per_negative_sample[i]);
-
-            int64_t* rng_state = rng_state_per_sample + 3 * static_cast<std::size_t>(j);
-
-            for (long long p = 0; p < n_neg_samples; ++p) {
-                // numba `%` follows Python semantics: result has the sign of
-                // the (positive) divisor.
-                long long r = static_cast<long long>(tau_rand_int(rng_state)) %
-                              static_cast<long long>(n_vertices);
-                if (r < 0) r += n_vertices;
-                k = static_cast<int32_t>(r);
-
-                other = tail_embedding + static_cast<std::size_t>(k) * dim;
-
-                dist_squared = rdist(current, other, dim);
-
-                if (dist_squared > 0.0f) {
-                    grad_coeff = 2.0 * gamma * b;
-                    grad_coeff /=
-                        (0.001 + static_cast<double>(dist_squared)) *
-                        (a * std::pow(static_cast<double>(dist_squared), b) +
-                         1.0);
-                } else if (j == k) {
-                    continue;
-                } else {
-                    grad_coeff = 0.0;
-                }
-
-                for (int d = 0; d < dim; ++d) {
-                    double grad_d;
-                    if (grad_coeff > 0.0) {
-                        grad_d = clip(grad_coeff *
-                                      static_cast<double>(current[d] - other[d]));
-                    } else {
-                        grad_d = 0.0;
-                    }
-                    current[d] =
-                        static_cast<float>(current[d] + grad_d * alpha);
-                }
+            current[d] = static_cast<float>(current[d] + grad_d * alpha);
+            if (move_other) {
+                other[d] = static_cast<float>(other[d] + (-grad_d) * alpha);
             }
-
-            epoch_of_next_negative_sample[i] +=
-                static_cast<double>(n_neg_samples) *
-                epochs_per_negative_sample[i];
         }
+
+        epoch_of_next_sample[i] += epochs_per_sample[i];
+
+        // int() in numba truncates toward zero, as does the C++ cast.
+        const long long n_neg_samples = static_cast<long long>(
+            (static_cast<double>(n) - epoch_of_next_negative_sample[i]) /
+            epochs_per_negative_sample[i]);
+
+        int64_t* rng_state =
+            rng_state_per_sample + 3 * static_cast<std::size_t>(j);
+
+        for (long long p = 0; p < n_neg_samples; ++p) {
+            // numba `%` follows Python semantics: result has the sign of the
+            // (positive) divisor.
+            long long r = static_cast<long long>(tau_rand_int(rng_state)) %
+                          static_cast<long long>(n_vertices);
+            if (r < 0) r += n_vertices;
+            k = static_cast<int32_t>(r);
+
+            other = tail_embedding + static_cast<std::size_t>(k) * stride;
+
+            dist_squared = rdist_t<DIM>(current, other, dim);
+
+            if (dist_squared > 0.0f) {
+                grad_coeff = 2.0 * gamma * b;
+                grad_coeff /=
+                    (0.001 + static_cast<double>(dist_squared)) *
+                    (a * pow_sel<FASTPOW>(static_cast<double>(dist_squared), b) +
+                     1.0);
+            } else if (j == k) {
+                continue;
+            } else {
+                grad_coeff = 0.0;
+            }
+
+            for (int d = 0; d < dloop; ++d) {
+                double grad_d;
+                if (grad_coeff > 0.0) {
+                    grad_d = clip(grad_coeff *
+                                  static_cast<double>(current[d] - other[d]));
+                } else {
+                    grad_d = 0.0;
+                }
+                current[d] = static_cast<float>(current[d] + grad_d * alpha);
+            }
+        }
+
+        epoch_of_next_negative_sample[i] +=
+            static_cast<double>(n_neg_samples) *
+            epochs_per_negative_sample[i];
     }
 }
+
+// Runtime dispatch over the compile-time epoch-kernel specializations. Picks
+// the DIM==2 unroll for the common 2-D fit and a generic DIM==0 kernel
+// otherwise; DENSMAP selects the density variant. Every instantiation here is
+// FASTPOW=false and bit-identical to the pre-refactor scalar kernel. (The
+// `fastpow` parameter is accepted for forward compatibility with the unseeded
+// fast-pow change; it currently only ever selects the libm path.)
+inline void dispatch_epoch_range(
+    bool densmap_active, bool fastpow, std::size_t i_begin, std::size_t i_end,
+    float* head_embedding, float* tail_embedding, const int32_t* head,
+    const int32_t* tail, int n_vertices, const double* epochs_per_sample,
+    double a, double b, int64_t* rng_state_per_sample, double gamma, int dim,
+    bool move_other, double alpha, const double* epochs_per_negative_sample,
+    double* epoch_of_next_negative_sample, double* epoch_of_next_sample, int n,
+    const DensmapEpochState& dens) {
+    (void)fastpow;  // always the libm path in this change
+#define UMAP_DISPATCH_CALL(D, DM)                                             \
+    optimize_euclidean_epoch_range_t<D, DM, false>(                          \
+        i_begin, i_end, head_embedding, tail_embedding, head, tail,          \
+        n_vertices, epochs_per_sample, a, b, rng_state_per_sample, gamma,    \
+        dim, move_other, alpha, epochs_per_negative_sample,                  \
+        epoch_of_next_negative_sample, epoch_of_next_sample, n, dens)
+    const bool dim2 = (dim == 2);
+    if (densmap_active) {
+        if (dim2) UMAP_DISPATCH_CALL(2, true);
+        else UMAP_DISPATCH_CALL(0, true);
+    } else {
+        if (dim2) UMAP_DISPATCH_CALL(2, false);
+        else UMAP_DISPATCH_CALL(0, false);
+    }
+#undef UMAP_DISPATCH_CALL
+}
+// -----------------------------------------------------------------------------
 
 }  // namespace
 
@@ -553,11 +642,14 @@ void optimize_layout_euclidean(
         }
         // --------------------------------------------------------------------
         if (!parallel || n_threads <= 1) {
-            // Sequential numba path (parallel=False): edges in order.
-            optimize_euclidean_epoch_range(
-                0, n_edges, head_embedding, tail_embedding, head.data(),
-                tail.data(), n_vertices, epochs_per_sample.data(), a, b,
-                rng_state_per_sample.data(), gamma, dim, move_other, alpha,
+            // Sequential numba path (parallel=False): edges in order. Routed
+            // through the specialized dispatcher (DIM==2 unroll + non-densMAP
+            // elision + edge-skip); FASTPOW=false keeps it bit-exact.
+            dispatch_epoch_range(
+                densmap, /*fastpow=*/false, 0, n_edges, head_embedding,
+                tail_embedding, head.data(), tail.data(), n_vertices,
+                epochs_per_sample.data(), a, b, rng_state_per_sample.data(),
+                gamma, dim, move_other, alpha,
                 epochs_per_negative_sample.data(),
                 epoch_of_next_negative_sample.data(),
                 epoch_of_next_sample.data(), n, dens);
@@ -573,13 +665,19 @@ void optimize_layout_euclidean(
                 const std::size_t hi = std::min(n_edges, lo + chunk);
                 if (lo >= hi) break;
                 workers.emplace_back(
-                    optimize_euclidean_epoch_range, lo, hi, head_embedding,
-                    tail_embedding, head.data(), tail.data(), n_vertices,
-                    epochs_per_sample.data(), a, b,
-                    rng_state_per_sample.data(), gamma, dim, move_other, alpha,
-                    epochs_per_negative_sample.data(),
-                    epoch_of_next_negative_sample.data(),
-                    epoch_of_next_sample.data(), n, std::cref(dens));
+                    [=, &head, &tail, &epochs_per_sample,
+                     &rng_state_per_sample, &epochs_per_negative_sample,
+                     &epoch_of_next_negative_sample, &epoch_of_next_sample,
+                     &dens] {
+                        dispatch_epoch_range(
+                            densmap, /*fastpow=*/false, lo, hi, head_embedding,
+                            tail_embedding, head.data(), tail.data(),
+                            n_vertices, epochs_per_sample.data(), a, b,
+                            rng_state_per_sample.data(), gamma, dim, move_other,
+                            alpha, epochs_per_negative_sample.data(),
+                            epoch_of_next_negative_sample.data(),
+                            epoch_of_next_sample.data(), n, dens);
+                    });
             }
             for (auto& w : workers) w.join();
         }
