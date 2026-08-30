@@ -5,11 +5,14 @@
 //
 // Only compiled when UMAP_ENABLE_METAL; each case skips gracefully when no
 // Metal device / metallib is available at runtime.
+#include <unistd.h>  // getpid: PID-unique temp files
+
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -729,9 +732,11 @@ TEST_CASE("gpu-knn e2e: device=GPU standard-branch fit (6k) reaches "
     // bit-identical any more — assert the loaded model's held-out quality
     // instead; the kNN half of the loaded transform is still the exact
     // deterministic engine.)
-    const char* path = "/tmp/umap_gpu_knn_e2e_model.bin";
-    gpu_model.save(path);
-    umap::UMAP loaded = umap::UMAP::load(path);
+    // PID-unique name: concurrent suite runs must not clobber each other.
+    const std::string path = "/tmp/umap_gpu_knn_e2e_model_" +
+                             std::to_string(getpid()) + ".bin";
+    gpu_model.save(path.c_str());
+    umap::UMAP loaded = umap::UMAP::load(path.c_str());
     const auto loaded_q = loaded.transform(Q.data(), nq);
     REQUIRE(loaded_q.size() == gpu_q.size());
     for (float v : loaded_q) CHECK(std::isfinite(v));
@@ -739,6 +744,7 @@ TEST_CASE("gpu-knn e2e: device=GPU standard-branch fit (6k) reaches "
         centroid_correct(loaded, loaded_q, n_per, nq_per);
     CAPTURE(loaded_correct);
     CHECK(loaded_correct >= nq - 2);
+    std::remove(path.c_str());
 }
 
 TEST_CASE("gpu-knn e2e: sparse device=GPU fits (small + standard) and "

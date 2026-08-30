@@ -77,6 +77,13 @@ TEST_CASE("test_umap_sparse_trustworthiness") {
     const double trust =
         testutil::trustworthiness(dense.data(), n, dim, emb.data(), 2, 10);
     CAPTURE(trust);
+    // Upstream threshold verbatim. Note (2026-08-29): the unseeded fit runs
+    // the hogwild parallel SGD, so `trust` is a random variable; it stayed
+    // >= 0.88 across 80+ single-instance suite runs but grazed 0.8787 once
+    // when TWO suites ran concurrently (heavy preemption fattens the racy
+    // tail). If this ever flakes in normal use, harden it like the
+    // order-statistics cases in test_metal.cpp rather than lowering the
+    // upstream threshold.
     CHECK(trust >= 0.88);
 }
 

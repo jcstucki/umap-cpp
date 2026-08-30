@@ -2,6 +2,8 @@
 // C API coverage. The real consumer lives in tests/c_api_smoke.c (compiled as
 // C -- proving umap_c.h is C-compilable); this driver runs it and adds a
 // save/load round trip through the C surface.
+#include <unistd.h>  // getpid: PID-unique temp files
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -49,9 +51,11 @@ TEST_CASE("save/load round trip through the C API") {
     REQUIRE(umap_fit_transform(h, X.data(), n, dim, nullptr, emb.data()) ==
             UMAP_OK);
 
+    // PID-unique name: two concurrently-running test suites must not clobber
+    // each other's model file (observed in a stress loop, 2026-08-29).
     const std::string path =
         std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp") +
-        "/umapcpp_capi_roundtrip.umap";
+        "/umapcpp_capi_roundtrip_" + std::to_string(getpid()) + ".umap";
     REQUIRE(umap_save(h, path.c_str()) == UMAP_OK);
 
     umap_handle* h2 = umap_create(nullptr);
