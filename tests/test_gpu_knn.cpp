@@ -676,6 +676,23 @@ TEST_CASE("gpu-knn e2e: device=GPU standard-branch fit (6k) reaches "
     CAPTURE(gpu_correct);
     CHECK(gpu_correct >= nq - 2);
     CHECK(gpu_correct >= cpu_correct - 2);
+    // gpu-transform additions: the transform SGD itself now runs on the GPU
+    // (move_other=false kernel). Held-out ACCURACY is the parity criterion
+    // here (30/30 in every one of 30 measured runs, vs CPU 30/30 — the two
+    // CHECKs above); trustworthiness at nq=30/k=10 is dominated by the racy
+    // FIT draw, not the transform: measured over 5 GPU fits x 6 transforms
+    // (2026-08-29): trust_q 0.871-0.964 between fits, +/-0.015 within a fit,
+    // vs CPU 0.968 — so the trust clause is an absolute floor ~3 sd under
+    // the observed minimum, not a CPU-delta.
+    const double trust_q_cpu =
+        testutil::trustworthiness(Q.data(), nq, dim, cpu_q.data(), 2, 10);
+    const double trust_q_gpu =
+        testutil::trustworthiness(Q.data(), nq, dim, gpu_q.data(), 2, 10);
+    CAPTURE(trust_q_cpu);
+    CAPTURE(trust_q_gpu);
+    MESSAGE("transform trustworthiness — CPU: " << trust_q_cpu
+            << ", GPU: " << trust_q_gpu);
+    CHECK(trust_q_gpu >= 0.80);
 
     // update() needs the NN-descent index the GPU fit skipped: clear error.
     const auto upd = three_cluster_data(2, 31);
@@ -684,14 +701,21 @@ TEST_CASE("gpu-knn e2e: device=GPU standard-branch fit (6k) reaches "
         "update() requires a search index"));
 
     // Save/load round-trip: the index sections are optional, a loaded GPU
-    // model transforms via the engine again.
+    // model transforms via the engine again. (gpu-transform additions: the
+    // transform SGD is now the racy GPU kernel, so two transforms are not
+    // bit-identical any more — assert the loaded model's held-out quality
+    // instead; the kNN half of the loaded transform is still the exact
+    // deterministic engine.)
     const char* path = "/tmp/umap_gpu_knn_e2e_model.bin";
     gpu_model.save(path);
     umap::UMAP loaded = umap::UMAP::load(path);
     const auto loaded_q = loaded.transform(Q.data(), nq);
     REQUIRE(loaded_q.size() == gpu_q.size());
-    for (std::size_t i = 0; i < gpu_q.size(); ++i)
-        CHECK(loaded_q[i] == gpu_q[i]);
+    for (float v : loaded_q) CHECK(std::isfinite(v));
+    const int loaded_correct =
+        centroid_correct(loaded, loaded_q, n_per, nq_per);
+    CAPTURE(loaded_correct);
+    CHECK(loaded_correct >= nq - 2);
 }
 
 TEST_CASE("gpu-knn e2e: sparse device=GPU fits (small + standard) and "

@@ -624,6 +624,15 @@ TEST_CASE("phase4 dispatch: unsupported GPU combos fall back to the bit-exact "
         REQUIRE(gpu_model.embedding().size() == cpu_model.embedding().size());
         for (std::size_t i = 0; i < cpu_model.embedding().size(); ++i)
             CHECK(gpu_model.embedding()[i] == cpu_model.embedding()[i]);
+        // gpu-transform additions: the generic (non-euclidean output) SGD of
+        // transform is equally CPU-only — the whole transform stays bit-exact
+        // under device=GPU.
+        const auto Q = three_cluster_data(4, 8321);
+        const auto cpu_q = cpu_model.transform(Q.data(), 12);
+        const auto gpu_q = gpu_model.transform(Q.data(), 12);
+        REQUIRE(gpu_q.size() == cpu_q.size());
+        for (std::size_t i = 0; i < cpu_q.size(); ++i)
+            CHECK(gpu_q[i] == cpu_q[i]);
     }
     SUBCASE("n_epochs list") {
         umap::UMAPParams p = base;
@@ -642,5 +651,79 @@ TEST_CASE("phase4 dispatch: unsupported GPU combos fall back to the bit-exact "
                 CHECK(gpu_model.embedding_list()[s][i] ==
                       cpu_model.embedding_list()[s][i]);
     }
+}
+// -----------------------------------------------------------------------------
+
+// --- gpu-transform additions -------------------------------------------------
+// transform's move_other=false SGD on the Metal kernel (frozen training tail).
+
+TEST_CASE("gpu transform sgd: held-out quality parity vs the CPU transform "
+          "(small-data GPU fit)") {
+    METAL_REQUIRED();
+    const int n_per = 80, dim = 6, n = 3 * n_per;
+    const auto X = three_cluster_data(n_per, 20260829);
+
+    umap::UMAPParams p;
+    p.n_neighbors = 10;
+    p.init = "random";
+    p.random_state = 42;
+
+    umap::UMAP cpu_model(p);
+    cpu_model.fit(X.data(), n, dim);
+    p.device = umap::Device::GPU;
+    umap::UMAP gpu_model(p);
+    gpu_model.fit(X.data(), n, dim);
+
+    const int nq_per = 15, nq = 3 * nq_per;
+    const auto Q = three_cluster_data(nq_per, 424243);
+    const auto cpu_q = cpu_model.transform(Q.data(), nq);
+    const auto gpu_q = gpu_model.transform(Q.data(), nq);
+    REQUIRE(gpu_q.size() == static_cast<std::size_t>(nq) * 2);
+    for (float v : gpu_q) CHECK(std::isfinite(v));
+
+    // Held-out accuracy: queries land nearest their own cluster's embedded
+    // centroid (each embedding measured against its own model's centroids).
+    const auto accuracy = [&](const umap::UMAP& model,
+                              const std::vector<float>& q_emb) {
+        std::array<std::array<double, 2>, 3> cent{};
+        for (int c = 0; c < 3; ++c)
+            for (int i = 0; i < n_per; ++i)
+                for (int d = 0; d < 2; ++d)
+                    cent[c][d] += model.embedding()[(c * n_per + i) * 2 + d] /
+                                  n_per;
+        int correct = 0;
+        for (int c = 0; c < 3; ++c) {
+            for (int i = 0; i < nq_per; ++i) {
+                const float* e = q_emb.data() + (c * nq_per + i) * 2;
+                int best = -1;
+                double best_d = 1e300;
+                for (int cc = 0; cc < 3; ++cc) {
+                    const double dx = e[0] - cent[cc][0];
+                    const double dy = e[1] - cent[cc][1];
+                    if (dx * dx + dy * dy < best_d) {
+                        best_d = dx * dx + dy * dy;
+                        best = cc;
+                    }
+                }
+                if (best == c) ++correct;
+            }
+        }
+        return correct;
+    };
+    const int cpu_correct = accuracy(cpu_model, cpu_q);
+    const int gpu_correct = accuracy(gpu_model, gpu_q);
+    const double trust_cpu =
+        testutil::trustworthiness(Q.data(), nq, dim, cpu_q.data(), 2, 10);
+    const double trust_gpu =
+        testutil::trustworthiness(Q.data(), nq, dim, gpu_q.data(), 2, 10);
+    CAPTURE(cpu_correct);
+    CAPTURE(gpu_correct);
+    CAPTURE(trust_cpu);
+    CAPTURE(trust_gpu);
+    MESSAGE("transform quality — CPU correct: " << cpu_correct << "/" << nq
+            << ", GPU correct: " << gpu_correct << "/" << nq
+            << ", CPU trust: " << trust_cpu << ", GPU trust: " << trust_gpu);
+    CHECK(gpu_correct >= cpu_correct - 2);
+    CHECK(trust_gpu >= trust_cpu - 0.05);
 }
 // -----------------------------------------------------------------------------

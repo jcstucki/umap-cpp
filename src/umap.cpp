@@ -32,6 +32,7 @@
 // --- phase4 additions --------------------------------------------------------
 #ifdef UMAP_ENABLE_METAL
 #include "umap/metal/gpu_knn.hpp"
+#include "umap/metal/gpu_layout.hpp"  // gpu-transform additions
 #endif
 // -----------------------------------------------------------------------------
 
@@ -3515,16 +3516,29 @@ std::vector<float> UMAP::transform(const float* X_new,
 
 std::vector<float> UMAP::transform_from_membership(
     const MembershipStrengths& ms, int64_t n_queries) const {
-    // --- phase4 additions ----------------------------------------------------
-    // transform's SGD (move_other=false against the frozen training
-    // embedding) is not routed to the Metal kernel: GPU quality parity was
-    // validated for the fit configuration only. Note once per call and run
-    // the CPU path. (gpu-knn additions: the transform *kNN* does run on the
-    // Metal engine where covered; this note is about the optimization only.)
+    // --- gpu-transform additions ---------------------------------------------
+    // transform's SGD (move_other=false, head = query embedding against the
+    // FROZEN training tail) runs on the Metal kernel for the euclidean output
+    // metric: the kernel's move_other flag skips all tail writes, so races
+    // are confined to same-query updates and tail reads are stable — better-
+    // behaved than the fit configuration. Non-euclidean output metrics (the
+    // upstream `if output_metric == "euclidean"` test — "l2" included) keep
+    // the bit-exact CPU generic path with a note, as does a missing Metal
+    // runtime. (gpu-knn additions: the transform *kNN* runs on the Metal
+    // engine where covered, independently of this seam.)
+    bool gpu_sgd = false;
     if (params_.device == Device::GPU) {
-        warn_msg(
-            "UMAP: device=GPU covers transform's kNN but not its "
-            "optimization; the move_other=false SGD runs on the CPU.");
+        if (params_.output_metric != "euclidean") {
+            warn_msg(
+                "UMAP: device=GPU requested but non-euclidean output metrics "
+                "are CPU-only; running transform's SGD on the CPU.");
+        } else if (!metal_available()) {
+            warn_msg(
+                "UMAP: device=GPU requested but no Metal device/metallib is "
+                "available at runtime; running transform's SGD on the CPU.");
+        } else {
+            gpu_sgd = true;
+        }
     }
     // -------------------------------------------------------------------------
     const int dim_out = params_.n_components;
@@ -3579,14 +3593,36 @@ std::vector<float> UMAP::transform_from_membership(
     // branch here, unlike fit's euclidean_output test).
     std::vector<float> tail_embedding = embedding_;
     if (params_.output_metric == "euclidean") {
-        optimize_layout_euclidean(
-            embedding.data(), static_cast<int>(n_queries),
-            tail_embedding.data(), dim_out, head, tail, n_epochs,
-            static_cast<int>(n_), epochs_per_sample, a_, b_, rng_state,
-            params_.repulsion_strength, initial_alpha_ / 4.0,
-            static_cast<double>(params_.negative_sample_rate),
-            /*parallel=*/!params_.random_state.has_value(), /*densmap=*/false,
-            /*move_other=*/false);
+        // --- gpu-transform additions -----------------------------------------
+        bool gpu_done = false;
+        if (gpu_sgd) {
+#ifdef UMAP_ENABLE_METAL
+            gpu_done = metal::gpu_optimize_layout_euclidean(
+                embedding.data(), static_cast<int>(n_queries),
+                tail_embedding.data(), dim_out, head, tail, n_epochs,
+                static_cast<int>(n_), epochs_per_sample, a_, b_, rng_state,
+                params_.repulsion_strength, initial_alpha_ / 4.0,
+                static_cast<double>(params_.negative_sample_rate),
+                /*move_other=*/false);
+#endif
+            if (!gpu_done) {
+                warn_msg(
+                    "UMAP: GPU transform SGD requested but the Metal kernel "
+                    "is unavailable; running on the CPU.");
+            }
+        }
+        // ---------------------------------------------------------------------
+        if (!gpu_done) {
+            optimize_layout_euclidean(
+                embedding.data(), static_cast<int>(n_queries),
+                tail_embedding.data(), dim_out, head, tail, n_epochs,
+                static_cast<int>(n_), epochs_per_sample, a_, b_, rng_state,
+                params_.repulsion_strength, initial_alpha_ / 4.0,
+                static_cast<double>(params_.negative_sample_rate),
+                /*parallel=*/!params_.random_state.has_value(),
+                /*densmap=*/false,
+                /*move_other=*/false);
+        }
     } else {
         // --- densmap additions ----------------------------------------------
         // hardening additions: output_metric == "custom" substitutes the
