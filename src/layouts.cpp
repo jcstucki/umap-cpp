@@ -4,11 +4,15 @@
 #include "umap/layouts.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 
@@ -492,6 +496,105 @@ inline void dispatch_epoch_range(
 }
 // -----------------------------------------------------------------------------
 
+// --- perf P6 additions -------------------------------------------------------
+// Persistent worker pool for the hogwild parallel SGD path. The previous
+// implementation spawned/joined n_threads std::threads every epoch (500+ epochs
+// x ~10 threads = thousands of spawns per fit); this reuses a fixed set of
+// workers across all epochs. The work partition is identical to the old code
+// (contiguous static [lo, hi) chunks, chunk t = [t*chunk, (t+1)*chunk)), and
+// each worker runs the same dispatch_epoch_range as before -- the hogwild races
+// (racy float32 embedding / rng-state writes) are unchanged, so this is the
+// SAFE reorganization the non-deterministic contract allows: same work, no
+// respawn. The main thread runs chunk 0 itself; workers cover chunks 1..T-1.
+class EpochThreadPool {
+   public:
+    // n_workers background threads handle chunks 1..n_workers (chunk 0 is run
+    // inline by the caller in run_epoch).
+    explicit EpochThreadPool(unsigned n_workers) : n_workers_(n_workers) {
+        workers_.reserve(n_workers_);
+        for (unsigned t = 0; t < n_workers_; ++t) {
+            workers_.emplace_back([this, t] { worker_loop(t + 1); });
+        }
+    }
+
+    ~EpochThreadPool() {
+        {
+            std::unique_lock<std::mutex> lk(mtx_);
+            stop_ = true;
+            ++generation_;
+        }
+        cv_.notify_all();
+        for (auto& w : workers_) {
+            if (w.joinable()) w.join();
+        }
+    }
+
+    EpochThreadPool(const EpochThreadPool&) = delete;
+    EpochThreadPool& operator=(const EpochThreadPool&) = delete;
+
+    // Run `task` over chunk indices [0, total_chunks): the caller executes
+    // chunk 0 inline; workers pick up 1..total_chunks-1. Blocks until all done.
+    void run_epoch(const std::function<void(unsigned)>& task,
+                   unsigned total_chunks) {
+        {
+            std::unique_lock<std::mutex> lk(mtx_);
+            task_ = &task;
+            total_chunks_ = total_chunks;
+            pending_.store((total_chunks > 1) ? (total_chunks - 1) : 0);
+            ++generation_;
+        }
+        cv_.notify_all();
+        // Main thread runs chunk 0 (if any).
+        if (total_chunks > 0) task(0);
+        // Wait for workers to finish their chunks.
+        if (pending_.load() != 0) {
+            std::unique_lock<std::mutex> lk(done_mtx_);
+            done_cv_.wait(lk, [this] { return pending_.load() == 0; });
+        }
+    }
+
+   private:
+    void worker_loop(unsigned chunk_index) {
+        uint64_t seen = 0;
+        for (;;) {
+            const std::function<void(unsigned)>* task = nullptr;
+            unsigned total = 0;
+            {
+                std::unique_lock<std::mutex> lk(mtx_);
+                cv_.wait(lk,
+                         [this, &seen] { return generation_ != seen || stop_; });
+                if (stop_) return;
+                seen = generation_;
+                task = task_;
+                total = total_chunks_;
+            }
+            if (task != nullptr && chunk_index < total) {
+                (*task)(chunk_index);
+            }
+            // Signal completion for this chunk (only chunks 1..total-1 count).
+            if (chunk_index < total) {
+                if (pending_.fetch_sub(1) == 1) {
+                    std::lock_guard<std::mutex> lk(done_mtx_);
+                    done_cv_.notify_one();
+                }
+            }
+        }
+    }
+
+    const unsigned n_workers_;
+    std::vector<std::thread> workers_;
+    std::mutex mtx_;
+    std::condition_variable cv_;
+    std::mutex done_mtx_;
+    std::condition_variable done_cv_;
+    const std::function<void(unsigned)>* task_ = nullptr;
+    unsigned total_chunks_ = 0;
+    std::atomic<unsigned> pending_{0};
+    uint64_t generation_ = 0;
+    bool stop_ = false;
+};
+// -----------------------------------------------------------------------------
+
 }  // namespace
 
 // --- densmap-gpu additions ---------------------------------------------------
@@ -617,6 +720,18 @@ void optimize_layout_euclidean(
         }
     }
 
+    // --- perf P6: persistent worker pool for the hogwild path (created once,
+    // reused across all epochs). Only spun up when we will actually run the
+    // parallel branch (n_threads > 1); n_threads-1 background workers cover
+    // chunks 1..n_threads-1 while the main thread runs chunk 0. --------------
+    const bool use_pool = parallel && n_threads > 1;
+    std::unique_ptr<EpochThreadPool> pool;
+    std::size_t chunk_size = 0;
+    if (use_pool) {
+        pool = std::make_unique<EpochThreadPool>(n_threads - 1);
+        chunk_size = (n_edges + n_threads - 1) / n_threads;
+    }
+
     for (int n = 0; n < n_epochs; ++n) {
         // --- densmap additions ----------------------------------------------
         // densmap_flag = densmap and lambda > 0
@@ -641,10 +756,11 @@ void optimize_layout_euclidean(
             dens.re_cov = 0.0f;
         }
         // --------------------------------------------------------------------
-        if (!parallel || n_threads <= 1) {
-            // Sequential numba path (parallel=False): edges in order. Routed
-            // through the specialized dispatcher (DIM==2 unroll + non-densMAP
-            // elision + edge-skip); FASTPOW=false keeps it bit-exact.
+        if (!use_pool) {
+            // Sequential numba path (parallel=False, or a 1-thread parallel
+            // build): edges in order. Routed through the specialized dispatcher
+            // (DIM==2 unroll + non-densMAP elision + edge-skip); FASTPOW=false
+            // keeps it bit-exact.
             dispatch_epoch_range(
                 densmap, /*fastpow=*/false, 0, n_edges, head_embedding,
                 tail_embedding, head.data(), tail.data(), n_vertices,
@@ -655,31 +771,26 @@ void optimize_layout_euclidean(
                 epoch_of_next_sample.data(), n, dens);
         } else {
             // "Hogwild" mirror of numba prange(parallel=True): contiguous
-            // static chunks, racy float32 embedding / rng-state updates
-            // (that is numba's semantics too; non-deterministic).
-            std::vector<std::thread> workers;
-            workers.reserve(n_threads);
-            const std::size_t chunk = (n_edges + n_threads - 1) / n_threads;
-            for (unsigned t = 0; t < n_threads; ++t) {
-                const std::size_t lo = static_cast<std::size_t>(t) * chunk;
-                const std::size_t hi = std::min(n_edges, lo + chunk);
-                if (lo >= hi) break;
-                workers.emplace_back(
-                    [=, &head, &tail, &epochs_per_sample,
-                     &rng_state_per_sample, &epochs_per_negative_sample,
-                     &epoch_of_next_negative_sample, &epoch_of_next_sample,
-                     &dens] {
-                        dispatch_epoch_range(
-                            densmap, /*fastpow=*/false, lo, hi, head_embedding,
-                            tail_embedding, head.data(), tail.data(),
-                            n_vertices, epochs_per_sample.data(), a, b,
-                            rng_state_per_sample.data(), gamma, dim, move_other,
-                            alpha, epochs_per_negative_sample.data(),
-                            epoch_of_next_negative_sample.data(),
-                            epoch_of_next_sample.data(), n, dens);
-                    });
-            }
-            for (auto& w : workers) w.join();
+            // static chunks, racy float32 embedding / rng-state updates (that
+            // is numba's semantics too; non-deterministic). The persistent
+            // pool reuses workers across epochs; the chunk partition matches
+            // the old per-epoch-spawn version exactly.
+            const std::size_t chunk = chunk_size;
+            std::function<void(unsigned)> epoch_task =
+                [&](unsigned t) {
+                    const std::size_t lo = static_cast<std::size_t>(t) * chunk;
+                    const std::size_t hi = std::min(n_edges, lo + chunk);
+                    if (lo >= hi) return;
+                    dispatch_epoch_range(
+                        densmap, /*fastpow=*/false, lo, hi, head_embedding,
+                        tail_embedding, head.data(), tail.data(), n_vertices,
+                        epochs_per_sample.data(), a, b,
+                        rng_state_per_sample.data(), gamma, dim, move_other,
+                        alpha, epochs_per_negative_sample.data(),
+                        epoch_of_next_negative_sample.data(),
+                        epoch_of_next_sample.data(), n, dens);
+                };
+            pool->run_epoch(epoch_task, n_threads);
         }
 
         alpha = initial_alpha *
