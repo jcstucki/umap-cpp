@@ -236,7 +236,12 @@ tracks the bit-exact CPU NN-descent port's to ~1e-4 at every measured size.
 engine: monolithic multi-second dispatches at n ≈ 100k were sporadically
 aborted by the macOS GPU watchdog and returned zero-filled buffers unnoticed
 — queries now run in work-budgeted slices and every command buffer's status
-is checked, falling back to the CPU on failure.)
+is checked, falling back to the CPU on failure. The layout SGD engine
+carries the same hardening: epoch batches are sized adaptively from the
+measured per-epoch time (~250 ms per submission, 25-epoch cap) and a failed
+buffer aborts with the host embedding untouched, so the stderr-noted CPU
+fallback reruns from the initial embedding, never a partially-optimized
+one.)
 
 GPU results are validated at embedding-quality level (per-metric kNN parity
 vs a float64 CPU reference at ≤ 1e-5, NN-descent recall ≥ 0.90 asserted at

@@ -3,6 +3,8 @@
 #include "umap/metal/gpu_layout.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -33,10 +35,35 @@ struct SgdParams {
 };
 static_assert(sizeof(SgdParams) == 64, "SgdParams layout must match MSL");
 
-// Number of epochs encoded per command buffer. Each epoch is its own compute
+// Cap on the epochs encoded per command buffer. Each epoch is its own compute
 // encoder (encoder boundaries are the per-epoch barriers); batching amortises
 // commit/scheduling overhead.
+//
+// watchdog-hardening additions: the actual batch size adapts at run time
+// (below) — a fixed 25-epoch buffer measures a couple hundred ms on 5k-point
+// graphs but scales linearly with the edge count, and macOS sporadically
+// aborts multi-second GPU submissions (observed on the kNN engines at ~2 s,
+// see src/metal/gpu_knn.cpp kChunkWorkBudget), so long fits on large graphs
+// could plausibly blow a single batch past the watchdog.
 constexpr int kEpochsPerCommandBuffer = 25;
+
+// watchdog-hardening additions: target duration for one command buffer.
+// Batches are sized from the measured per-epoch time to stay near this
+// budget (the kNN engines' couple-hundred-ms work-budget scale, far below
+// observed watchdog aborts); the first buffer probes a single epoch. An
+// epoch is the atomic unit — one epoch longer than the budget still runs
+// alone (as the densmap-corrected region always does).
+constexpr double kBatchBudgetMs = 250.0;
+
+int next_batch_epochs(std::chrono::steady_clock::duration measured,
+                      int epochs_run) {
+    const double ms =
+        std::chrono::duration<double, std::milli>(measured).count();
+    if (ms <= 0.0) return kEpochsPerCommandBuffer;
+    const double per_epoch = ms / static_cast<double>(std::max(1, epochs_run));
+    return std::clamp(static_cast<int>(kBatchBudgetMs / per_epoch), 1,
+                      kEpochsPerCommandBuffer);
+}
 
 // Each epoch's edges are split into this many sub-dispatches with encoder
 // barriers between them. Rationale: hogwild races lose concurrent
@@ -261,16 +288,62 @@ bool gpu_optimize_layout_euclidean(
         }
     };
 
+    // watchdog-hardening additions (mirrors the kNN engines' commit_and_wait,
+    // src/metal/gpu_knn.cpp): a command buffer the macOS GPU scheduler
+    // aborted or errored leaves the device-side embedding torn, and before
+    // this check the epoch loop silently carried on and copied the wreckage
+    // back over the caller's arrays. Every buffer's status is now verified;
+    // a failure abandons the run WITHOUT the write-back below, so the
+    // caller's arrays keep the initial embedding (the device works on
+    // copies) and the documented CPU fallback restarts from exactly the
+    // state this call received — the cheapest correct recovery: no pristine
+    // host copy is ever needed. UMAP_GPU_FAIL_AFTER_BATCH=n (undocumented;
+    // fallback-plumbing tests) makes the (n+1)-th command buffer of this
+    // call report failure after it really ran.
+    long fail_after = -1;
+    if (const char* env = std::getenv("UMAP_GPU_FAIL_AFTER_BATCH")) {
+        fail_after = std::atol(env);
+    }
+    long batches_done = 0;
+    const auto commit_and_wait = [&](MTL::CommandBuffer* cmd,
+                                     int first_epoch) -> bool {
+        cmd->commit();
+        cmd->waitUntilCompleted();
+        bool completed = cmd->status() == MTL::CommandBufferStatusCompleted &&
+                         cmd->error() == nullptr;
+        if (completed && fail_after >= 0 && batches_done == fail_after) {
+            completed = false;  // injected failure (tests)
+        }
+        ++batches_done;
+        if (!completed) {
+            std::fprintf(stderr,
+                         "UMAP: GPU layout SGD command buffer failed at epoch "
+                         "%d/%d (Metal status %ld); leaving the embedding "
+                         "untouched for the CPU fallback.\n",
+                         first_epoch, n_epochs,
+                         static_cast<long>(cmd->status()));
+        }
+        return completed;
+    };
+
+    bool ok = true;
+    int batch_epochs = 1;  // probe one epoch, then size batches from its time
     int n = 0;
-    while (n < n_epochs) {
+    while (ok && n < n_epochs) {
         if (n < first_dens_epoch) {
-            // Plain epochs: batched several per command buffer.
-            const int n1 = std::min(
-                {n_epochs, n + kEpochsPerCommandBuffer, first_dens_epoch});
+            // Plain epochs: batched per command buffer (adaptive size, see
+            // kBatchBudgetMs above).
+            const int n0 = n;
+            const int n1 =
+                std::min({n_epochs, n + batch_epochs, first_dens_epoch});
             MTL::CommandBuffer* cmd = ctx.queue->commandBuffer();
             for (; n < n1; ++n) encode_epoch(cmd, n, nullptr);
-            cmd->commit();
-            cmd->waitUntilCompleted();
+            const auto t0 = std::chrono::steady_clock::now();
+            ok = commit_and_wait(cmd, n0);
+            if (ok) {
+                batch_epochs = next_batch_epochs(
+                    std::chrono::steady_clock::now() - t0, n1 - n0);
+            }
         } else {
             // densmap-gpu additions: corrected epoch. The previous command
             // buffer completed, so the shared embedding buffer is coherent;
@@ -287,15 +360,19 @@ bool gpu_optimize_layout_euclidean(
                                    s.re_mean, s.re_cov};
             MTL::CommandBuffer* cmd = ctx.queue->commandBuffer();
             encode_epoch(cmd, n, &dp);
-            cmd->commit();
-            cmd->waitUntilCompleted();
+            ok = commit_and_wait(cmd, n);
             ++n;
         }
     }
 
-    std::memcpy(head_embedding, head_buf->contents(), head_bytes);
-    if (!aliased) {
-        std::memcpy(tail_embedding, tail_buf->contents(), tail_bytes);
+    // watchdog-hardening additions: results are copied back only after every
+    // command buffer completed — on failure the host embeddings still hold
+    // the initial state (see the fallback contract in gpu_layout.hpp).
+    if (ok) {
+        std::memcpy(head_embedding, head_buf->contents(), head_bytes);
+        if (!aliased) {
+            std::memcpy(tail_embedding, tail_buf->contents(), tail_bytes);
+        }
     }
 
     head_buf->release();
@@ -311,7 +388,7 @@ bool gpu_optimize_layout_euclidean(
     if (dens_R_buf) dens_R_buf->release();
     if (dens_phi_buf) dens_phi_buf->release();
     if (dens_re_buf) dens_re_buf->release();
-    return true;
+    return ok;
 }
 
 }  // namespace metal

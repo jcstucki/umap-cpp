@@ -23,10 +23,13 @@
 //  - Alpha decays on the host once per epoch, exactly as in layouts.py.
 //  - Gradients are clipped at +/-4, as in layouts.py::clip.
 //
-// Dispatch structure: epochs are batched several per command buffer; within
-// an epoch the edges are split into ~32 sub-dispatches with encoder barriers
-// between them (per-epoch barriers match the reference's per-epoch numba
-// call). The sub-dispatches bound the number of *concurrently* racing updates
+// Dispatch structure: epochs are batched several per command buffer — the
+// batch size adapts to the measured per-epoch time so one submission stays
+// around ~250 ms, capped at 25 epochs (watchdog hardening: macOS aborts GPU
+// submissions in the multi-second range, and every buffer's completion
+// status is verified; see the return contract below). Within an epoch the
+// edges are split into ~32 sub-dispatches with encoder barriers between
+// them (per-epoch barriers match the reference's per-epoch numba call). The sub-dispatches bound the number of *concurrently* racing updates
 // per vertex at ~degree/32: a single full-grid dispatch would run essentially
 // every edge at once, and the resulting lost read-modify-write updates
 // measurably weaken cluster attraction on small graphs (numba's prange only
@@ -60,10 +63,16 @@ namespace metal {
 // epoch's work), need a host sync anyway (the scalars feed the very next
 // dispatch), and reusing the CPU code keeps the numpy float32 reduction
 // semantics single-sourced. Corrected epochs therefore run one command
-// buffer per epoch instead of the 25-epoch batches (documented cost).
+// buffer per epoch instead of the multi-epoch batches (documented cost).
 // densmap_kwds requires move_other=true and aliased head/tail (the fit
 // configuration, like the CPU path).
-// Returns false (embeddings untouched) if no Metal device is available.
+// Returns false if no Metal device is available OR a command buffer fails
+// mid-run (watchdog-hardening additions: e.g. a macOS GPU watchdog abort
+// under load — stderr diagnostic, like the kNN engines). In EVERY false
+// case the host embeddings are untouched: the kernel works on device-side
+// copies and the results are only written back after all epochs completed,
+// so callers rerun the CPU optimizer from the exact initial state they
+// passed in (never from a partially-optimized or torn buffer).
 bool gpu_optimize_layout_euclidean(
     float* head_embedding, int n_head_vertices, float* tail_embedding, int dim,
     const std::vector<int32_t>& head, const std::vector<int32_t>& tail,

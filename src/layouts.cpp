@@ -766,10 +766,16 @@ std::vector<float> simplicial_set_embedding_from_init(
                 rng_state, gamma, initial_alpha, negative_sample_rate,
                 /*move_other=*/true, densmap_kwds);
 #endif
+            // watchdog-hardening additions: false also covers a command
+            // buffer failing mid-run (macOS GPU watchdog abort); the kernel
+            // leaves `embedding` untouched in every false case, so the CPU
+            // loop below restarts from the pristine [0, 10]-rescaled init,
+            // never from a partially-optimized buffer.
             if (!gpu_done) {
                 std::fprintf(stderr,
                              "UMAP: GPU layout SGD requested but the Metal "
-                             "kernel is unavailable; running on the CPU.\n");
+                             "kernel is unavailable or failed; running on "
+                             "the CPU.\n");
             }
         }
         if (!gpu_done) {

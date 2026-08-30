@@ -3641,10 +3641,14 @@ std::vector<float> UMAP::transform_from_membership(
                 static_cast<double>(params_.negative_sample_rate),
                 /*move_other=*/false);
 #endif
+            // watchdog-hardening additions: false also covers a command
+            // buffer failing mid-run; embedding/tail_embedding are untouched
+            // in every false case (gpu_layout.hpp contract), so the CPU SGD
+            // below restarts from the pristine weighted-mean init.
             if (!gpu_done) {
                 warn_msg(
                     "UMAP: GPU transform SGD requested but the Metal kernel "
-                    "is unavailable; running on the CPU.");
+                    "is unavailable or failed; running on the CPU.");
             }
         }
         // ---------------------------------------------------------------------

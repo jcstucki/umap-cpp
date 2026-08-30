@@ -9,8 +9,13 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <utility>
 #include <vector>
+
+#include <unistd.h>  // watchdog-fallback additions: stderr capture (dup/dup2)
 
 #include "doctest.h"
 #include "umap/device.hpp"
@@ -962,5 +967,217 @@ TEST_CASE("gpu densmap: trustworthiness parity and density-order preservation "
     };
     CHECK(mean_rad(cpu_model.rad_emb(), 1) > mean_rad(cpu_model.rad_emb(), 0));
     CHECK(mean_rad(gpu_model.rad_emb(), 1) > mean_rad(gpu_model.rad_emb(), 0));
+}
+// -----------------------------------------------------------------------------
+
+// --- watchdog-fallback additions ---------------------------------------------
+// The SGD engine's command-buffer status verification (the kNN engines' fix
+// mirrored into gpu_layout.cpp): a failed buffer must return false with the
+// host embedding untouched, and the production callers must rerun the CPU
+// optimizer from the pristine init. A real watchdog abort is not portably
+// triggerable, so the undocumented UMAP_GPU_FAIL_AFTER_BATCH=n knob makes
+// the engine treat the (n+1)-th command buffer of a call as failed (after it
+// really ran, so the discarded device state is genuinely advanced).
+
+namespace {
+
+// Scoped UMAP_GPU_FAIL_AFTER_BATCH: unset on scope exit — REQUIRE-unwind
+// included — so a failing assertion cannot poison later GPU cases.
+struct FailAfterBatchGuard {
+    explicit FailAfterBatchGuard(const char* n) {
+        setenv("UMAP_GPU_FAIL_AFTER_BATCH", n, 1);
+    }
+    ~FailAfterBatchGuard() { unsetenv("UMAP_GPU_FAIL_AFTER_BATCH"); }
+};
+
+// Captures everything written to fd 2 between begin() and end(). The
+// fallback notes are plain fprintf(stderr, ...) / warn_msg; doctest reports
+// on stdout, so redirecting the fd is safe here. Restores on destruction.
+struct StderrCapture {
+    int saved = -1;
+    int fd = -1;
+    std::string path;
+    void begin() {
+        std::fflush(stderr);
+        char tmpl[] = "/tmp/umap_stderr_capture_XXXXXX";
+        fd = mkstemp(tmpl);
+        REQUIRE(fd >= 0);
+        path = tmpl;
+        saved = dup(2);
+        REQUIRE(saved >= 0);
+        REQUIRE(dup2(fd, 2) >= 0);
+    }
+    std::string end() {
+        std::fflush(stderr);
+        if (saved >= 0) {
+            dup2(saved, 2);
+            close(saved);
+            saved = -1;
+        }
+        std::string text;
+        if (fd >= 0) {
+            lseek(fd, 0, SEEK_SET);
+            char buf[4096];
+            ssize_t r;
+            while ((r = read(fd, buf, sizeof(buf))) > 0)
+                text.append(buf, static_cast<std::size_t>(r));
+            close(fd);
+            fd = -1;
+            unlink(path.c_str());
+        }
+        return text;
+    }
+    ~StderrCapture() {
+        if (saved >= 0) {
+            dup2(saved, 2);
+            close(saved);
+        }
+        if (fd >= 0) {
+            close(fd);
+            unlink(path.c_str());
+        }
+    }
+};
+
+std::size_t count_diffs(const std::vector<float>& a,
+                        const std::vector<float>& b) {
+    REQUIRE(a.size() == b.size());
+    std::size_t diffs = 0;
+    for (std::size_t i = 0; i < a.size(); ++i)
+        if (a[i] != b[i]) ++diffs;
+    return diffs;
+}
+
+}  // namespace
+
+TEST_CASE("gpu layout watchdog: a failed command buffer returns false with "
+          "the host embedding bitwise untouched") {
+    METAL_REQUIRED();
+    ClusterFixture fx({{0.0, 0.0}, {20.0, 20.0}}, 30, 20260901);
+    const int64_t rng_state[3] = {1234567, -7654321, 55555};
+    const auto ab = umap::find_ab_params(1.0, 0.1);
+    const int n_epochs = 60;
+    GlueParts glue = make_glue(fx.graph, fx.init.data(), 2, n_epochs);
+    const std::vector<float> pristine = glue.init;
+
+    // Fail the 1st command buffer (nothing kept) and the 3rd (the 1-epoch
+    // probe plus one sized batch really advanced the device buffers first —
+    // the discarded-torn-state scenario).
+    for (const char* knob : {"0", "2"}) {
+        CAPTURE(knob);
+        FailAfterBatchGuard guard(knob);
+        std::vector<float> emb = pristine;
+        const bool ok = umap::metal::gpu_optimize_layout_euclidean(
+            emb.data(), fx.n, emb.data(), 2, glue.head, glue.tail, n_epochs,
+            fx.n, glue.eps, ab.a, ab.b, rng_state, 1.0, 1.0, 5.0,
+            /*move_other=*/true);
+        CHECK(!ok);
+        CHECK(count_diffs(emb, pristine) == 0);
+    }
+
+    // densmap corrected-epoch region (one command buffer per epoch): frac=1
+    // makes every epoch corrected; fail on the 3rd corrected epoch.
+    {
+        umap::DensmapParams dk;
+        dk.lambda = 2.0;
+        dk.frac = 1.0;
+        dk.var_shift = 0.1;
+        dk.mu = glue.weights;
+        dk.mu_sum.assign(static_cast<std::size_t>(fx.n), 0.0f);
+        for (std::size_t e = 0; e < glue.head.size(); ++e) {
+            dk.mu_sum[static_cast<std::size_t>(glue.head[e])] +=
+                glue.weights[e];
+            dk.mu_sum[static_cast<std::size_t>(glue.tail[e])] +=
+                glue.weights[e];
+        }
+        TestRng rrng(31);
+        dk.R.resize(static_cast<std::size_t>(fx.n));
+        for (auto& v : dk.R) v = static_cast<float>(rrng.normal());
+
+        FailAfterBatchGuard guard("2");
+        std::vector<float> emb = pristine;
+        const bool ok = umap::metal::gpu_optimize_layout_euclidean(
+            emb.data(), fx.n, emb.data(), 2, glue.head, glue.tail, n_epochs,
+            fx.n, glue.eps, ab.a, ab.b, rng_state, 1.0, 1.0, 5.0,
+            /*move_other=*/true, &dk);
+        CHECK(!ok);
+        CHECK(count_diffs(emb, pristine) == 0);
+    }
+
+    // Knob cleared: the same call succeeds and does move the embedding.
+    {
+        std::vector<float> emb = pristine;
+        REQUIRE(umap::metal::gpu_optimize_layout_euclidean(
+            emb.data(), fx.n, emb.data(), 2, glue.head, glue.tail, n_epochs,
+            fx.n, glue.eps, ab.a, ab.b, rng_state, 1.0, 1.0, 5.0,
+            /*move_other=*/true));
+        CHECK(count_diffs(emb, pristine) > 0);
+    }
+}
+
+TEST_CASE("gpu layout watchdog e2e: injected mid-fit failure falls back to a "
+          "CPU fit from the pristine init, with the notes printed") {
+    METAL_REQUIRED();
+    const int n_per = 80, dim = 6, n = 3 * n_per;
+    const auto X = three_cluster_data(n_per, 20260901);
+
+    umap::UMAPParams p;
+    p.n_neighbors = 10;
+    p.init = "random";
+    p.random_state = 42;
+    p.device = umap::Device::GPU;
+
+    StderrCapture capture;
+    capture.begin();
+    std::vector<float> emb_fail0, emb_fail2, q_emb;
+    {
+        FailAfterBatchGuard guard("0");  // 1st buffer fails: no GPU work ran
+        umap::UMAP model(p);
+        model.fit(X.data(), n, dim);
+        emb_fail0 = model.embedding();
+    }
+    umap::UMAP model2(p);
+    {
+        FailAfterBatchGuard guard("2");  // fails after ~26 real GPU epochs
+        model2.fit(X.data(), n, dim);
+        emb_fail2 = model2.embedding();
+    }
+    const int nq = 15;
+    {
+        FailAfterBatchGuard guard("0");
+        const auto Q = three_cluster_data(nq / 3, 991144);
+        q_emb = model2.transform(Q.data(), nq);
+    }
+    const std::string notes = capture.end();
+
+    // Both the engine's own diagnostic and the caller fallback notes landed.
+    CHECK(notes.find("GPU layout SGD command buffer failed") !=
+          std::string::npos);
+    CHECK(notes.find("UMAP: GPU layout SGD requested but the Metal kernel is "
+                     "unavailable or failed; running on the CPU.") !=
+          std::string::npos);
+    CHECK(notes.find("UMAP: GPU transform SGD requested but the Metal kernel "
+                     "is unavailable or failed; running on the CPU.") !=
+          std::string::npos);
+
+    // The fallback produced a valid CPU embedding (finite, phase4-level
+    // trustworthiness) for both fit and transform.
+    REQUIRE(emb_fail0.size() == static_cast<std::size_t>(n) * 2);
+    for (float v : emb_fail0) CHECK(std::isfinite(v));
+    REQUIRE(q_emb.size() == static_cast<std::size_t>(nq) * 2);
+    for (float v : q_emb) CHECK(std::isfinite(v));
+    const double trust =
+        testutil::trustworthiness(X.data(), n, dim, emb_fail0.data(), 2, 10);
+    CAPTURE(trust);
+    CHECK(trust >= 0.90);
+
+    // Pristine-restart proof: whether the abort hit before any GPU epoch ran
+    // (fail-after 0) or after the probe + one sized batch advanced the
+    // device buffers (fail-after 2), the fallback fit is bit-identical —
+    // both CPU reruns consumed the same initial embedding and rng stream, so
+    // no torn GPU state leaked in. (Every stage is deterministic here: exact
+    // GPU kNN, seeded RandomState, sequential CPU SGD; a fallback resuming
+    // from the aborted device buffer would make the two runs differ.)
+    CHECK(count_diffs(emb_fail0, emb_fail2) == 0);
 }
 // -----------------------------------------------------------------------------
