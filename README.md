@@ -195,6 +195,46 @@ parity with the Python reference's serial fit (21.9 s).
 fit runs in **~1.3 s** and 10k×64 in **~0.92 s** — 3.6× and 2.6× faster than
 the Python reference's *parallel* numba fits (4.7 s / 2.4 s).
 
+### SGD layout on the CPU
+
+With spectral init reduced to ~0.3 s, the SGD layout is the dominant stage of a
+CPU fit (~95% of a seeded fit; ~1.4–2.7 s of an unseeded one). Three changes
+speed it up **without touching the seeded bit-contract** — the seeded/sequential
+path (`random_state` set) still calls libm `pow` in the same order as numba, so
+its layout goldens stay byte-identical (max-abs-diff 0):
+
+* a compile-time `dim==2` / non-densMAP specialization of the epoch kernel
+  (unrolled coordinate loops, density branches elided, dead edges skipped) —
+  control-flow only, so it is bit-exact on every path. Seeded SGD **−2%** (the
+  seeded path is libm-`pow`-bound — ~2/3 of its time is `pow`, which the numba
+  parity pins);
+* a **persistent hogwild thread pool** replacing per-epoch `std::thread`
+  spawns (a 500-epoch fit spawned thousands of threads). Same static work
+  partition, same race semantics; unseeded SGD **−0.5 to −4%**, scaling with
+  epoch count;
+* a polynomial **fast `pow`** (`exp2(y·log2(x))`, ~3.8e-4 relative error) on the
+  **unseeded hogwild path only** — that path is already non-deterministic
+  (numba's `parallel=True` semantics), so it can trade the last ULPs of `pow`
+  for speed while the seeded path stays exact. Unseeded SGD **−26 to −30%**.
+  Trustworthiness over median-of-5 unseeded fits is unchanged vs the libm build
+  (10k: +0.0001, within sampling noise).
+
+Unseeded (hogwild-parallel) SGD stage, before (P0 baseline) → after, ms
+(M-series, seeded uses libm `pow` throughout; the wins compound on the unseeded
+path):
+
+| SGD stage, ms | seeded (bit-exact) | unseeded before | unseeded after |
+| --- | ---: | ---: | ---: |
+| 10k×16 | 9,447 → 9,284 | 2,200 | **1,385** (−37%) |
+| 10k×64 | 9,937 → 9,745 | 2,300 | **1,500** (−35%) |
+| 50k×16 | ~19,200 | 3,600 | **2,510** (−30%) |
+| 50k×64 | ~20,300 | 3,850 | **2,667** (−31%) |
+
+The seeded stage is bounded by libm `pow` that the reference pins; the big lever
+is the unseeded path, where an unseeded 50k×64 fit now runs in ~7.1 s (SGD
+2.7 s) and 10k×64 in ~2.0 s. For the fastest seeded large fits, use
+`--device gpu` (above).
+
 ## GPU (Apple Metal)
 
 `UMAPParams::device = umap::Device::GPU` (CLI: `--device gpu`) routes to Metal
