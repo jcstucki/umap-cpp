@@ -14,6 +14,7 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -345,8 +346,9 @@ TEST_CASE("gpu-nnd e2e: 40k device=GPU fit (auto -> nn-descent) reaches "
           "CPU-NN-descent-comparable trustworthiness") {
     METAL_REQUIRED();
     const int n = 40000, dim = 8, k = 10;
+    const int nq = 60;  // transform leg below: same centers, tail rows
     REQUIRE(n > umap::metal::kGpuNndCrossoverN);  // auto mode routes to nnd
-    const auto X = mixture_data(n, dim, 0x40C4FE, 6);
+    const auto X = mixture_data(n + nq, dim, 0x40C4FE, 6);
 
     umap::UMAPParams p;
     p.n_neighbors = k;
@@ -390,9 +392,11 @@ TEST_CASE("gpu-nnd e2e: 40k device=GPU fit (auto -> nn-descent) reaches "
     // margin sits ~30 sd beyond the observed worst and -0.10 further still.
     p.device = umap::Device::GPU;
     std::vector<double> trusts;
+    std::unique_ptr<umap::UMAP> last_model;
     for (uint32_t rep_seed : {42u, 43u, 44u}) {
         p.random_state = rep_seed;
-        umap::UMAP gpu_model(p);
+        last_model = std::make_unique<umap::UMAP>(p);
+        umap::UMAP& gpu_model = *last_model;
         gpu_model.fit(X.data(), n, dim);
         REQUIRE_FALSE(gpu_model.small_data());
         // Row sanity on the descent graph: self-first, ascending distances.
@@ -418,6 +422,48 @@ TEST_CASE("gpu-nnd e2e: 40k device=GPU fit (auto -> nn-descent) reaches "
             << trusts[1] << " " << trusts[2]);
     CHECK(trusts[1] >= trust_cpu - 0.05);  // median parity vs CPU
     CHECK(trusts[0] >= trust_cpu - 0.10);  // per-fit smoke floor
+
+    // Transform against a descent fit: no search index exists, so the kNN
+    // runs on the index-free exact engine at any n (O(nq * n), watchdog-
+    // safe slices). The queries are the generator's tail rows (identical
+    // cluster centers; cluster id of tail row i is (n + i) % 6) — held-out
+    // points land finite and nearest an own-cluster training point.
+    const float* Q = X.data() + static_cast<std::size_t>(n) * dim;
+    const auto q_emb = last_model->transform(Q, nq);
+    REQUIRE(q_emb.size() == static_cast<std::size_t>(nq) * 2);
+    for (float v : q_emb) CHECK(std::isfinite(v));
+    // Majority vote over the 15 embedding-nearest training points (a single
+    // stray training point makes nearest-1 flaky at n = 40k).
+    const auto& emb = last_model->embedding();
+    const int kv = 15;
+    int near_own = 0;
+    std::vector<std::pair<double, int>> nearest(kv);
+    for (int i = 0; i < nq; ++i) {
+        nearest.assign(kv, {std::numeric_limits<double>::infinity(), -1});
+        for (int j = 0; j < n; ++j) {
+            const double dx = static_cast<double>(q_emb[i * 2]) -
+                              static_cast<double>(emb[j * 2]);
+            const double dy = static_cast<double>(q_emb[i * 2 + 1]) -
+                              static_cast<double>(emb[j * 2 + 1]);
+            const double d2 = dx * dx + dy * dy;
+            if (d2 < nearest.back().first) {
+                nearest.back() = {d2, j};
+                for (int m = kv - 1;
+                     m > 0 && nearest[m].first < nearest[m - 1].first; --m)
+                    std::swap(nearest[m], nearest[m - 1]);
+            }
+        }
+        int own = 0;
+        for (const auto& pr : nearest)
+            if (pr.second >= 0 && pr.second % 6 == (n + i) % 6) ++own;
+        if (own > kv / 2) ++near_own;
+    }
+    CAPTURE(near_own);
+    MESSAGE("40k descent-fit transform: " << near_own << "/" << nq
+            << " queries with own-cluster majority among 15 nearest");
+    // Measured 2026-08-29 (M-series, 6 runs): 60/60 in every run; nq-3
+    // leaves room for the racy fit/transform draws.
+    CHECK(near_own >= nq - 3);
 }
 
 // ---------------------------------------------------------------------------
