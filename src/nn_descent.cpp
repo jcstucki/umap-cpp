@@ -705,10 +705,48 @@ struct Update {
     float d;
 };
 
-}  // namespace
+// --- perf additions (CPU pass 2026-08-30): metric inlining ------------------
+// NN-descent and brute-force kNN evaluate the metric once per candidate pair;
+// routing every call through the type-erased std::function (DistFn) costs an
+// indirect call per pair (numba instead specializes and inlines the metric
+// into the kernel). The hot loops below are templated on the metric callable
+// so the built-in fast metrics compile as direct, inlinable calls --
+// identical float ops in identical order, a pure dispatch change -- while
+// the std::function path remains the generic fallback for kwds-bound /
+// callable metrics.
+using RawDistPtr = float (*)(const float*, const float*, int64_t);
 
-void init_rp_tree(const float* data, int64_t dim, DistFn dist, NNHeap& graph,
-                  const LeafArray& leaf_array) {
+template <RawDistPtr F>
+struct StaticDist {
+    float operator()(const float* x, const float* y, int64_t d) const {
+        return F(x, y, d);
+    }
+};
+
+// Invokes body(d) with d either a StaticDist over the recognized builtin
+// kernel (compile-time direct call) or the DistFn itself (fallback).
+template <typename Body>
+void with_metric(const DistFn& dist, Body&& body) {
+    const RawDistPtr* stored = dist.target<RawDistPtr>();
+    const RawDistPtr f = stored != nullptr ? *stored : nullptr;
+    if (f == &squared_euclidean) {
+        body(StaticDist<&squared_euclidean>{});
+    } else if (f == &alternative_cosine) {
+        body(StaticDist<&alternative_cosine>{});
+    } else if (f == &manhattan) {
+        body(StaticDist<&manhattan>{});
+    } else if (f == &true_euclidean) {
+        body(StaticDist<&true_euclidean>{});
+    } else if (f == &true_cosine) {
+        body(StaticDist<&true_cosine>{});
+    } else {
+        body(dist);
+    }
+}
+
+template <typename Dist>
+void init_rp_tree_impl(const float* data, int64_t dim, const Dist& dist,
+                       NNHeap& graph, const LeafArray& leaf_array) {
     // pynndescent_.py::init_rp_tree with its default n_threads=8 "virtual
     // thread" partitioning (deterministic regardless of real parallelism).
     const int64_t n_threads = 8;
@@ -775,8 +813,10 @@ void init_rp_tree(const float* data, int64_t dim, DistFn dist, NNHeap& graph,
     }
 }
 
-void init_random(int64_t n_neighbors, const float* data, int64_t n,
-                 int64_t dim, NNHeap& heap, DistFn dist, int64_t rng_state[3]) {
+template <typename Dist>
+void init_random_impl(int64_t n_neighbors, const float* data, int64_t n,
+                      int64_t dim, NNHeap& heap, const Dist& dist,
+                      int64_t rng_state[3]) {
     for (int64_t i = 0; i < n; ++i) {
         if (heap.ind_row(i)[0] < 0) {
             int64_t filled = 0;
@@ -794,6 +834,24 @@ void init_random(int64_t n_neighbors, const float* data, int64_t n,
             }
         }
     }
+}
+
+}  // namespace
+
+// Public wrappers keep the DistFn signatures (header API / tests); the
+// metric dispatch happens once per call, not per pair.
+void init_rp_tree(const float* data, int64_t dim, DistFn dist, NNHeap& graph,
+                  const LeafArray& leaf_array) {
+    with_metric(dist, [&](const auto& d) {
+        init_rp_tree_impl(data, dim, d, graph, leaf_array);
+    });
+}
+
+void init_random(int64_t n_neighbors, const float* data, int64_t n,
+                 int64_t dim, NNHeap& heap, DistFn dist, int64_t rng_state[3]) {
+    with_metric(dist, [&](const auto& d) {
+        init_random_impl(n_neighbors, data, n, dim, heap, d, rng_state);
+    });
 }
 
 void new_build_candidates(NNHeap& current_graph, int64_t max_candidates,
@@ -868,10 +926,11 @@ void new_build_candidates(NNHeap& current_graph, int64_t max_candidates,
 namespace {
 
 // pynndescent_.py::nn_descent_internal (array-update path), n_threads=1.
+template <typename Dist>
 void nn_descent_internal(const float* data, int64_t n, int64_t dim,
                          NNHeap& current_graph, int64_t n_neighbors,
                          int64_t rng_state[3], int64_t max_candidates,
-                         DistFn dist, int64_t n_iters, double delta,
+                         const Dist& dist, int64_t n_iters, double delta,
                          bool verbose) {
     const int64_t block_size = 16384;
     const int64_t n_blocks = n / block_size;
@@ -974,12 +1033,18 @@ NNHeap nn_descent(const float* data, int64_t n, int64_t dim,
                   double delta, const LeafArray& leaf_array, bool verbose) {
     NNHeap current_graph = NNHeap::make(n, n_neighbors);
 
-    if (leaf_array.n_rows > 0)
-        init_rp_tree(data, dim, dist, current_graph, leaf_array);
-    init_random(n_neighbors, data, n, dim, current_graph, dist, rng_state);
+    // One metric dispatch for the whole run (init + descent loops share the
+    // specialized instantiation).
+    with_metric(dist, [&](const auto& d) {
+        if (leaf_array.n_rows > 0)
+            init_rp_tree_impl(data, dim, d, current_graph, leaf_array);
+        init_random_impl(n_neighbors, data, n, dim, current_graph, d,
+                         rng_state);
 
-    nn_descent_internal(data, n, dim, current_graph, n_neighbors, rng_state,
-                        max_candidates, dist, n_iters, delta, verbose);
+        nn_descent_internal(data, n, dim, current_graph, n_neighbors,
+                            rng_state, max_candidates, d, n_iters, delta,
+                            verbose);
+    });
 
     deheap_sort(current_graph.ind.data(), current_graph.dist.data(), n,
                 n_neighbors);
@@ -1010,8 +1075,11 @@ void nn_descent_with_init_graph(NNHeap& current_graph, const float* data,
                                 bool verbose) {
     // nn_descent with init_graph=current_graph (rp_tree_init handled by the
     // caller): straight to the candidate loop, then deheap_sort.
-    nn_descent_internal(data, n, dim, current_graph, n_neighbors, rng_state,
-                        max_candidates, dist, n_iters, delta, verbose);
+    with_metric(dist, [&](const auto& d) {
+        nn_descent_internal(data, n, dim, current_graph, n_neighbors,
+                            rng_state, max_candidates, d, n_iters, delta,
+                            verbose);
+    });
     deheap_sort(current_graph.ind.data(), current_graph.dist.data(), n,
                 n_neighbors);
 }
