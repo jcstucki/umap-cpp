@@ -46,18 +46,24 @@ namespace metal {
 constexpr int kGpuNndMaxK = 64;
 
 // Exact-vs-NN-descent crossover for device=GPU standard-branch dense fits
-// (auto mode). Measured on M-series (dim 16, k 15, hidden case
-// `-ns -tc="gpu nnd timing*"`, 2026-08-29, 3 stable runs): GPU NN-descent is
-// faster at every measured size — 20k: 140 ms vs exact 307 ms; 50k: 407 ms
-// vs 2251 ms; 100k: 968 ms vs 8963 ms (recall 0.9975 / 0.9952 / 0.9931,
-// matching the bit-exact CPU NN-descent port's recall to ~1e-4 at each
-// size). Exact nevertheless keeps the sub-30k range: its absolute cost
-// there is modest (< ~0.7 s) and it returns recall-1.0 graphs — strictly
-// better than what the CPU standard branch would produce — while above 30k
-// the O(n²) term dominates (>= ~3x the descent, growing quadratically) for
-// a <= ~0.7% recall difference. Interpolated crossing of the "exact costs
-// 3x the descent" line sits right around n ≈ 30k.
-constexpr int kGpuNndCrossoverN = 30000;
+// (auto mode). REMEASURED after the gpu-knn-gemm P1 kernel rewrite (the
+// register-blocked decomposable-metric fast body, ~16-18x over the old scalar
+// engine — see PERF_BASELINE.md P1). With that kernel the *exact* engine is
+// now faster than GPU NN-descent at every measured size AND both dims through
+// 100k (hidden case `-ns -tc="gpu knn crossover timing*"`, k 15, 2026-08-30,
+// 2 stable runs), while still returning recall-1.0 graphs:
+//   dim 16 — 20k: exact 35 vs nnd 143; 30k: 51 vs 214; 50k: 147 vs ~385;
+//            100k: ~520 vs ~990 ms.
+//   dim 64 — 20k: exact 74 vs nnd 507; 30k: 187 vs 818; 50k: ~720 vs ~1530;
+//            100k: ~2650 vs ~3880 ms  (nnd recall falls 0.97 -> 0.89 as dim/n
+//            grow; exact stays 1.0).
+// The old 30k crossover existed because the pre-rewrite scalar exact kernel
+// cost ~3x the descent above 30k; that inversion is gone. The exact engine's
+// O(n²) term must overtake the descent's ~O(n log n) eventually, but it has
+// not by 100k on either dim, so the crossover moves to the top of the
+// measured-exact-wins range. Above it (and beyond a single Metal buffer) NND
+// still owns the truly-huge, unmeasured regime.
+constexpr int kGpuNndCrossoverN = 100000;
 
 // True for the metrics the NN-descent kernels implement: euclidean/l2,
 // sqeuclidean, manhattan (+ aliases), cosine. Other engine metrics stay on
