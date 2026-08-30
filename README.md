@@ -191,9 +191,19 @@ parity with the Python reference's serial fit (21.9 s).
 | after (2I−L Lanczos)  | 327 ms | ~20,600 ms |
 | Python (numba serial) | — | 21,863 ms |
 
-`--device gpu` (below) then moves kNN and the SGD onto Metal: the same 50k×16
-fit runs in **~1.3 s** and 10k×64 in **~0.92 s** — 3.6× and 2.6× faster than
-the Python reference's *parallel* numba fits (4.7 s / 2.4 s).
+`--device gpu` (below) then moves kNN and the SGD onto Metal (with the
+register-blocked exact-kNN kernel — see the GPU section): the same 50k×16 fit
+runs in **~1.03 s**, 50k×64 in **~1.67 s**, and 10k×64 in **~0.52 s** — 3–5×
+faster than the Python reference's *parallel* numba fits. The deterministic
+seeded CPU path is at parity with Python's serial fit; the unseeded CPU path
+(upstream's own hogwild `parallel` semantics + the P2-GATED fast-`pow`) matches
+Python's parallel fit on CPU alone. End-to-end fit wall-clock (M-series Mac):
+
+| fit | seeded CPU | unseeded CPU | device=gpu | py serial / parallel |
+| --- | ---: | ---: | ---: | ---: |
+| 10k×64 | 10.5 s | 2.04 s | **0.52 s** | 11.0 / 2.44 s |
+| 50k×16 | 20.7 s | 4.46 s | **1.03 s** | 21.9 / 4.66 s |
+| 50k×64 | 24.7 s | 7.00 s | **1.67 s** | 23.9 / 5.20 s |
 
 ### SGD layout on the CPU
 
