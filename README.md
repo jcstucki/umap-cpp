@@ -169,6 +169,32 @@ umap_destroy(h);
 A complete `find_package` consumer (C++ and C) lives in
 [`examples/consumer/`](examples/consumer/).
 
+## Performance
+
+Measured on an M-series Mac (median of the benchmark harness; `~/.venvs`
+Python reference = numba 0.67, NUMBA_NUM_THREADS=1 for serial). Embedding
+quality is validated in lockstep — trustworthiness on the seeded CPU path is
+within ±0.0004 of the reference at every size, so the numbers below trade no
+accuracy.
+
+Spectral initialisation uses a **matvec-only Lanczos** on the flipped
+normalised Laplacian `2I − L` (largest-algebraic eigenpairs of `2I − L` are
+the smallest of `L`), mirroring upstream's `eigsh(which="SM", tol=1e-4)`
+instead of a shift-invert whose sparse-LU factorisation dominated large fits.
+At 50k×16 this cuts the spectral-init stage from **75.2 s → 0.33 s (~230×)**,
+taking the whole seeded CPU fit from ~98.6 s to ~20.6 s (SGD-bound now) — at
+parity with the Python reference's serial fit (21.9 s).
+
+| fit, 50k×16, seeded | spectral init | whole fit |
+| --- | ---: | ---: |
+| before (shift-invert) | 75,203 ms | 98,594 ms |
+| after (2I−L Lanczos)  | 327 ms | ~20,600 ms |
+| Python (numba serial) | — | 21,863 ms |
+
+`--device gpu` (below) then moves kNN and the SGD onto Metal: the same 50k×16
+fit runs in **~1.3 s** and 10k×64 in **~0.92 s** — 3.6× and 2.6× faster than
+the Python reference's *parallel* numba fits (4.7 s / 2.4 s).
+
 ## GPU (Apple Metal)
 
 `UMAPParams::device = umap::Device::GPU` (CLI: `--device gpu`) routes to Metal
