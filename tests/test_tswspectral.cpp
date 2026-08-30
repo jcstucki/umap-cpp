@@ -142,6 +142,11 @@ TEST_CASE("test_tsw_spectral_init") {
 
     // Anchor both layouts to the dense-eigh truth (== the upstream
     // tswspectral output at tol=1e-8, t1_tsw_upstream, to ~1.4e-15).
+    // spec runs at the upstream default tol=1e-4 (perf pass 2026-08-30: the
+    // solver now mirrors eigsh's matvec-only solve at upstream's tolerance
+    // rather than the original shift-invert at tol=1e-10, so its anchor is
+    // the tolerance contract, not machine precision; measured err ~8e-5 on
+    // this fixture). tsw explicitly passes tol=1e-8 and stays tight.
     for (int j = 0; j < 2; ++j) {
         const double err_spec = up_to_sign_err(
             t1_n,
@@ -151,7 +156,7 @@ TEST_CASE("test_tsw_spectral_init") {
             t1_n,
             [&](int i) { return static_cast<double>(tsw[i * 2 + j]); },
             [&](int i) { return t1_tsw_upstream[i * 2 + j]; });
-        CHECK(err_spec < 1e-5);
+        CHECK(err_spec < 2e-4);
         CHECK(err_tsw < 1e-5);
     }
 

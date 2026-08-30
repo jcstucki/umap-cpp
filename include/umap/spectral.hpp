@@ -34,10 +34,17 @@
 //     RandomState/Generator, so random fallbacks / jitter are not bit-equal
 //     to Python -- only distributionally equivalent. Gaussian noise uses
 //     Box-Muller on tau_rand.
-//   * The eigensolver is Spectra's shift-invert Lanczos (sigma = -1e-5, the
-//     value sklearn recommends) rather than ARPACK's regular-mode
-//     which="SM"; selection (k = dim + 1 smallest, ncv = max(2k+1, sqrt(n))
-//     clamped to n, v0 = ones) and normalization are replicated.
+//   * The eigensolver is Spectra's Lanczos on the spectrally-flipped operator
+//     2I - L (largest-algebraic of 2I - L == smallest of L; spectrum of the
+//     normalized Laplacian lies in [0, 2]) rather than ARPACK's regular-mode
+//     which="SM" on L itself; both are matvec-only solves at the same
+//     tolerance (tol or 1e-4) -- selection (k = dim + 1 smallest,
+//     ncv = max(2k+1, sqrt(n)) clamped to n, v0 = ones, maxiter or 5n) and
+//     normalization are replicated. Eigenpair parity vs Python is therefore
+//     "up to sign, up to the solve tolerance" (the historical contract; the
+//     original port used shift-invert at tol 1e-10, whose sparse LU
+//     factorization dominated large fits -- see PERF notes in the repo
+//     README).
 //   * Upstream errors out (uncaught TypeError via scipy) when a connected
 //     graph has n <= dim + 1; we throw std::invalid_argument.
 #pragma once
@@ -66,11 +73,13 @@ int32_t connected_components(const SparseMatrix& graph,
 // upstream uncaught scipy error for tiny graphs).
 // maxiter = 0 keeps the historical default max(1000, 5n); a positive value
 // caps the Spectra iterations like upstream's eigsh maxiter (tswspectral
-// threads its `maxiter or graph.shape[0] * 5` through here).
+// threads its `maxiter or graph.shape[0] * 5` through here). tol = 0
+// resolves to 1e-4, mirroring upstream's `tol or 1e-4` (tswspectral threads
+// its tol through; spectral_layout uses the default).
 bool normalized_laplacian_eigs(const SparseMatrix& graph, int k,
                                std::vector<double>& eigenvalues,
                                std::vector<double>& eigenvectors,
-                               int64_t maxiter = 0);
+                               int64_t maxiter = 0, double tol = 0.0);
 
 // Port of spectral.component_layout for metric="euclidean" (or data == nullptr).
 // data: row-major (n_samples x n_features) or nullptr; component_labels: size

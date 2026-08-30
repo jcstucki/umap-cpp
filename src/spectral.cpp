@@ -11,8 +11,8 @@
 
 #include <Eigen/Dense>
 #include <Eigen/SparseCore>
-#include <Spectra/MatOp/SparseSymShiftSolve.h>
-#include <Spectra/SymEigsShiftSolver.h>
+#include <Spectra/MatOp/SparseSymMatProd.h>
+#include <Spectra/SymEigsSolver.h>
 
 #include "umap/rng.hpp"
 
@@ -113,6 +113,38 @@ void build_normalized_laplacian(const SparseMatrix& graph,
     L.setFromTriplets(trips.begin(), trips.end());
 }
 
+// The spectrally-flipped operator M = 2I - L = I + D^{-1/2} A D^{-1/2},
+// built directly from the same degree computation (largest-algebraic
+// eigenpairs of M == smallest of L; used by the matvec-only eigsh mirror in
+// normalized_laplacian_eigs).
+void build_flipped_normalized_laplacian(const SparseMatrix& graph,
+                                        Eigen::SparseMatrix<double>& M,
+                                        std::vector<double>& sqrt_deg) {
+    const int64_t n = graph.n_rows;
+
+    sqrt_deg.assign(static_cast<std::size_t>(n), 0.0);
+    for (int32_t i = 0; i < graph.n_rows; ++i)
+        for (int32_t p = graph.indptr[i]; p < graph.indptr[i + 1]; ++p)
+            sqrt_deg[static_cast<std::size_t>(graph.indices[p])] +=
+                static_cast<double>(graph.data[p]);
+    for (auto& d : sqrt_deg) d = std::sqrt(d);
+
+    std::vector<Eigen::Triplet<double>> trips;
+    trips.reserve(graph.nnz() + static_cast<std::size_t>(n));
+    for (int64_t i = 0; i < n; ++i) trips.emplace_back(i, i, 1.0);
+    for (int32_t i = 0; i < graph.n_rows; ++i)
+        for (int32_t p = graph.indptr[i]; p < graph.indptr[i + 1]; ++p) {
+            const int32_t j = graph.indices[p];
+            trips.emplace_back(
+                i, j,
+                static_cast<double>(graph.data[p]) /
+                    (sqrt_deg[static_cast<std::size_t>(i)] *
+                     sqrt_deg[static_cast<std::size_t>(j)]));
+        }
+    M.resize(n, n);
+    M.setFromTriplets(trips.begin(), trips.end());
+}
+
 // _spectral_layout for the general case, returning float64 like upstream
 // (n x dim row-major). Forward declaration for the multi-component recursion.
 std::vector<double> spectral_layout_f64(const float* data, int64_t n_features,
@@ -156,7 +188,7 @@ int32_t connected_components(const SparseMatrix& graph,
 bool normalized_laplacian_eigs(const SparseMatrix& graph, int k,
                                std::vector<double>& eigenvalues,
                                std::vector<double>& eigenvectors,
-                               int64_t maxiter) {
+                               int64_t maxiter, double tol) {
     const int64_t n = graph.n_rows;
     if (k >= n) {
         // Upstream: scipy warns "k >= N ... attempting eigh" then raises an
@@ -166,15 +198,22 @@ bool normalized_laplacian_eigs(const SparseMatrix& graph, int k,
             "for k >= N)");
     }
 
-    Eigen::SparseMatrix<double> L;
+    // Matvec-only solve mirroring upstream's eigsh(L, k, which="SM",
+    // ncv=max(2k+1, sqrt(n)), tol=tol or 1e-4, v0=ones, maxiter=5n): the
+    // normalized Laplacian has spectrum in [0, 2], so the algebraically
+    // LARGEST eigenpairs of the flipped operator M = 2I - L are the smallest
+    // of L (lambda = 2 - mu, identical eigenvectors). Lanczos converges to
+    // the extremal end of M's spectrum without any factorization -- each
+    // iteration is one SpMV -- replacing the previous shift-invert solver
+    // (sigma = -1e-5, tol 1e-10) whose sparse LU factorization dominated
+    // large fits (~71% of a 50k x 64 fit; see the perf baseline). M is built
+    // directly as I + D^{-1/2} A D^{-1/2} (== 2I - L up to rounding of the
+    // diagonal for graphs with explicit self-loops, which UMAP graphs never
+    // have).
+    Eigen::SparseMatrix<double> M;
     std::vector<double> sqrt_deg;
-    build_normalized_laplacian(graph, L, sqrt_deg);
+    build_flipped_normalized_laplacian(graph, M, sqrt_deg);
 
-    // Upstream eigsh selection: k smallest ("SM", equal to smallest algebraic
-    // for the PSD Laplacian), ncv = max(2k + 1, sqrt(n)) (scipy clamps to n),
-    // v0 = ones, maxiter = 5n. We solve in shift-invert mode with the small
-    // negative sigma sklearn recommends (-1e-5) for robustness; the selected
-    // eigenpairs and their (unit 2-norm) normalization match ARPACK's.
     const int64_t ncv64 = std::min<int64_t>(
         n, std::max<int64_t>(2 * static_cast<int64_t>(k) + 1,
                              static_cast<int64_t>(std::sqrt(
@@ -185,38 +224,46 @@ bool normalized_laplacian_eigs(const SparseMatrix& graph, int k,
             ? static_cast<int>(std::min<int64_t>(maxiter, 1 << 30))
             : std::max<int>(1000,
                             static_cast<int>(std::min<int64_t>(5 * n, 1 << 30)));
+    // tol == 0 resolves to upstream's `tol or 1e-4` default.
+    const double eff_tol = tol != 0.0 ? tol : 1e-4;
 
     try {
-        Spectra::SparseSymShiftSolve<double> op(L);
-        Spectra::SymEigsShiftSolver<Spectra::SparseSymShiftSolve<double>> eigs(
-            op, k, ncv, -1e-5);
+        Spectra::SparseSymMatProd<double> op(M);
+        Spectra::SymEigsSolver<Spectra::SparseSymMatProd<double>> eigs(op, k,
+                                                                       ncv);
         Eigen::VectorXd v0 = Eigen::VectorXd::Ones(n);
         eigs.init(v0.data());
-        eigs.compute(Spectra::SortRule::LargestMagn, maxit, 1e-10,
-                     Spectra::SortRule::SmallestAlge);
+        eigs.compute(Spectra::SortRule::LargestAlge, maxit, eff_tol,
+                     Spectra::SortRule::LargestAlge);
         if (eigs.info() != Spectra::CompInfo::Successful) return false;
 
-        const Eigen::VectorXd evals = eigs.eigenvalues();
+        const Eigen::VectorXd mu = eigs.eigenvalues();  // descending in mu
         const Eigen::MatrixXd evecs = eigs.eigenvectors();
-        // order = np.argsort(eigenvalues) (ascending); Spectra already sorts
-        // by SmallestAlge but we replicate the explicit argsort regardless.
+        // lambda = 2 - mu, then order = np.argsort(eigenvalues) (ascending);
+        // descending mu already gives ascending lambda but we replicate the
+        // explicit argsort regardless, exactly like the previous solver did.
+        std::vector<double> lam(static_cast<std::size_t>(k));
+        for (int c = 0; c < k; ++c)
+            lam[static_cast<std::size_t>(c)] = 2.0 - mu[c];
         std::vector<int> order(static_cast<std::size_t>(k));
         std::iota(order.begin(), order.end(), 0);
-        std::stable_sort(order.begin(), order.end(),
-                         [&](int a, int b) { return evals[a] < evals[b]; });
+        std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+            return lam[static_cast<std::size_t>(a)] <
+                   lam[static_cast<std::size_t>(b)];
+        });
 
         eigenvalues.resize(static_cast<std::size_t>(k));
         eigenvectors.assign(static_cast<std::size_t>(n) * k, 0.0);
         for (int c = 0; c < k; ++c) {
-            eigenvalues[static_cast<std::size_t>(c)] = evals[order[c]];
+            eigenvalues[static_cast<std::size_t>(c)] =
+                lam[static_cast<std::size_t>(order[c])];
             for (int64_t i = 0; i < n; ++i)
                 eigenvectors[static_cast<std::size_t>(i) * k + c] =
                     evecs(i, order[c]);
         }
         return true;
     } catch (const std::exception&) {
-        // e.g. numerically-singular factorization; upstream catches
-        // ArpackError and falls back to random.
+        // Upstream catches ArpackError and falls back to random.
         return false;
     }
 }
@@ -703,9 +750,9 @@ std::vector<float> tswspectral_layout(const float* data, int64_t n_features,
     if (resolved == "eigsh") {
         // Upstream: eigsh(L, k, which="SM", ncv=max(2k+1, sqrt(n)),
         // tol=tol or 1e-4, v0=np.ones(n), maxiter=maxiter or 5n) -- the warm
-        // start is DISCARDED on this branch. Spectra solves tighter than
-        // tol=1e-4 (documented deviation); maxiter threads through.
-        ok = normalized_laplacian_eigs(graph, k, evals, evecs, maxiter);
+        // start is DISCARDED on this branch. tol/maxiter thread through
+        // (tol == 0 resolves to 1e-4 inside, like `tol or 1e-4`).
+        ok = normalized_laplacian_eigs(graph, k, evals, evecs, maxiter, tol);
     } else if (resolved == "lobpcg") {
         // Upstream: lobpcg(L, X, largest=False, tol=tol or 1e-4,
         // maxiter=maxiter or 5n) with the convergence UserWarning escalated.

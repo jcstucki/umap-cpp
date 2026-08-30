@@ -378,7 +378,14 @@ TEST_CASE("spectral init parity: ~1e-5 up to per-column sign (as1, "
             }
             best = std::min(best, diff);
         }
-        CHECK(best < 1e-4);  // observed ~1e-6..1e-5; ARPACK tol dominates
+        // Bound reflects the matvec-only eigsh mirror (Spectra Lanczos on
+        // 2I-L at upstream's tol=1e-4, replacing the old tol=1e-10 shift-
+        // invert). Two different Lanczos codes stopped at the same loose tol
+        // land ~1e-3 apart on this small-eigengap graph (lambda2..3 gap ~0.05)
+        // while each stays within ~1e-3 of the dense-exact eigenvectors;
+        // observed 0.0007..0.00099. Spectral init is quality-level parity by
+        // contract (Spectra vs ARPACK), validated downstream by trustworthiness.
+        CHECK(best < 3e-3);
     }
 }
 
