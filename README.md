@@ -290,7 +290,7 @@ linking) — returns `false` and the caller runs its own CPU fallback.
 suites generated from the real Python implementation
 (`scripts/gen_golden*.py`, `scripts/gen_upstream_fixtures.py`):
 
-* Metal build: **432 test cases / 520,053 assertions**, 0 failures
+* Metal build: **432 test cases / 520,013 assertions**, 0 failures
   (26 skips: version-removed scipy metrics, upstream `@skip` mirrors,
   typed-surface-unrepresentable cases, four hidden GPU timing cases);
 * CPU-only build: **407 cases / 174,687 assertions**, 0 failures (22 skips).
