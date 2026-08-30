@@ -196,7 +196,8 @@ bit-exact CPU port with a stderr note):
 | kNN site | engine-covered metrics | otherwise |
 | --- | --- | --- |
 | dense fit, small-data branch (n < 4096) | euclidean/l2, sqeuclidean, manhattan/l1/taxicab, chebyshev/linf\*, minkowski(p), cosine, correlation, hamming, canberra, braycurtis, seuclidean(v), wminkowski(w, p), mahalanobis(Vinv) — k ≤ 256 | CPU pairwise |
-| dense fit, standard branch (n ≥ 4096) | same 13 metrics, k ≤ 256, `unique=False` — the engine's **exact** kNN graph replaces NN-descent's approximate one (recall 1.0; no search index is built) | CPU NN-descent |
+| dense fit, standard branch (4096 ≤ n ≤ 30k) | same 13 metrics, k ≤ 256, `unique=False` — the engine's **exact** kNN graph replaces NN-descent's approximate one (recall 1.0; no search index is built) | CPU NN-descent |
+| dense fit, standard branch (n > 30k) | euclidean/l2, sqeuclidean, manhattan, cosine, k ≤ 64, `unique=False` — **GPU NN-descent** (host RP-forest init + on-device descent; recall ≈ CPU NN-descent's to ~1e-4, see below); other engine metrics / 64 < k ≤ 256 stay on the exact GPU engine at any n | CPU NN-descent |
 | dense transform (any n) | same 13 metrics, k ≤ 256 — exact engine kNN vs the training data, no search index needed | CPU `PreparedIndex` query |
 | sparse (CSR) fit small + standard, sparse transform | euclidean, cosine (norm-trick CSR kernel) | CPU sparse kernels / NN-descent |
 | precomputed / `precomputed_knn` | n/a (no distance computation) | — |
@@ -204,31 +205,50 @@ bit-exact CPU port with a stderr note):
 
 Discrete/object metrics, the boolean (jaccard/dice/yule/…) family, hellinger,
 and custom callables stay CPU-fallback. Under device=GPU the standard-branch
-kNN graph is **exact** rather than NN-descent-approximate — quality parity
-like the rest of GPU mode, deliberately *not* bit-identical to Python's
-approximate graph. GPU standard fits build no search index: transform runs
-its kNN on the engine directly, `save()`/`load()` round-trip (the index
-sections are optional), but `update()` raises and a saved model needs Metal
-at load-site to transform.
+kNN graph is **exact** up to n = 30k and **GPU NN-descent** above — quality
+parity like the rest of GPU mode, deliberately *not* bit-identical to
+Python's approximate graph (and, uniquely on the GPU-NN-descent leg,
+not bit-identical between two runs either: reverse-candidate sampling
+races by design, the same family as the hogwild SGD). GPU standard fits
+build no search index: transform runs its kNN on the engine directly at any
+n (exact, O(n_q·n)), `save()`/`load()` round-trip (the index sections are
+optional), but `update()` raises and a saved model needs Metal at load-site
+to transform.
 
-Rough exact-kNN timings (M-series, dim 16, k 15; hidden test
-`-ns -tc="gpu knn timing*"`): GPU exact 47 ms vs CPU NN-descent 103 ms at
-n=5k, 318 ms vs 494 ms at 20k, 2087 ms vs 1408 ms at 50k. The O(n²) exact
-engine wins below n ≈ 35k *and* returns recall-1.0 graphs; well above that,
-CPU NN-descent becomes faster (at approximate recall) — device=GPU keeps the
-exact graph regardless, so for multi-hundred-k datasets where fit time
-dominates quality needs, prefer `Device::CPU`.
+kNN timings (M-series, dim 16, k 15; hidden tests `-ns -tc="gpu knn
+timing*"` / `-tc="gpu nnd timing*"`, remeasured 2026-08-29 after the
+watchdog fix below):
+
+| n | GPU NN-descent | GPU exact | CPU NN-descent | GPU-nnd recall (CPU-nnd) |
+| --- | --- | --- | --- | --- |
+| 20k | 140 ms | 307 ms | 450 ms | 0.9975 (0.9976) |
+| 50k | 407 ms | 2251 ms | 1270 ms | 0.9952 (0.9952) |
+| 100k | 968 ms | 8963 ms | 3000 ms | 0.9931 (0.9932) |
+
+The auto crossover (`umap::metal::kGpuNndCrossoverN` = 30000) keeps the
+exact engine below 30k, where its absolute cost is modest and it returns
+recall-1.0 graphs — strictly better than the CPU standard branch — and
+switches to GPU NN-descent above, where the O(n²) term dominates (≥ ~3× the
+descent and growing) for a ≤ ~0.7% recall difference; the descent's recall
+tracks the bit-exact CPU NN-descent port's to ~1e-4 at every measured size.
+`UMAP_GPU_KNN_MODE=exact|nnd` overrides the mode for experiments. (The
+2026-08-29 gpu-nnd pass also fixed a silent-corruption hazard in the exact
+engine: monolithic multi-second dispatches at n ≈ 100k were sporadically
+aborted by the macOS GPU watchdog and returned zero-filled buffers unnoticed
+— queries now run in work-budgeted slices and every command buffer's status
+is checked, falling back to the CPU on failure.)
 
 GPU results are validated at embedding-quality level (per-metric kNN parity
-vs a float64 CPU reference at ≤ 1e-5, trustworthiness parity with CPU fits
-and transforms, held-out transform accuracy, densMAP density-order parity —
+vs a float64 CPU reference at ≤ 1e-5, NN-descent recall ≥ 0.90 asserted at
+median-of-3 vs the exact engine, trustworthiness parity with CPU fits
+and transforms — incl. a 40k GPU-NN-descent fit within 0.05 of a CPU
+NN-descent fit — held-out transform accuracy, densMAP density-order parity —
 rad_emb Spearman ≥ 0.9 vs the seeded CPU run, inside the CPU reference's own
 sequential-vs-hogwild band), **not** bitwise: kNN distances are float32
 (exact ties resolve in ascending data-index order), Metal has no float64,
-the device RNG is seeded per (edge, epoch), and hogwild updates race by
-design. The complete remaining CPU-only surface under device=GPU: the
-NN-descent >crossover regime (n ≳ 35k, documented above), RandomState-
-stream-critical internals (`update()`, supervised target-y kNN,
+the device RNG is seeded per (edge, epoch), and hogwild/sampling updates
+race by design. The complete remaining CPU-only surface under device=GPU:
+RandomState-stream-critical internals (`update()`, supervised target-y kNN,
 `inverse_transform` ranking, `output_dens` epilogue kNN, composites),
 n_epochs lists (embedding snapshots), non-euclidean output metrics,
 exotic/discrete/boolean/callable input metrics, and k > 256. Users who need
@@ -270,9 +290,9 @@ linking) — returns `false` and the caller runs its own CPU fallback.
 suites generated from the real Python implementation
 (`scripts/gen_golden*.py`, `scripts/gen_upstream_fixtures.py`):
 
-* Metal build: **427 test cases / 265,240 assertions**, 0 failures
-  (25 skips: version-removed scipy metrics, upstream `@skip` mirrors,
-  typed-surface-unrepresentable cases, three hidden GPU timing cases);
+* Metal build: **432 test cases / 520,053 assertions**, 0 failures
+  (26 skips: version-removed scipy metrics, upstream `@skip` mirrors,
+  typed-surface-unrepresentable cases, four hidden GPU timing cases);
 * CPU-only build: **407 cases / 174,687 assertions**, 0 failures (22 skips).
 
 `scripts/test_install.sh` additionally verifies `cmake --install`, the
