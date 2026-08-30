@@ -263,8 +263,10 @@ GlueParts make_glue(const umap::SparseMatrix& graph_in, const float* init,
     return out;
 }
 
-// centroid distance vs cluster spreads (same criterion as tests/test_layout.cpp)
-bool clusters_separated(const std::vector<float>& emb,
+// Centroid distance over the summed cluster RMS spreads (the
+// tests/test_layout.cpp criterion, exposed as the raw ratio so the racy GPU
+// path can assert on order statistics of it — see the flake note below).
+double separation_ratio(const std::vector<float>& emb,
                         const ClusterFixture& fx) {
     REQUIRE(fx.n_clusters == 2);
     const int half = fx.n / 2;
@@ -282,8 +284,13 @@ bool clusters_separated(const std::vector<float>& emb,
     }
     const double dx = c[0][0] - c[1][0];
     const double dy = c[0][1] - c[1][1];
-    return std::sqrt(dx * dx + dy * dy) >
-           2.0 * (std::sqrt(r[0]) + std::sqrt(r[1]));
+    return std::sqrt(dx * dx + dy * dy) /
+           (std::sqrt(r[0]) + std::sqrt(r[1]));
+}
+
+bool clusters_separated(const std::vector<float>& emb,
+                        const ClusterFixture& fx) {
+    return separation_ratio(emb, fx) > 2.0;
 }
 
 // Embedding-quality proxy: mean intra-cluster vs mean inter-cluster pairwise
@@ -333,20 +340,48 @@ TEST_CASE("gpu sgd: embeddings finite, clusters separate like the CPU path") {
     const double a = ab.a, b = ab.b;
     const int n_epochs = 500;
 
-    // CPU sequential reference (same graph + same init, via the CPU glue).
+    // CPU sequential reference (same graph + same init, via the CPU glue);
+    // deterministic, ratio 7.09.
     const auto cpu_emb = umap::simplicial_set_embedding_from_init(
         fx.graph, fx.init.data(), 2, a, b, rng_state, n_epochs);
     REQUIRE(clusters_separated(cpu_emb, fx));
 
-    const auto gpu_emb = run_gpu_layout(fx, n_epochs, a, b, rng_state);
-    REQUIRE(gpu_emb.size() == cpu_emb.size());
-    for (float v : gpu_emb) {
-        CHECK(std::isfinite(v));
-        // init is in [0, 10]; per-step moves are bounded by |clip| * alpha
-        // <= 4, so coordinates stay in a modest range unless updates blew up.
-        CHECK(std::fabs(v) < 1e3);
+    // The GPU ratio is a RANDOM VARIABLE (hogwild races): measured over 310
+    // runs on M-series (2026-08-29, fixed and per-run-varied rng_state):
+    // mean 4.6, sd 1.7, observed range [1.01, 9.83], p(ratio < 2.0) ~ 2.6%,
+    // p(< 1.5) ~ 1.0%. A single-run `ratio > 2` check therefore flaked about
+    // once per ~40 full-suite runs (the rare 1-of-263k-assertions failure).
+    // Restructured to order statistics of 5 independent runs (rng_state
+    // varied per run): P(median < 1.5) ~ 1e-5 and P(max < 2.0) ~ 1e-8, while
+    // a broken kernel still fails hard — flipping the attractive-gradient
+    // sign in sgd_epoch drives all 5 ratios to 0.14-0.20 (verified
+    // experimentally, then reverted).
+    std::vector<double> ratios;
+    for (int rep = 0; rep < 5; ++rep) {
+        const int64_t rs[3] = {rng_state[0], rng_state[1],
+                               rng_state[2] + 7919 * rep};
+        const auto gpu_emb = run_gpu_layout(fx, n_epochs, a, b, rs);
+        REQUIRE(gpu_emb.size() == cpu_emb.size());
+        for (float v : gpu_emb) {
+            CHECK(std::isfinite(v));
+            // init is in [0, 10]; per-step moves are bounded by |clip| *
+            // alpha <= 4, so coordinates stay in a modest range unless
+            // updates blew up.
+            CHECK(std::fabs(v) < 1e3);
+        }
+        ratios.push_back(separation_ratio(gpu_emb, fx));
     }
-    CHECK(clusters_separated(gpu_emb, fx));
+    std::sort(ratios.begin(), ratios.end());
+    CAPTURE(ratios[0]);
+    CAPTURE(ratios[1]);
+    CAPTURE(ratios[2]);
+    CAPTURE(ratios[3]);
+    CAPTURE(ratios[4]);
+    MESSAGE("gpu separation ratios (sorted): " << ratios[0] << " " << ratios[1]
+            << " " << ratios[2] << " " << ratios[3] << " " << ratios[4]
+            << " (cpu: " << separation_ratio(cpu_emb, fx) << ")");
+    CHECK(ratios[2] > 1.5);  // median: typical run separates the clusters
+    CHECK(ratios[4] > 2.0);  // max: CPU-grade separation is reached
 }
 
 TEST_CASE("gpu sgd quality proxy: 3 clusters, intra << inter for CPU and GPU") {
@@ -359,21 +394,33 @@ TEST_CASE("gpu sgd quality proxy: 3 clusters, intra << inter for CPU and GPU") {
 
     const auto cpu_emb = umap::simplicial_set_embedding_from_init(
         fx.graph, fx.init.data(), 2, a, b, rng_state, n_epochs);
-    const auto gpu_emb = run_gpu_layout(fx, n_epochs, a, b, rng_state);
-
     const auto cpu_ii = intra_inter(cpu_emb, fx);
-    const auto gpu_ii = intra_inter(gpu_emb, fx);
     const double cpu_intra = cpu_ii.first, cpu_inter = cpu_ii.second;
-    const double gpu_intra = gpu_ii.first, gpu_inter = gpu_ii.second;
-    CAPTURE(cpu_intra);
-    CAPTURE(cpu_inter);
-    CAPTURE(gpu_intra);
-    CAPTURE(gpu_inter);
+    CHECK(cpu_inter > 2.0 * cpu_intra);  // deterministic (10.5x)
+
+    // Same flake-hardening as the 2-cluster case: the GPU inter/intra ratio
+    // measured over 310 runs — mean 7.3, sd 1.9, observed min 2.36 — so the
+    // single-run `> 2` check sat ~1 sd from the observed floor. Median of 3
+    // independent runs: P(median < 2.0) ~ 3e-5, and a broken kernel
+    // (attractive-gradient sign flip) fails every run at 0.99-1.00
+    // (verified, reverted).
+    std::vector<double> ratios;
+    for (int rep = 0; rep < 3; ++rep) {
+        const int64_t rs[3] = {rng_state[0], rng_state[1],
+                               rng_state[2] + 7919 * rep};
+        const auto gpu_emb = run_gpu_layout(fx, n_epochs, a, b, rs);
+        for (float v : gpu_emb) CHECK(std::isfinite(v));
+        const auto gpu_ii = intra_inter(gpu_emb, fx);
+        ratios.push_back(gpu_ii.second / gpu_ii.first);
+    }
+    std::sort(ratios.begin(), ratios.end());
+    CAPTURE(ratios[0]);
+    CAPTURE(ratios[1]);
+    CAPTURE(ratios[2]);
     MESSAGE("quality proxy — CPU inter/intra: " << cpu_inter / cpu_intra
-            << ", GPU inter/intra: " << gpu_inter / gpu_intra);
-    CHECK(cpu_inter > 2.0 * cpu_intra);
-    CHECK(gpu_inter > 2.0 * gpu_intra);
-    for (float v : gpu_emb) CHECK(std::isfinite(v));
+            << ", GPU inter/intra (sorted): " << ratios[0] << " " << ratios[1]
+            << " " << ratios[2]);
+    CHECK(ratios[1] > 2.0);  // median of 3
 }
 
 // Rough CPU-vs-GPU timing on a 5k-point SGD; hidden by default (run with
