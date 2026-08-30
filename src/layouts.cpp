@@ -251,17 +251,78 @@ void densmap_epoch_init(const float* head_embedding,
 }
 // ----------------------------------------------------------------------------
 
-// --- perf P2 additions -------------------------------------------------------
-// Approximate pow(x, y) for the unseeded hogwild path. Defined and wired in a
-// later change (P2-GATED); forward-declared here so pow_sel<true> parses. It is
-// never odr-used in this change (dispatch only emits FASTPOW=false), so no
-// definition is required for the link.
-inline double fast_pow(double x, double y);
+// --- perf P2-GATED additions -------------------------------------------------
+// Fast pow(x, y) for x > 0, used ONLY on the unseeded hogwild SGD path
+// (optimize_layout_euclidean parallel=true). The seeded/sequential path keeps
+// libm std::pow so its float ops stay bit-identical to numba's (numba lowers
+// `d ** b` to the same libm pow). This is the ~2/3-of-SGD hotspot: every
+// attractive/repulsive gradient evaluates a·d^(2b) and its (2b-1) sibling.
+//
+// pow(x, y) = 2^(y * log2(x)). fast_log2/fast_exp2 are the standard
+// mantissa-polynomial approximations over a double bitcast: log2 splits off the
+// integer exponent and fits a degree-4 minimax polynomial to log2 of the [1,2)
+// mantissa; exp2 does the inverse. Peak composed relative error is ~3.8e-4
+// across the argument range the SGD hits (dist_squared in ~[1e-4, 2e2],
+// exponents 2b-1 / 2b for b ~ 0.4..1.4), well inside hogwild's own float32-race
+// noise -- the quality gate is trustworthiness parity over unseeded runs,
+// verified in tests. Coefficients were least-squares fit against log2/exp2 over
+// [1,2] / [0,1] respectively.
+inline double fast_log2(double x) {
+    // Bitcast the double; the biased exponent gives the integer part of log2,
+    // the mantissa (scaled to [1,2)) drives the polynomial.
+    std::uint64_t bits;
+    std::memcpy(&bits, &x, sizeof(bits));
+    // exponent field (bits 52..62), unbiased.
+    const int e = static_cast<int>((bits >> 52) & 0x7FF) - 1023;
+    // mantissa in [1, 2): clear exponent, set it to 1023 (2^0).
+    std::uint64_t mbits = (bits & 0x000FFFFFFFFFFFFFULL) | 0x3FF0000000000000ULL;
+    double m;
+    std::memcpy(&m, &mbits, sizeof(m));
+    // Degree-4 minimax fit of log2(m) on m in [1,2] (max abs err ~2e-4).
+    const double p =
+        (((-0.07915036579650883 * m + 0.6288157295067979) * m -
+          2.0810602043155706) *
+             m +
+         4.028372767821109) *
+            m -
+        2.49677376830763;
+    return static_cast<double>(e) + p;
+}
+
+inline double fast_exp2(double y) {
+    // Split into integer and fractional parts; 2^i via the exponent field,
+    // 2^f (f in [0,1)) via a degree-4 minimax polynomial.
+    double yi = std::floor(y);
+    const double yf = y - yi;
+    // Clamp the integer exponent to the representable range to avoid UB in the
+    // bit assembly (grad terms never reach these extremes, but be safe).
+    if (yi > 1023.0) yi = 1023.0;
+    if (yi < -1022.0) yi = -1022.0;
+    // Degree-4 minimax fit of 2^f on f in [0,1] (max rel err ~7e-6).
+    const double poly =
+        (((0.013676531088293625 * yf + 0.051666877432472585) * yf +
+          0.2417102624674633) *
+             yf +
+         0.6929312891634198) *
+            yf +
+        1.0000072832541607;
+    const std::int64_t ei = static_cast<std::int64_t>(yi);
+    std::uint64_t bits =
+        static_cast<std::uint64_t>((ei + 1023) & 0x7FF) << 52;
+    double pow2i;
+    std::memcpy(&pow2i, &bits, sizeof(pow2i));
+    return pow2i * poly;
+}
+
+// pow(x, y), x > 0.
+inline double fast_pow(double x, double y) {
+    return fast_exp2(y * fast_log2(x));
+}
 
 // pow selector: the seeded/sequential path (FASTPOW=false) uses libm std::pow
-// so the bit-contract with numba holds. FASTPOW=true (fast_pow, unseeded path)
-// is enabled in a later change; here only the false instantiation is ever
-// generated, so std::pow is the sole code path.
+// so the bit-contract with numba holds; the unseeded hogwild path
+// (FASTPOW=true) uses the polynomial fast_pow above. `pow_sel<FP>` is chosen at
+// compile time so neither path pays a runtime branch.
 template <bool FASTPOW>
 inline double pow_sel(double x, double y) {
     if constexpr (FASTPOW) {
@@ -465,10 +526,10 @@ void optimize_euclidean_epoch_range_t(
 
 // Runtime dispatch over the compile-time epoch-kernel specializations. Picks
 // the DIM==2 unroll for the common 2-D fit and a generic DIM==0 kernel
-// otherwise; DENSMAP selects the density variant. Every instantiation here is
-// FASTPOW=false and bit-identical to the pre-refactor scalar kernel. (The
-// `fastpow` parameter is accepted for forward compatibility with the unseeded
-// fast-pow change; it currently only ever selects the libm path.)
+// otherwise; DENSMAP selects the density variant; FASTPOW selects the
+// approximate pow (unseeded hogwild path only). Every FASTPOW=false
+// instantiation is bit-identical to the pre-refactor scalar kernel; FASTPOW is
+// the sole numerics-affecting axis and callers gate it to the unseeded path.
 inline void dispatch_epoch_range(
     bool densmap_active, bool fastpow, std::size_t i_begin, std::size_t i_end,
     float* head_embedding, float* tail_embedding, const int32_t* head,
@@ -477,20 +538,29 @@ inline void dispatch_epoch_range(
     bool move_other, double alpha, const double* epochs_per_negative_sample,
     double* epoch_of_next_negative_sample, double* epoch_of_next_sample, int n,
     const DensmapEpochState& dens) {
-    (void)fastpow;  // always the libm path in this change
-#define UMAP_DISPATCH_CALL(D, DM)                                             \
-    optimize_euclidean_epoch_range_t<D, DM, false>(                          \
+#define UMAP_DISPATCH_CALL(D, DM, FP)                                         \
+    optimize_euclidean_epoch_range_t<D, DM, FP>(                             \
         i_begin, i_end, head_embedding, tail_embedding, head, tail,          \
         n_vertices, epochs_per_sample, a, b, rng_state_per_sample, gamma,    \
         dim, move_other, alpha, epochs_per_negative_sample,                  \
         epoch_of_next_negative_sample, epoch_of_next_sample, n, dens)
     const bool dim2 = (dim == 2);
-    if (densmap_active) {
-        if (dim2) UMAP_DISPATCH_CALL(2, true);
-        else UMAP_DISPATCH_CALL(0, true);
+    if (fastpow) {
+        if (densmap_active) {
+            if (dim2) UMAP_DISPATCH_CALL(2, true, true);
+            else UMAP_DISPATCH_CALL(0, true, true);
+        } else {
+            if (dim2) UMAP_DISPATCH_CALL(2, false, true);
+            else UMAP_DISPATCH_CALL(0, false, true);
+        }
     } else {
-        if (dim2) UMAP_DISPATCH_CALL(2, false);
-        else UMAP_DISPATCH_CALL(0, false);
+        if (densmap_active) {
+            if (dim2) UMAP_DISPATCH_CALL(2, true, false);
+            else UMAP_DISPATCH_CALL(0, true, false);
+        } else {
+            if (dim2) UMAP_DISPATCH_CALL(2, false, false);
+            else UMAP_DISPATCH_CALL(0, false, false);
+        }
     }
 #undef UMAP_DISPATCH_CALL
 }
@@ -703,6 +773,13 @@ void optimize_layout_euclidean(
         }
     }
 
+    // --- perf P2-GATED: fast-pow is enabled only on the unseeded hogwild
+    // path. UMAP.fit passes parallel = (random_state is None), so `parallel` is
+    // an exact proxy for "unseeded"; the seeded path keeps libm std::pow and
+    // stays bit-exact vs numba. (A parallel && 1-thread build still runs the
+    // unseeded contract, so fast-pow applies there too.) ---------------------
+    const bool fastpow = parallel;
+
     unsigned n_threads = 1;
     if (parallel) {
         // --- hardening additions: n_jobs caps the pool (upstream calls
@@ -759,10 +836,11 @@ void optimize_layout_euclidean(
         if (!use_pool) {
             // Sequential numba path (parallel=False, or a 1-thread parallel
             // build): edges in order. Routed through the specialized dispatcher
-            // (DIM==2 unroll + non-densMAP elision + edge-skip); FASTPOW=false
-            // keeps it bit-exact.
+            // (DIM==2 unroll + non-densMAP elision + edge-skip). fastpow is
+            // false on the seeded path (bit-exact) and true only when
+            // parallel=true (unseeded 1-thread build).
             dispatch_epoch_range(
-                densmap, /*fastpow=*/false, 0, n_edges, head_embedding,
+                densmap, fastpow, 0, n_edges, head_embedding,
                 tail_embedding, head.data(), tail.data(), n_vertices,
                 epochs_per_sample.data(), a, b, rng_state_per_sample.data(),
                 gamma, dim, move_other, alpha,
@@ -782,7 +860,7 @@ void optimize_layout_euclidean(
                     const std::size_t hi = std::min(n_edges, lo + chunk);
                     if (lo >= hi) return;
                     dispatch_epoch_range(
-                        densmap, /*fastpow=*/false, lo, hi, head_embedding,
+                        densmap, fastpow, lo, hi, head_embedding,
                         tail_embedding, head.data(), tail.data(), n_vertices,
                         epochs_per_sample.data(), a, b,
                         rng_state_per_sample.data(), gamma, dim, move_other,
